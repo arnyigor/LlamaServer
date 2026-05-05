@@ -19,6 +19,7 @@ from src.core.server_manager import ServerManager
 from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
+from src.ui.tooltips import build_ncmoe_tooltip, build_ctx_tooltip
 
 
 class LlamaGUI:
@@ -49,6 +50,13 @@ class LlamaGUI:
         u.scan_btn.clicked.connect(self.scan_models)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
+        u.gpu_layers.valueChanged.connect(self._on_gpu_layers_changed)
+        u.cache_type_k.currentIndexChanged.connect(self._on_param_changed)
+        u.cache_type_v.currentIndexChanged.connect(self._on_param_changed)
+        u.flash_attn.stateChanged.connect(self._on_param_changed)
+        u.parallel_slots.valueChanged.connect(self._on_param_changed)
+        u.cpu_moe_layers.valueChanged.connect(self._on_param_changed)
+        u.gpu_auto.stateChanged.connect(self._on_param_changed)
         u.update_llama_btn.clicked.connect(self.update_llamacpp)
         u.integration_check_btn.clicked.connect(self.check_integration_models)
         u.integration_add_btn.clicked.connect(self.add_model_to_integration)
@@ -249,22 +257,45 @@ class LlamaGUI:
 
         self.ui.model_info.setText("\n".join(parts))
 
-        if expert_count:
-            from src.core.gguf_parser import recommend_moe_cpu_layers
-
-            rec_moe = recommend_moe_cpu_layers(info, self.ui.ctx_size.value())
-            tooltip = (
-                f"MoE модель: {expert_count} экспертов, {expert_used} активных\n"
-                f"Рекомендация для ctx={self.ui.ctx_size.value():,}: {rec_moe}"
-            )
-            self.ui.cpu_moe_layers.setToolTip(tooltip)
-        else:
-            self.ui.cpu_moe_layers.setToolTip("Модель не является MoE")
+        self._refresh_tooltips(info)
 
         self.config.settings.last_model_path = path
         if self.ui.auto_params.isChecked() and not self.ui.loading_profile:
             self.apply_recommended_params(info)
         self.update_cli_preview()
+
+    def _refresh_tooltips(self, info):
+        """Обновление tooltip для ncmoe и ctx при смене модели."""
+        expert_count = info.get("expert_count", 0)
+
+        if expert_count:
+            gpu_layers_val = (
+                999 if self.ui.gpu_auto.isChecked() else self.ui.gpu_layers.value()
+            )
+            tooltip = build_ncmoe_tooltip(
+                info=info,
+                ctx_size=self.ui.ctx_size.value(),
+                gpu_layers=gpu_layers_val,
+                cache_type_k=self.ui.cache_type_k.currentText(),
+                cache_type_v=self.ui.cache_type_v.currentText(),
+                flash_attn=self.ui.flash_attn.isChecked(),
+                parallel_slots=self.ui.parallel_slots.value(),
+                current_ncmoe=self.ui.cpu_moe_layers.value(),
+            )
+            self.ui.cpu_moe_layers.setToolTip(tooltip)
+        else:
+            self.ui.cpu_moe_layers.setToolTip("Модель не MoE")
+
+        tooltip_ctx = build_ctx_tooltip(
+            info=info,
+            current_ctx=self.ui.ctx_size.value(),
+            gpu_layers=self.ui.gpu_layers.value(),
+            cache_type_k=self.ui.cache_type_k.currentText(),
+            cache_type_v=self.ui.cache_type_v.currentText(),
+            flash_attn=self.ui.flash_attn.isChecked(),
+            parallel_slots=self.ui.parallel_slots.value(),
+        )
+        self.ui.ctx_size.setToolTip(tooltip_ctx)
 
     def apply_recommended_params(self, info):
         rec = info.get("recommended_ctx")
@@ -287,18 +318,47 @@ class LlamaGUI:
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if not info:
             return
-        expert_count = info.get("expert_count", 0)
-        if not expert_count:
-            return
-        from src.core.gguf_parser import recommend_moe_cpu_layers
 
-        rec_moe = recommend_moe_cpu_layers(info, ctx_size)
-        expert_used = info.get("expert_used", 0)
-        tooltip = (
-            f"MoE модель: {expert_count} экспертов, {expert_used} активных\n"
-            f"Рекомендация для ctx={ctx_size:,}: {rec_moe}"
+        info_key = (
+            next((k for k, v in self.ui.models_by_path.items() if v is info), None)
+            or self.ui.model_combo.currentData()
+        )
+
+        gpu_layers_val = (
+            999 if self.ui.gpu_auto.isChecked() else self.ui.gpu_layers.value()
+        )
+        tooltip = build_ncmoe_tooltip(
+            info=info,
+            ctx_size=ctx_size,
+            gpu_layers=gpu_layers_val,
+            cache_type_k=self.ui.cache_type_k.currentText(),
+            cache_type_v=self.ui.cache_type_v.currentText(),
+            flash_attn=self.ui.flash_attn.isChecked(),
+            parallel_slots=self.ui.parallel_slots.value(),
+            current_ncmoe=self.ui.cpu_moe_layers.value(),
         )
         self.ui.cpu_moe_layers.setToolTip(tooltip)
+
+        tooltip_ctx = build_ctx_tooltip(
+            info=info,
+            current_ctx=ctx_size,
+            gpu_layers=self.ui.gpu_layers.value(),
+            cache_type_k=self.ui.cache_type_k.currentText(),
+            cache_type_v=self.ui.cache_type_v.currentText(),
+            flash_attn=self.ui.flash_attn.isChecked(),
+            parallel_slots=self.ui.parallel_slots.value(),
+        )
+        self.ui.ctx_size.setToolTip(tooltip_ctx)
+
+    def _on_gpu_layers_changed(self, value):
+        info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
+        if info:
+            self._refresh_tooltips(info)
+
+    def _on_param_changed(self, _value=None):
+        info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
+        if info:
+            self._refresh_tooltips(info)
 
     def update_cli_preview(self):
         try:
