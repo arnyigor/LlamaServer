@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -53,61 +52,54 @@ def read_json_file(path: Union[str, Path]) -> Any:
         return json.load(f)
 
 
-def json_write_encoding(path: Union[str, Path]) -> str:
-    """Определение кодировки для записи JSON.
-
-    Args:
-        path: Путь к файлу.
-
-    Returns:
-        Кодировка (utf-8 или utf-8-sig).
-    """
-    target = Path(path)
-    if target.exists():
-        try:
-            with open(target, "rb") as f:
-                if f.read(3) == b"\xef\xbb\xbf":
-                    return "utf-8-sig"
-        except OSError:
-            pass
-    return "utf-8"
+def _detect_bom(path: Path) -> str:
+    """Определение кодировки по наличию BOM."""
+    try:
+        with open(path, "rb") as f:
+            return "utf-8-sig" if f.read(3) == b"\xef\xbb\xbf" else "utf-8"
+    except OSError:
+        return "utf-8"
 
 
 def write_json_file_safely(path: Union[str, Path], data: Any) -> None:
-    """Запись JSON файла.
+    """Атомарная запись JSON через временный файл.
 
-    Простая прямая запись без временных файлов (для совместимости с PyInstaller).
+    Гарантирует целостность: либо файл записан полностью,
+    либо остался нетронутым. Сохраняет оригинальную кодировку (BOM).
 
     Args:
         path: Путь к файлу.
-        data: Данные для записи.
-    """
-    target = Path(path)
-    try:
-        with open(target, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-    except Exception:
-        # Fallback: если не удалось записать, пробуем через временный файл
-        import tempfile
-        import os as os_module
+        data: Данные для записи (должны быть JSON-сериализуемы).
 
-        temp_name = ""
+    Raises:
+        OSError: При ошибке записи или переименования.
+        TypeError: При несериализуемых данных.
+    """
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    encoding = _detect_bom(target) if target.exists() else "utf-8"
+
+    try:
+        content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    except (TypeError, ValueError) as e:
+        raise TypeError(f"Data is not JSON-serializable: {e}") from e
+
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.tmp",
+        suffix=".json",
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding=encoding) as f:
+            f.write(content)
+        os.replace(tmp_path, target)
+    except BaseException:
         try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as f:
-                temp_name = f.name
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.write("\n")
-            if target.exists():
-                os_module.remove(target)
-            os_module.rename(temp_name, target)
-        except Exception:
-            if temp_name and os_module.exists(temp_name):
-                try:
-                    os_module.unlink(temp_name)
-                except OSError:
-                    pass
-            raise
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_or_create_json(path: Union[str, Path]) -> Dict[str, Any]:
@@ -118,6 +110,9 @@ def load_or_create_json(path: Union[str, Path]) -> Dict[str, Any]:
 
     Returns:
         Словарь с данными.
+
+    Raises:
+        ValueError: Если JSON не является объектом.
     """
     if not path:
         raise ValueError("Путь к JSON не указан")

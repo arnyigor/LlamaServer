@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import List
 
 from PySide6.QtCore import QThread, Signal
 
@@ -22,27 +23,50 @@ class ModelScanner(QThread):
 
     models_found = Signal(list)
     progress = Signal(str)
+    error = Signal(str)
 
     def __init__(self, base_path):
         super().__init__()
         self.base_path = base_path
+        self.setTerminationEnabled(False)
 
     def run(self):
-        models = []
+        models: List[dict] = []
         base = Path(self.base_path)
-        if base.exists():
-            for gguf_file in base.rglob("*.gguf"):
+
+        if not base.exists():
+            self.error.emit(f"Папка не найдена: {base}")
+            return
+
+        try:
+            all_files = [f for f in base.rglob("*.gguf") if not is_projector_file(f)]
+            total = len(all_files)
+
+            for i, gguf_file in enumerate(all_files, 1):
                 if self.isInterruptionRequested():
-                    break
-                if is_projector_file(gguf_file):
+                    self.progress.emit("⏹ Сканирование отменено")
+                    models.sort(key=lambda x: x["display"].lower())
+                    self.models_found.emit(models)
+                    return
+
+                try:
+                    rel_path = gguf_file.relative_to(base)
+                    info = extract_model_info(gguf_file)
+                    info["display"] = str(rel_path)
+                    models.append(info)
+                except Exception as e:
+                    self.progress.emit(f"⚠️ Пропуск {gguf_file.name}: {e}")
                     continue
-                rel_path = gguf_file.relative_to(base)
-                info = extract_model_info(gguf_file)
-                info["display"] = str(rel_path)
-                models.append(info)
-                if len(models) % 25 == 0:
-                    self.progress.emit(f"Найдено моделей: {len(models)}")
-        models.sort(key=lambda i: i["display"].lower())
+
+                if i % 25 == 0 or i == total:
+                    self.progress.emit(
+                        f"Сканирование: {i}/{total}, найдено: {len(models)}"
+                    )
+
+        except PermissionError as e:
+            self.error.emit(f"Нет доступа: {e}")
+
+        models.sort(key=lambda x: x["display"].lower())
         self.models_found.emit(models)
 
 

@@ -1,15 +1,23 @@
 """LlamaServer GUI - точка входа."""
+
 import os
 import sys
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QMessageBox,
+    QSystemTrayIcon,
+    QMenu,
+)
 
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
 from src.core.server_manager import ServerManager
 from src.services.threads import ModelScanner, LlamaCppUpdater
+from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
 
 
@@ -20,6 +28,12 @@ class LlamaGUI:
         self.server = ServerManager()
         self.scanner = None
         self.updater = None
+
+        self.log_mgr = LogManager(self.ui.logs)
+        self.log_mgr.speed_updated.connect(self.ui.speed_label.setText)
+        self.ui.autoscroll_logs.toggled.connect(
+            lambda checked: setattr(self.log_mgr, "autoscroll", checked)
+        )
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
@@ -47,26 +61,33 @@ class LlamaGUI:
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
 
-        self.server.log_received.connect(u.log)
+        self.server.log_received.connect(
+            lambda text, level: self.log_mgr.append(text, level)
+        )
         self.server.state_changed.connect(self.update_action_buttons)
         self.server.bench_finished.connect(lambda _: self.update_action_buttons())
 
     def browse_opencode_config(self):
-        f, _ = QFileDialog.getOpenFileName(self.ui, "Выберите opencode.json", "", "JSON (*.json);;All files (*.*)")
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui, "Выберите opencode.json", "", "JSON (*.json);;All files (*.*)"
+        )
         if f:
             self.ui.opencode_config_path.setText(f)
             self.save_settings()
             self.check_integration_models(silent=True)
 
     def browse_pi_config(self):
-        f, _ = QFileDialog.getOpenFileName(self.ui, "Выберите PI config.json", "", "JSON (*.json);;All files (*.*)")
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui, "Выберите PI config.json", "", "JSON (*.json);;All files (*.*)"
+        )
         if f:
             self.ui.pi_config_path.setText(f)
             self.save_settings()
             self.check_integration_models(silent=True)
 
     def _setup_tray(self):
-        if not QSystemTrayIcon.isSystemTrayAvailable(): return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
         self.tray = QSystemTrayIcon(self.ui)
         self.tray.setToolTip("LlamaServer GUI")
         menu = QMenu()
@@ -75,8 +96,11 @@ class LlamaGUI:
         menu.addSeparator()
         menu.addAction("Выход", self.quit_app)
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda
-                                        r: self.ui.hide() if self.ui.isVisible() and r == QSystemTrayIcon.DoubleClick else self.ui.showNormal())
+        self.tray.activated.connect(
+            lambda r: self.ui.hide()
+            if self.ui.isVisible() and r == QSystemTrayIcon.DoubleClick
+            else self.ui.showNormal()
+        )
         self.tray.show()
 
     def save_settings(self):
@@ -87,49 +111,78 @@ class LlamaGUI:
     def auto_detect_bench(self):
         srv = self.ui.exe_path.text()
         if srv and os.path.exists(srv):
-            bench = os.path.join(os.path.dirname(srv), os.path.basename(srv).replace("server", "bench"))
-            if os.path.exists(bench): self.ui.bench_path.setText(bench)
+            bench = os.path.join(
+                os.path.dirname(srv), os.path.basename(srv).replace("server", "bench")
+            )
+            if os.path.exists(bench):
+                self.ui.bench_path.setText(bench)
 
     def browse_exe(self):
-        f, _ = QFileDialog.getOpenFileName(self.ui, "Выберите llama-server", "", "Executable (*.exe)")
-        if f: self.ui.exe_path.setText(f); self.save_settings()
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui, "Выберите llama-server", "", "Executable (*.exe)"
+        )
+        if f:
+            self.ui.exe_path.setText(f)
+            self.save_settings()
 
     def browse_bench(self):
-        f, _ = QFileDialog.getOpenFileName(self.ui, "Выберите llama-bench", "", "Executable (*.exe)")
-        if f: self.ui.bench_path.setText(f); self.save_settings()
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui, "Выберите llama-bench", "", "Executable (*.exe)"
+        )
+        if f:
+            self.ui.bench_path.setText(f)
+            self.save_settings()
 
     def browse_model_dir(self):
         d = QFileDialog.getExistingDirectory(self.ui, "Выберите папку с моделями")
-        if d: self.ui.model_dir.setText(d); self.save_settings(); self.scan_models()
+        if d:
+            self.ui.model_dir.setText(d)
+            self.save_settings()
+            self.scan_models()
 
     def auto_scan_models(self):
-        if self.ui.models: self.ui.scan_status.setText(f"Кэш моделей: {len(self.ui.models)}. Фоновая проверка...")
+        if self.ui.models:
+            self.ui.scan_status.setText(
+                f"Кэш моделей: {len(self.ui.models)}. Фоновая проверка..."
+            )
         bp = self.ui.model_dir.text()
-        if bp and os.path.exists(bp): self.scan_models(silent=True)
+        if bp and os.path.exists(bp):
+            self.scan_models(silent=True)
 
     def scan_models(self, silent=False):
         bp = self.ui.model_dir.text()
         if not bp or not os.path.exists(bp):
-            if not silent: QMessageBox.warning(self.ui, "Ошибка", "Укажите существующую базовую папку")
+            if not silent:
+                QMessageBox.warning(
+                    self.ui, "Ошибка", "Укажите существующую базовую папку"
+                )
             return
         if self.scanner and self.scanner.isRunning():
-            if not silent: self.scanner.requestInterruption()
+            if not silent:
+                self.scanner.requestInterruption()
             return
-        self.ui.scan_btn.setText("⏹ Отменить");
+        if self.scanner:
+            self.scanner.deleteLater()
+            self.scanner = None
+        self.ui.scan_btn.setText("⏹ Отменить")
         self.ui.scan_progress.setVisible(True)
         self.ui.scan_status.setText("Сканирование GGUF...")
         self.scanner = ModelScanner(bp)
         self.scanner.progress.connect(self.ui.scan_status.setText)
         self.scanner.models_found.connect(self.on_models_found)
+        self.scanner.error.connect(lambda msg: self.log_mgr.append(msg, "error"))
         self.scanner.finished.connect(
-            lambda: self.ui.scan_btn.setText("🔍 Сканировать") or self.ui.scan_progress.setVisible(False))
+            lambda: self.ui.scan_btn.setText("🔍 Сканировать")
+            or self.ui.scan_progress.setVisible(False)
+        )
         self.scanner.start()
 
     def on_models_found(self, models):
         self.ui.models = models
         self.ui.models_by_path = {m["path"]: m for m in models}
         self.ui.model_combo.clear()
-        for m in models: self.ui.model_combo.addItem(m["display"], m["path"])
+        for m in models:
+            self.ui.model_combo.addItem(m["display"], m["path"])
         last = self.config.settings.last_model_path
         idx = self.ui.model_combo.findData(last)
         if idx >= 0:
@@ -137,7 +190,7 @@ class LlamaGUI:
         elif models:
             self.ui.model_combo.setCurrentIndex(0)
         self.save_settings()
-        self.ui.log(f"✅ Найдено моделей: {len(models)}")
+        self.log_mgr.append(f"✅ Найдено моделей: {len(models)}")
         self.ui.scan_status.setText(f"Найдено моделей: {len(models)}")
 
     def on_model_selected(self, *_):
@@ -146,14 +199,17 @@ class LlamaGUI:
             txt = self.ui.model_combo.currentText().strip()
             if txt and os.path.exists(txt) and txt.lower().endswith(".gguf"):
                 path = txt
-                self.ui.model_combo.setItemData(self.ui.model_combo.currentIndex(), path)
+                self.ui.model_combo.setItemData(
+                    self.ui.model_combo.currentIndex(), path
+                )
             else:
-                self.ui.model_info.setText("Выберите модель");
+                self.ui.model_info.setText("Выберите модель")
                 return
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
         self.ui.models_by_path[path] = info
         self.ui.model_info.setText(
-            f"Архитектура: {info.get('architecture')}; квант: {info.get('quant')}; размер: {info.get('size_gib')} GiB; ctx: {info.get('context_length')}")
+            f"Архитектура: {info.get('architecture')}; квант: {info.get('quant')}; размер: {info.get('size_gib')} GiB; ctx: {info.get('context_length')}"
+        )
         self.config.settings.last_model_path = path
         if self.ui.auto_params.isChecked() and not self.ui.loading_profile:
             self.apply_recommended_params(info)
@@ -161,15 +217,19 @@ class LlamaGUI:
 
     def apply_recommended_params(self, info):
         rec = info.get("recommended_ctx")
-        if rec: self.ui.ctx_size.setValue(rec)
+        if rec:
+            self.ui.ctx_size.setValue(rec)
         q = (info.get("quant") or "").upper()
-        if q.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3")) or info.get("recommended_ctx", 0) >= 16384:
-            self.ui.cache_type_k.setCurrentText("q8_0");
+        if (
+            q.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3"))
+            or info.get("recommended_ctx", 0) >= 16384
+        ):
+            self.ui.cache_type_k.setCurrentText("q8_0")
             self.ui.cache_type_v.setCurrentText("q8_0")
         else:
-            self.ui.cache_type_k.setCurrentText("f16");
+            self.ui.cache_type_k.setCurrentText("f16")
             self.ui.cache_type_v.setCurrentText("f16")
-        self.ui.batch_size.setValue(2048);
+        self.ui.batch_size.setValue(2048)
         self.ui.ubatch_size.setValue(2048)
 
     def update_cli_preview(self):
@@ -183,11 +243,15 @@ class LlamaGUI:
 
     def start_server(self):
         if self.server.is_bench_running():
-            QMessageBox.warning(self.ui, "Benchmark запущен", "Остановите benchmark перед запуском сервера");
+            QMessageBox.warning(
+                self.ui,
+                "Benchmark запущен",
+                "Остановите benchmark перед запуском сервера",
+            )
             return
         exe = self.ui.exe_path.text()
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-server.exe");
+            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-server.exe")
             return
         self.config.read_from_ui(self.ui)
         # resolve mmproj
@@ -196,43 +260,59 @@ class LlamaGUI:
         try:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
         except ValueError as e:
-            QMessageBox.warning(self.ui, "Ошибка", str(e));
+            QMessageBox.warning(self.ui, "Ошибка", str(e))
             return
-        if not args: return
-        self.ui.log(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
+        if not args:
+            return
+        self.log_mgr.append(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
         self.server.start_server(exe, args)
-        self.ui.start_btn.setEnabled(False);
-        self.ui.test_btn.setEnabled(False);
+        self.ui.start_btn.setEnabled(False)
+        self.ui.test_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
-        if hasattr(self, "tray"): self.tray.setToolTip(f"LlamaServer GUI - Running on port {self.ui.port.value()}")
+        if hasattr(self, "tray"):
+            self.tray.setToolTip(
+                f"LlamaServer GUI - Running on port {self.ui.port.value()}"
+            )
 
     def run_benchmark(self):
         if self.server.is_server_running():
-            QMessageBox.warning(self.ui, "Сервер запущен", "Остановите сервер перед запуском benchmark");
+            QMessageBox.warning(
+                self.ui, "Сервер запущен", "Остановите сервер перед запуском benchmark"
+            )
             return
         self.auto_detect_bench()
         bexe = self.ui.bench_path.text()
         if not bexe or not os.path.exists(bexe):
-            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-bench.exe");
+            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-bench.exe")
             return
         self.config.read_from_ui(self.ui)
         try:
-            args = build_args(self.config.settings, self.ui.model_combo.currentData(), for_benchmark=True)
+            args = build_args(
+                self.config.settings,
+                self.ui.model_combo.currentData(),
+                for_benchmark=True,
+            )
         except ValueError as e:
-            QMessageBox.warning(self.ui, "Ошибка", str(e));
+            QMessageBox.warning(self.ui, "Ошибка", str(e))
             return
-        if not args: return
-        self.ui.log(f"🧪 Запуск бенчмарка: {os.path.basename(bexe)}\n   Параметры: {' '.join(args)}")
+        if not args:
+            return
+        self.log_mgr.append(
+            f"🧪 Запуск бенчмарка: {os.path.basename(bexe)}\n   Параметры: {' '.join(args)}"
+        )
         self.server.start_bench(bexe, args)
-        self.ui.test_btn.setEnabled(False);
+        self.ui.test_btn.setEnabled(False)
         self.ui.test_btn.setText("⏳ Тестирование...")
-        self.ui.start_btn.setEnabled(False);
+        self.ui.start_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
 
     def stop_work(self):
-        if self.server.is_server_running(): self.server.stop_server()
-        if self.server.is_bench_running(): self.server.stop_bench()
-        if self.scanner and self.scanner.isRunning(): self.scanner.requestInterruption()
+        if self.server.is_server_running():
+            self.server.stop_server()
+        if self.server.is_bench_running():
+            self.server.stop_bench()
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.requestInterruption()
         self.update_action_buttons()
 
     def update_action_buttons(self, busy=False):
@@ -248,20 +328,28 @@ class LlamaGUI:
 
     def update_llamacpp(self):
         if self.server.is_server_running() or self.server.is_bench_running():
-            QMessageBox.warning(self.ui, "Updater", "Stop processes before updating.");
+            QMessageBox.warning(self.ui, "Updater", "Stop processes before updating.")
             return
         exe = self.ui.exe_path.text().strip()
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(self.ui, "Updater", "Select existing llama-server.exe first.");
+            QMessageBox.critical(
+                self.ui, "Updater", "Select existing llama-server.exe first."
+            )
             return
-        self.ui.update_progress.setValue(0);
+        self.ui.update_progress.setValue(0)
         self.ui.update_progress.setVisible(True)
         self.updater = LlamaCppUpdater(exe)
         self.updater.progress.connect(self.ui.update_status.setText)
         self.updater.percent.connect(self.ui.update_progress.setValue)
         self.updater.completed.connect(
-            lambda ch, msg: self.ui.update_status.setText(msg) or self.auto_detect_bench() or self.save_settings())
-        self.updater.finished.connect(lambda: self.ui.update_progress.setVisible(False) or self.update_action_buttons())
+            lambda ch, msg: self.ui.update_status.setText(msg)
+            or self.auto_detect_bench()
+            or self.save_settings()
+        )
+        self.updater.finished.connect(
+            lambda: self.ui.update_progress.setVisible(False)
+            or self.update_action_buttons()
+        )
         self.updater.start()
         self.update_action_buttons()
 
@@ -278,9 +366,8 @@ class LlamaGUI:
 
     def quit_app(self):
         self.save_settings()
-        self.ui.save_ui_state()  # ✅ Сохраняем геометрию и спойлеры
-        self.ui.log_timer.stop()
-        self.ui.flush_log_buffer()
+        self.ui.save_ui_state()
+        self.log_mgr.stop()
         self.server.terminate_all()
         if self.scanner and self.scanner.isRunning():
             self.scanner.requestInterruption()

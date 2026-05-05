@@ -6,14 +6,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.services.threads import LlamaCppUpdater
-from PySide6.QtCore import QCoreApplication, QThread
-import time
+from PySide6.QtCore import QCoreApplication, QTimer
 
 
 def test_updater():
     app = QCoreApplication(sys.argv)
 
-    # Тестовый путь (замените на реальный)
     test_path = r"C:\path\to\llama-server.exe"
 
     print(f"Testing updater with path: {test_path}")
@@ -42,14 +40,15 @@ def test_updater():
     print("Starting updater...")
     updater.start()
 
-    # Ждем завершения или таймаута
-    timer = QThread()
-    time.sleep(30)  # Ждем 30 секунд
-
-    if updater.isRunning():
-        print("WARNING: Updater still running after 30s")
-        updater.requestInterruption()
-        updater.wait(5000)
+    QTimer.singleShot(
+        30000,
+        lambda: (
+            print("WARNING: Timeout after 30s") if updater.isRunning() else None,
+            updater.requestInterruption() if updater.isRunning() else None,
+            updater.wait(5000) if updater.isRunning() else None,
+            app.quit(),
+        ),
+    )
 
     print("Test finished")
 
