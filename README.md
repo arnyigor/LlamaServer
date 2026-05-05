@@ -30,13 +30,26 @@ GUI-менеджер для запуска `llama-server.exe` из `llama.cpp` �
 Python-зависимости:
 
 ```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 ## Запуск
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
 python main.py
+```
+
+## Сборка
+
+Собрать `dist\LlamaServerGUI.exe` через локальное окружение `.venv`:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install pyinstaller
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
 ```
 
 При первом запуске укажите:
@@ -179,6 +192,7 @@ python main.py
 Проверить синтаксис:
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
 python -m py_compile main.py
 ```
 
@@ -196,7 +210,6 @@ curl http://127.0.0.1:8080/v1/models
 
 ## Примечания
 
-- Для мониторинга скорости и KV cache включите галочку `metrics`. GUI добавит `--metrics` и начнет асинхронно опрашивать `/metrics` только после полной загрузки сервера. Это уменьшает шум в verbose-логах и не блокирует UI.
 - `mmap` в актуальном `llama-server` обычно включен по умолчанию, но переключатель оставлен для явного управления.
 - `mlock` полезен только если достаточно RAM и система разрешает блокировку памяти.
 - Большой `ctx` резко увеличивает расход памяти KV cache.

@@ -1,16 +1,17 @@
+"""LlamaServer GUI - точка входа.
+
+Модульное PySide6 приложение для управления llama-server и llama-bench.
+"""
+
 import sys
 import json
 import os
 import re
-import shutil
 import shlex
-import struct
-import subprocess
-import tempfile
 import time
-import urllib.request
-import zipfile
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,537 +32,142 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QScrollArea,
+    QSystemTrayIcon,
+    QMenu,
+    QSplitter,
 )
-from PySide6.QtCore import QProcess, Qt, QThread, Signal, QTimer, QUrl
-from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtGui import (
+    QFont,
+    QColor,
+    QTextCharFormat,
+    QTextCursor,
+    QAction,
+    QIcon,
+)
 
-
-GGUF_VALUE_TYPES = {
-    0: "uint8",
-    1: "int8",
-    2: "uint16",
-    3: "int16",
-    4: "uint32",
-    5: "int32",
-    6: "float32",
-    7: "bool",
-    8: "string",
-    9: "array",
-    10: "uint64",
-    11: "int64",
-    12: "float64",
-}
-
-GGUF_FILE_TYPES = {
-    0: "F32",
-    1: "F16",
-    2: "Q4_0",
-    3: "Q4_1",
-    7: "Q8_0",
-    8: "Q5_0",
-    9: "Q5_1",
-    10: "Q2_K",
-    11: "Q3_K_S",
-    12: "Q3_K_M",
-    13: "Q3_K_L",
-    14: "Q4_K_S",
-    15: "Q4_K_M",
-    16: "Q5_K_S",
-    17: "Q5_K_M",
-    18: "Q6_K",
-    19: "IQ2_XXS",
-    20: "IQ2_XS",
-    21: "Q2_K_S",
-    22: "IQ3_XS",
-    23: "IQ3_XXS",
-    24: "IQ1_S",
-    25: "IQ4_NL",
-    26: "IQ3_S",
-    27: "IQ3_M",
-    28: "IQ2_S",
-    29: "IQ2_M",
-    30: "IQ4_XS",
-    31: "IQ1_M",
-    32: "BF16",
-    33: "Q4_0_4_4",
-    34: "Q4_0_4_8",
-    35: "Q4_0_8_8",
-    36: "TQ1_0",
-    37: "TQ2_0",
-}
-
-
-def read_gguf_string(f):
-    size_data = f.read(8)
-    if len(size_data) != 8:
-        raise ValueError("Unexpected GGUF EOF while reading string size")
-    size = struct.unpack("<Q", size_data)[0]
-    data = f.read(size)
-    if len(data) != size:
-        raise ValueError("Unexpected GGUF EOF while reading string")
-    return data.decode("utf-8", errors="replace")
-
-
-def skip_gguf_value(f, value_type):
-    sizes = {
-        0: 1,
-        1: 1,
-        2: 2,
-        3: 2,
-        4: 4,
-        5: 4,
-        6: 4,
-        7: 1,
-        10: 8,
-        11: 8,
-        12: 8,
-    }
-    if value_type == 8:
-        size = struct.unpack("<Q", f.read(8))[0]
-        f.seek(size, os.SEEK_CUR)
-    elif value_type == 9:
-        child_type = struct.unpack("<I", f.read(4))[0]
-        length = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(length):
-            skip_gguf_value(f, child_type)
-    elif value_type in sizes:
-        f.seek(sizes[value_type], os.SEEK_CUR)
-    else:
-        raise ValueError(f"Unsupported GGUF value type: {value_type}")
-
-
-def read_gguf_value(f, value_type):
-    if value_type == 0:
-        return struct.unpack("<B", f.read(1))[0]
-    if value_type == 1:
-        return struct.unpack("<b", f.read(1))[0]
-    if value_type == 2:
-        return struct.unpack("<H", f.read(2))[0]
-    if value_type == 3:
-        return struct.unpack("<h", f.read(2))[0]
-    if value_type == 4:
-        return struct.unpack("<I", f.read(4))[0]
-    if value_type == 5:
-        return struct.unpack("<i", f.read(4))[0]
-    if value_type == 6:
-        return struct.unpack("<f", f.read(4))[0]
-    if value_type == 7:
-        return struct.unpack("<?", f.read(1))[0]
-    if value_type == 8:
-        return read_gguf_string(f)
-    if value_type == 10:
-        return struct.unpack("<Q", f.read(8))[0]
-    if value_type == 11:
-        return struct.unpack("<q", f.read(8))[0]
-    if value_type == 12:
-        return struct.unpack("<d", f.read(8))[0]
-    skip_gguf_value(f, value_type)
-    return None
-
-
-def read_gguf_metadata(path):
-    metadata = {}
-    with open(path, "rb") as f:
-        if f.read(4) != b"GGUF":
-            return metadata
-
-        version = struct.unpack("<I", f.read(4))[0]
-        if version < 2:
-            tensor_count = struct.unpack("<I", f.read(4))[0]
-            metadata_count = struct.unpack("<I", f.read(4))[0]
-        else:
-            tensor_count = struct.unpack("<Q", f.read(8))[0]
-            metadata_count = struct.unpack("<Q", f.read(8))[0]
-
-        if metadata_count > 20000:
-            raise ValueError(f"Suspicious GGUF metadata count: {metadata_count}")
-
-        metadata["gguf.version"] = version
-        metadata["gguf.tensor_count"] = tensor_count
-        for _ in range(metadata_count):
-            key = read_gguf_string(f)
-            value_type = struct.unpack("<I", f.read(4))[0]
-            metadata[f"{key}.type"] = GGUF_VALUE_TYPES.get(value_type, str(value_type))
-            metadata[key] = read_gguf_value(f, value_type)
-
-            arch = metadata.get("general.architecture", "")
-            has_file_type = "general.file_type" in metadata
-            has_context = any(
-                key.endswith(".context_length") and isinstance(value, int)
-                for key, value in metadata.items()
-            )
-            if arch and has_file_type and has_context:
-                break
-    return metadata
-
-
-def quant_from_filename(path):
-    name = Path(path).name.upper()
-    match = re.search(
-        r"(IQ[1-4]_[A-Z0-9_]+|TQ[12]_0|Q[2-8](?:_K)?(?:_[SML])?|Q4_0_4_[48]|Q4_0_8_8|F16|F32|BF16)",
-        name,
-    )
-    return match.group(1) if match else ""
-
-
-def detect_mmproj_for_model(path):
-    model_path = Path(path)
-    candidates = []
-    patterns = ("*mmproj*", "*projector*")
-
-    for directory in [model_path.parent, model_path.parent.parent]:
-        if not directory.exists():
-            continue
-        for pattern in patterns:
-            for item in directory.glob(pattern):
-                if item == model_path or not item.is_file():
-                    continue
-                if item.suffix.lower() not in {".gguf", ".bin"}:
-                    continue
-                name = item.name.lower()
-                if "mmproj" in name or "projector" in name:
-                    candidates.append(item)
-
-    if not candidates:
-        return ""
-
-    candidates.sort(
-        key=lambda item: (
-            item.parent != model_path.parent,
-            len(item.name),
-            item.name.lower(),
-        )
-    )
-    return str(candidates[0])
-
-
-def extract_model_info(path):
-    file_path = Path(path)
-    info = {
-        "path": str(file_path),
-        "name": file_path.name,
-        "size_gib": round(file_path.stat().st_size / (1024**3), 2)
-        if file_path.exists()
-        else 0,
-        "architecture": "",
-        "context_length": 0,
-        "quant": quant_from_filename(file_path),
-        "mmproj_path": detect_mmproj_for_model(file_path),
-        "metadata_error": "",
-    }
-
-    try:
-        metadata = read_gguf_metadata(file_path)
-        arch = metadata.get("general.architecture", "")
-        info["architecture"] = arch
-        file_type = metadata.get("general.file_type")
-        if isinstance(file_type, int) and file_type in GGUF_FILE_TYPES:
-            info["quant"] = GGUF_FILE_TYPES[file_type]
-
-        ctx_key = f"{arch}.context_length" if arch else ""
-        context_length = metadata.get(ctx_key)
-        if not isinstance(context_length, int):
-            for key, value in metadata.items():
-                if key.endswith(".context_length") and isinstance(value, int):
-                    context_length = value
-                    break
-        if isinstance(context_length, int):
-            info["context_length"] = context_length
-    except Exception as exc:
-        info["metadata_error"] = str(exc)
-
-    info["recommended_ctx"] = recommend_context(info)
-    return info
-
-
-def recommend_context(info):
-    quant = (info.get("quant") or "").upper()
-    size_gib = info.get("size_gib") or 0
-    model_ctx = info.get("context_length") or 0
-
-    if quant.startswith(("IQ1", "IQ2", "Q2")):
-        recommended = 4096
-    elif quant.startswith(("IQ3", "Q3")):
-        recommended = 6144
-    elif quant.startswith(("IQ4", "Q4")):
-        recommended = 8192
-    elif quant.startswith(("Q5", "IQ5")):
-        recommended = 12288
-    elif quant.startswith("Q6"):
-        recommended = 16384
-    elif quant.startswith("Q8"):
-        recommended = 24576
-    elif quant in {"F16", "BF16", "F32"}:
-        recommended = 32768
-    else:
-        recommended = 8192
-
-    if size_gib >= 24:
-        recommended = min(recommended, 8192)
-    elif size_gib >= 14:
-        recommended = min(recommended, 12288)
-    elif size_gib <= 5 and quant:
-        recommended = max(recommended, 8192)
-
-    if model_ctx:
-        recommended = min(recommended, model_ctx)
-
-    return max(512, int(recommended // 512 * 512))
-
-
-class ModelScanner(QThread):
-    """Сканирование папок с GGUF в отдельном потоке"""
-
-    models_found = Signal(list)
-    progress = Signal(str)
-
-    def __init__(self, base_path):
-        super().__init__()
-        self.base_path = base_path
-
-    def run(self):
-        models = []
-        base = Path(self.base_path)
-        if base.exists():
-            for gguf_file in base.rglob("*.gguf"):
-                if self.isInterruptionRequested():
-                    break
-                rel_path = gguf_file.relative_to(base)
-                info = extract_model_info(gguf_file)
-                info["display"] = str(rel_path)
-                models.append(info)
-                if len(models) % 25 == 0:
-                    self.progress.emit(f"Найдено моделей: {len(models)}")
-        models.sort(key=lambda item: item["display"].lower())
-        self.models_found.emit(models)
-
-
-class LlamaCppUpdater(QThread):
-    progress = Signal(str)
-    percent = Signal(int)
-    completed = Signal(bool, str)
-
-    API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-
-    def __init__(self, server_path):
-        super().__init__()
-        self.server_path = Path(server_path)
-
-    def run(self):
-        try:
-            if not self.server_path.exists():
-                raise FileNotFoundError(f"llama-server.exe not found: {self.server_path}")
-
-            target_dir = self.server_path.parent
-            current_build = self.get_current_build()
-            release = self.fetch_latest_release()
-            latest_build = self.parse_build_number(release.get("tag_name", ""))
-            if latest_build is None:
-                raise RuntimeError(f"Cannot parse release tag: {release.get('tag_name')}")
-
-            current_text = current_build if current_build is not None else "unknown"
-            self.progress.emit(
-                f"llama.cpp local build: {current_text}, latest: {latest_build}"
-            )
-            if current_build is not None and current_build >= latest_build:
-                self.percent.emit(100)
-                self.completed.emit(False, f"Already up to date: build {current_build}")
-                return
-
-            assets = self.select_assets(release)
-            if not assets:
-                raise RuntimeError("No Windows x64 CUDA 12.4 release asset found")
-
-            with tempfile.TemporaryDirectory(prefix="llamacpp-update-") as temp_dir:
-                temp_path = Path(temp_dir)
-                extract_dir = temp_path / "extract"
-                extract_dir.mkdir()
-
-                for index, asset in enumerate(assets, start=1):
-                    name = asset["name"]
-                    archive_path = temp_path / name
-                    self.progress.emit(f"Downloading {name} ({index}/{len(assets)})")
-                    self.download(asset["browser_download_url"], archive_path)
-                    self.progress.emit(f"Extracting {name}")
-                    self.safe_extract_zip(archive_path, extract_dir)
-
-                install_root = self.find_install_root(extract_dir)
-                if not (install_root / "llama-server.exe").exists():
-                    raise RuntimeError("Downloaded archive does not contain llama-server.exe")
-
-                self.progress.emit(f"Installing into {target_dir}")
-                self.copy_tree_contents(install_root, target_dir)
-
-            self.percent.emit(100)
-            self.completed.emit(True, f"Updated llama.cpp to build {latest_build}")
-        except Exception as exc:
-            self.completed.emit(False, f"Update failed: {exc}")
-
-    def get_current_build(self):
-        try:
-            result = subprocess.run(
-                [str(self.server_path), "--version"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                cwd=str(self.server_path.parent),
-                check=False,
-            )
-        except Exception as exc:
-            self.progress.emit(f"Cannot read local version: {exc}")
-            return None
-
-        text = f"{result.stdout}\n{result.stderr}"
-        match = re.search(r"version:\s*(\d+)", text, re.IGNORECASE)
-        return int(match.group(1)) if match else None
-
-    def fetch_latest_release(self):
-        request = urllib.request.Request(
-            self.API_URL,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "LlamaServerGUI",
-            },
-        )
-        self.progress.emit("Checking latest llama.cpp release")
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    def parse_build_number(self, value):
-        match = re.search(r"b?(\d+)", value or "")
-        return int(match.group(1)) if match else None
-
-    def select_assets(self, release):
-        assets = release.get("assets", [])
-        pattern = re.compile(r"^llama-b\d+-bin-win-cuda-12\.4-x64\.zip$")
-        for asset in assets:
-            if pattern.match(asset.get("name", "")):
-                return [asset]
-        return []
-
-    def download(self, url, destination):
-        request = urllib.request.Request(url, headers={"User-Agent": "LlamaServerGUI"})
-        with urllib.request.urlopen(request, timeout=60) as response:
-            total = int(response.headers.get("Content-Length") or 0)
-            done = 0
-            with open(destination, "wb") as out:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        self.percent.emit(min(99, int(done * 100 / total)))
-
-    def safe_extract_zip(self, archive_path, destination):
-        destination = destination.resolve()
-        with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.infolist():
-                target = (destination / member.filename).resolve()
-                try:
-                    target.relative_to(destination)
-                except ValueError as exc:
-                    raise RuntimeError(f"Unsafe zip entry: {member.filename}")
-            archive.extractall(destination)
-
-    def find_install_root(self, extract_dir):
-        candidates = sorted(extract_dir.rglob("llama-server.exe"))
-        return candidates[0].parent if candidates else extract_dir
-
-    def copy_tree_contents(self, source, destination):
-        destination.mkdir(parents=True, exist_ok=True)
-        for item in source.iterdir():
-            target = destination / item.name
-            if item.is_dir():
-                shutil.copytree(item, target, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, target)
+# Импорты из модулей проекта
+from src.core.constants import (
+    DEFAULT_LOCAL_BASE_URL,
+    KILL_TIMEOUT_BENCHMARK,
+    KILL_TIMEOUT_SERVER,
+    LLAMA_ALLOWED_FLAGS,
+    LLAMACPP_PROVIDER_ID,
+    MAX_LOG_LINES,
+)
+from src.core.gguf_parser import extract_model_info
+from src.ui.widgets import CollapsiblePanel
+from src.services.threads import ModelScanner, LlamaCppUpdater
+from src.services.integration import (
+    ensure_opencode_llamacpp_provider,
+    ensure_pi_llamacpp_provider,
+    get_model_ids,
+)
+from src.utils.file_utils import (
+    load_or_create_json,
+    validate_path,
+    write_json_file_safely,
+)
 
 
 class LlamaGUI(QMainWindow):
+    """Главное окно приложения LlamaServer GUI."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LLama.cpp GUI Manager")
         self.setGeometry(100, 100, 1150, 720)
         self.setMinimumSize(900, 560)
 
-        # Процесс для сервера
+        # Процессы
         self.process = QProcess()
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.stateChanged.connect(self.handle_state)
 
-        # Процесс для бенчмарка (отдельный)
         self.bench_process = QProcess()
         self.bench_process.readyReadStandardOutput.connect(self.handle_bench_stdout)
         self.bench_process.readyReadStandardError.connect(self.handle_bench_stderr)
         self.bench_process.finished.connect(self.handle_bench_finished)
 
-        self.profiles_file = "profiles.json"
-        self.settings_file = "settings.json"
-        self.profiles = {}
-        self.settings = {}
-        self.models = []
-        self.models_by_path = {}
-        self.scanner = None
-        self.updater = None
+        # Файлы и данные
+        # Определяем рабочую директорию (для PyInstaller используем _MEIPASS или текущую)
+        if hasattr(sys, "_MEIPASS"):
+            # При запуске из exe используем директорию exe, а не временную
+            self.work_dir = Path(sys.executable).parent
+        else:
+            self.work_dir = Path.cwd()
+
+        self.profiles_file = str(self.work_dir / "profiles.json")
+        self.settings_file = str(self.work_dir / "settings.json")
+        self.profiles: Dict[str, Any] = {}
+        self.settings: Dict[str, Any] = {}
+        self.models: List[Dict[str, Any]] = []
+        self.models_by_path: Dict[str, Dict[str, Any]] = {}
+
+        # Потоки
+        self.scanner: Optional[ModelScanner] = None
+        self.updater: Optional[LlamaCppUpdater] = None
+
+        # Состояние
         self.loading_profile = False
         self.server_stop_requested = False
         self.bench_stop_requested = False
         self.scan_cancel_requested = False
-        self.prompt_speed = None
-        self.generation_speed = None
-        self.tokens_cached = None
-        self.kv_cache_tokens = None
-        self.kv_cache_usage_ratio = None
-        self.effective_ctx_size = None
-        self.decode_last_by_task = {}
-        self.decode_speed_ema = None
-        self.stats_failures = 0
-        self.server_ready = False
-        self.stats_manager = QNetworkAccessManager(self)
-        self.stats_manager.finished.connect(self.handle_stats_reply)
-        self.stats_timer = QTimer(self)
-        self.stats_timer.setInterval(2000)
-        self.stats_timer.timeout.connect(self.poll_server_stats)
+
+        # Метрики
+        self.prompt_speed: Optional[float] = None
+        self.generation_speed: Optional[float] = None
+        self.tokens_cached: Optional[int] = None
+        self.kv_cache_tokens: Optional[int] = None
+        self.kv_cache_usage_ratio: Optional[float] = None
+        self.effective_ctx_size: Optional[int] = None
+        self.decode_last_by_task: Dict[str, tuple] = {}
+        self.decode_speed_ema: Optional[float] = None
+
+        # Tray icon
+        self.tray_icon: Optional[QSystemTrayIcon] = None
+        self.tray_menu: Optional[QMenu] = None
+
+        # Batch logging
+        self.log_buffer: List[tuple] = []
+        self.log_timer = QTimer()
+        self.log_timer.timeout.connect(self.flush_log_buffer)
+        self.log_timer.start(100)  # 100ms
 
         self.setup_ui()
+        self.setup_tray()
         self.load_data()
         QTimer.singleShot(250, self.auto_scan_models)
 
     def setup_ui(self):
+        """Настройка пользовательского интерфейса."""
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        # Левая панель (управление)
+        # === ЛЕВАЯ ПАНЕЛЬ ===
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.setSpacing(6)
 
-        # Группа путей
-        path_group = QGroupBox("Пути")
+        # 1. Пути
+        path_group = QGroupBox("📁 Пути")
         path_layout = QVBoxLayout(path_group)
 
-        # Путь к llama-server.exe
         exe_layout = QHBoxLayout()
         self.exe_path = QLineEdit()
         self.exe_path.setPlaceholderText("Путь к llama-server.exe")
-        self.exe_path.textChanged.connect(
-            self.auto_detect_bench
-        )  # Автоопределение bench
+        self.exe_path.textChanged.connect(self.auto_detect_bench)
         exe_btn = QPushButton("Обзор")
         exe_btn.clicked.connect(self.browse_exe)
         exe_layout.addWidget(self.exe_path)
         exe_layout.addWidget(exe_btn)
         path_layout.addLayout(exe_layout)
 
-        # Путь к llama-bench.exe
         bench_layout = QHBoxLayout()
         self.bench_path = QLineEdit()
         self.bench_path.setPlaceholderText("Путь к llama-bench.exe (авто)")
@@ -585,7 +191,6 @@ class LlamaGUI(QMainWindow):
         path_layout.addLayout(update_layout)
         path_layout.addWidget(self.update_progress)
 
-        # Базовая папка моделей
         model_dir_layout = QHBoxLayout()
         self.model_dir = QLineEdit()
         self.model_dir.setPlaceholderText("Базовая папка с моделями")
@@ -604,23 +209,19 @@ class LlamaGUI(QMainWindow):
         self.scan_progress.setVisible(False)
         path_layout.addWidget(self.scan_status)
         path_layout.addWidget(self.scan_progress)
-
         left_layout.addWidget(path_group)
 
-        # Выбор модели
-        model_group = QGroupBox("Модель")
+        # 2. Модель
+        model_group = QGroupBox("🤖 Модель")
         model_layout = QVBoxLayout(model_group)
-
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.currentIndexChanged.connect(self.on_model_selected)
         model_layout.addWidget(QLabel("Найденные GGUF:"))
         model_layout.addWidget(self.model_combo)
-
         self.auto_params = QCheckBox("Автонастройка ctx/GPU/cache по GGUF")
         self.auto_params.setChecked(True)
         model_layout.addWidget(self.auto_params)
-
         mmproj_layout = QHBoxLayout()
         self.use_mmproj = QCheckBox("Использовать mmproj, если найден")
         self.use_mmproj.setChecked(True)
@@ -629,69 +230,17 @@ class LlamaGUI(QMainWindow):
         mmproj_layout.addWidget(self.use_mmproj)
         mmproj_layout.addWidget(self.mmproj_offload)
         model_layout.addLayout(mmproj_layout)
-
         self.model_info = QLabel("Выберите модель")
         self.model_info.setWordWrap(True)
         model_layout.addWidget(self.model_info)
-
         left_layout.addWidget(model_group)
 
-        # Кнопки управления
-        btn_layout = QHBoxLayout()
+        # 3. Производительность (ВСЕГДА ВИДИМО)
+        perf_group = QGroupBox("🚀 Производительность и память")
+        perf_layout = QVBoxLayout(perf_group)
 
-        self.test_btn = QPushButton("🧪 Тестировать")
-        self.test_btn.setStyleSheet(
-            "background-color: #2196F3; color: white; font-weight: bold;"
-        )
-        self.test_btn.clicked.connect(self.run_benchmark)
-
-        self.start_btn = QPushButton("▶ Старт Server")
-        self.start_btn.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold;"
-        )
-        self.start_btn.clicked.connect(self.start_server)
-
-        self.stop_btn = QPushButton("⏹ Стоп")
-        self.stop_btn.setStyleSheet("background-color: #f44336; color: white;")
-        self.stop_btn.clicked.connect(self.stop_work)
-        self.stop_btn.setEnabled(False)
-
-        btn_layout.addWidget(self.test_btn)
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.stop_btn)
-        left_layout.addLayout(btn_layout)
-
-        # Параметры генерации
-        params_group = QGroupBox("Параметры генерации")
-        params_layout = QVBoxLayout(params_group)
-
-        # Temperature
-        temp_layout = QHBoxLayout()
-        temp_layout.addWidget(QLabel("Temperature:"))
-        self.temperature = QDoubleSpinBox()
-        self.temperature.setRange(0.0, 2.0)
-        self.temperature.setSingleStep(0.1)
-        self.temperature.setValue(0.7)
-        self.temperature.setDecimals(2)
-        temp_layout.addWidget(self.temperature)
-        temp_layout.addStretch()
-        params_layout.addLayout(temp_layout)
-
-        # Repeat Penalty
-        penalty_layout = QHBoxLayout()
-        penalty_layout.addWidget(QLabel("Repeat Penalty:"))
-        self.repeat_penalty = QDoubleSpinBox()
-        self.repeat_penalty.setRange(0.0, 2.0)
-        self.repeat_penalty.setSingleStep(0.01)
-        self.repeat_penalty.setValue(1.1)
-        self.repeat_penalty.setDecimals(2)
-        penalty_layout.addWidget(self.repeat_penalty)
-        penalty_layout.addStretch()
-        params_layout.addLayout(penalty_layout)
-
-        # GPU Layers
-        gpu_layout = QHBoxLayout()
-        gpu_layout.addWidget(QLabel("GPU Layers (-ngl):"))
+        gpu_moe_layout = QHBoxLayout()
+        gpu_moe_layout.addWidget(QLabel("GPU Layers (-ngl):"))
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 200)
         self.gpu_layers.setValue(33)
@@ -699,11 +248,16 @@ class LlamaGUI(QMainWindow):
         self.gpu_auto.setChecked(True)
         self.gpu_auto.toggled.connect(self.gpu_layers.setDisabled)
         self.gpu_layers.setDisabled(True)
-        gpu_layout.addWidget(self.gpu_layers)
-        gpu_layout.addWidget(self.gpu_auto)
-        params_layout.addLayout(gpu_layout)
+        gpu_moe_layout.addWidget(self.gpu_layers)
+        gpu_moe_layout.addWidget(self.gpu_auto)
+        gpu_moe_layout.addSpacing(10)
+        gpu_moe_layout.addWidget(QLabel("CPU MoE (-ncmoe):"))
+        self.cpu_moe_layers = QSpinBox()
+        self.cpu_moe_layers.setRange(0, 200)
+        self.cpu_moe_layers.setValue(0)
+        gpu_moe_layout.addWidget(self.cpu_moe_layers)
+        perf_layout.addLayout(gpu_moe_layout)
 
-        # Context Size
         ctx_layout = QHBoxLayout()
         ctx_layout.addWidget(QLabel("Context Size (-c):"))
         self.ctx_size = QSpinBox()
@@ -711,71 +265,10 @@ class LlamaGUI(QMainWindow):
         self.ctx_size.setSingleStep(512)
         self.ctx_size.setValue(4096)
         ctx_layout.addWidget(self.ctx_size)
-        params_layout.addLayout(ctx_layout)
-
-        # Threads
-        threads_layout = QHBoxLayout()
-        threads_layout.addWidget(QLabel("Threads (-t):"))
-        self.threads = QSpinBox()
-        self.threads.setRange(1, 64)
-        self.threads.setValue(os.cpu_count() or 4)
-        threads_layout.addWidget(self.threads)
-        params_layout.addLayout(threads_layout)
-
-        # Port
-        port_layout = QHBoxLayout()
-        port_layout.addWidget(QLabel("Port:"))
-        self.port = QSpinBox()
-        self.port.setRange(1024, 65535)
-        self.port.setValue(8080)
-        port_layout.addWidget(self.port)
-        params_layout.addLayout(port_layout)
-
-        # Flash Attention
-        self.flash_attn = QCheckBox("Flash Attention (-fa)")
-        self.flash_attn.setChecked(True)
-        params_layout.addWidget(self.flash_attn)
-
-        # Параметры загрузки и памяти
-        runtime_group = QGroupBox("Память и сервер")
-        runtime_layout = QVBoxLayout(runtime_group)
-
-        memory_flags_layout = QHBoxLayout()
-        self.use_mmap = QCheckBox("mmap")
-        self.use_mmap.setChecked(True)
-        self.use_mlock = QCheckBox("mlock")
-        self.verbose = QCheckBox("verbose")
-        self.log_timestamps = QCheckBox("log timestamps")
-        memory_flags_layout.addWidget(self.use_mmap)
-        memory_flags_layout.addWidget(self.use_mlock)
-        memory_flags_layout.addWidget(self.verbose)
-        memory_flags_layout.addWidget(self.log_timestamps)
-        runtime_layout.addLayout(memory_flags_layout)
-
-        cache_layout = QHBoxLayout()
-        cache_layout.addWidget(QLabel("KV cache K/V:"))
-        self.cache_type_k = QComboBox()
-        self.cache_type_v = QComboBox()
-        for cache_type in [
-            "f16",
-            "q8_0",
-            "q4_0",
-            "q4_1",
-            "iq4_nl",
-            "q5_0",
-            "q5_1",
-            "f32",
-        ]:
-            self.cache_type_k.addItem(cache_type)
-            self.cache_type_v.addItem(cache_type)
-        self.cache_type_k.setCurrentText("f16")
-        self.cache_type_v.setCurrentText("f16")
-        cache_layout.addWidget(self.cache_type_k)
-        cache_layout.addWidget(self.cache_type_v)
-        runtime_layout.addLayout(cache_layout)
+        perf_layout.addLayout(ctx_layout)
 
         batch_layout = QHBoxLayout()
-        batch_layout.addWidget(QLabel("Batch/ubatch:"))
+        batch_layout.addWidget(QLabel("Batch / UBatch (-b / -ub):"))
         self.batch_size = QSpinBox()
         self.batch_size.setRange(128, 32768)
         self.batch_size.setSingleStep(128)
@@ -783,82 +276,261 @@ class LlamaGUI(QMainWindow):
         self.ubatch_size = QSpinBox()
         self.ubatch_size.setRange(64, 8192)
         self.ubatch_size.setSingleStep(64)
-        self.ubatch_size.setValue(512)
+        self.ubatch_size.setValue(2048)
         batch_layout.addWidget(self.batch_size)
         batch_layout.addWidget(self.ubatch_size)
-        runtime_layout.addLayout(batch_layout)
+        perf_layout.addLayout(batch_layout)
 
-        server_flags_layout = QHBoxLayout()
-        server_flags_layout.addWidget(QLabel("Slots:"))
+        threads_layout = QHBoxLayout()
+        threads_layout.addWidget(QLabel("Threads gen / batch (-t / -tb):"))
+        self.threads = QSpinBox()
+        self.threads.setRange(1, 64)
+        self.threads.setValue(os.cpu_count() or 4)
+        self.threads_batch = QSpinBox()
+        self.threads_batch.setRange(0, 64)
+        self.threads_batch.setSpecialValueText("same")
+        self.threads_batch.setValue(0)
+        threads_layout.addWidget(self.threads)
+        threads_layout.addWidget(self.threads_batch)
+        perf_layout.addLayout(threads_layout)
+
+        kv_layout = QHBoxLayout()
+        kv_layout.addWidget(QLabel("KV Cache K / V (-ctk / -ctv):"))
+        self.cache_type_k = QComboBox()
+        self.cache_type_v = QComboBox()
+        for ct in ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]:
+            self.cache_type_k.addItem(ct)
+            self.cache_type_v.addItem(ct)
+        self.cache_type_k.setCurrentText("f16")
+        self.cache_type_v.setCurrentText("f16")
+        kv_layout.addWidget(self.cache_type_k)
+        kv_layout.addWidget(self.cache_type_v)
+        perf_layout.addLayout(kv_layout)
+
+        flags_layout = QHBoxLayout()
+        self.flash_attn = QCheckBox("Flash Attention (-fa)")
+        self.flash_attn.setChecked(True)
+        self.fit_off = QCheckBox("Fit off (--fit off)")
+        self.fit_off.setChecked(True)
+        flags_layout.addWidget(self.flash_attn)
+        flags_layout.addWidget(self.fit_off)
+        perf_layout.addLayout(flags_layout)
+
+        rea_layout = QHBoxLayout()
+        rea_layout.addWidget(QLabel("Reasoning (-rea):"))
+        self.reasoning_mode = QComboBox()
+        for m in ("off", "auto", "on"):
+            self.reasoning_mode.addItem(m)
+        self.reasoning_mode.setCurrentText("off")
+        rea_layout.addWidget(self.reasoning_mode)
+        perf_layout.addLayout(rea_layout)
+
+        port_slot_layout = QHBoxLayout()
+        port_slot_layout.addWidget(QLabel("Port:"))
+        self.port = QSpinBox()
+        self.port.setRange(1024, 65535)
+        self.port.setValue(8080)
+        port_slot_layout.addWidget(self.port)
+        port_slot_layout.addSpacing(10)
+        port_slot_layout.addWidget(QLabel("Slots (-np):"))
         self.parallel_slots = QSpinBox()
         self.parallel_slots.setRange(1, 16)
         self.parallel_slots.setValue(1)
+        port_slot_layout.addWidget(self.parallel_slots)
+        perf_layout.addLayout(port_slot_layout)
+
+        chk_ram_layout = QHBoxLayout()
+        chk_ram_layout.addWidget(QLabel("Ctx Checkpoints:"))
+        self.ctx_checkpoints = QSpinBox()
+        self.ctx_checkpoints.setRange(-1, 128)
+        self.ctx_checkpoints.setSpecialValueText("default")
+        self.ctx_checkpoints.setValue(-1)
+        chk_ram_layout.addWidget(self.ctx_checkpoints)
+        chk_ram_layout.addSpacing(10)
+        chk_ram_layout.addWidget(QLabel("Cache RAM (MiB):"))
+        self.cache_ram = QSpinBox()
+        self.cache_ram.setRange(-2, 262144)
+        self.cache_ram.setSpecialValueText("default")
+        self.cache_ram.setValue(-2)
+        chk_ram_layout.addWidget(self.cache_ram)
+        perf_layout.addLayout(chk_ram_layout)
+        left_layout.addWidget(perf_group)
+
+        # 4. Спойлер: Сэмплинг и отладка
+        adv_panel = CollapsiblePanel("⚙️ Сэмплинг, отладка и сервер")
+        samp_layout = QHBoxLayout()
+        samp_layout.addWidget(QLabel("Temperature:"))
+        self.temperature = QDoubleSpinBox()
+        self.temperature.setRange(0.0, 2.0)
+        self.temperature.setSingleStep(0.1)
+        self.temperature.setValue(0.7)
+        self.temperature.setDecimals(2)
+        samp_layout.addWidget(self.temperature)
+        samp_layout.addSpacing(10)
+        samp_layout.addWidget(QLabel("Repeat Penalty:"))
+        self.repeat_penalty = QDoubleSpinBox()
+        self.repeat_penalty.setRange(0.0, 2.0)
+        self.repeat_penalty.setSingleStep(0.01)
+        self.repeat_penalty.setValue(1.1)
+        self.repeat_penalty.setDecimals(2)
+        samp_layout.addWidget(self.repeat_penalty)
+        adv_panel.add_layout(samp_layout)
+
+        mem_dbg_layout = QHBoxLayout()
+        self.use_mmap = QCheckBox("mmap")
+        self.use_mmap.setChecked(True)
+        self.use_mlock = QCheckBox("mlock")
+        self.verbose = QCheckBox("verbose")
+        self.log_timestamps = QCheckBox("log timestamps")
+        mem_dbg_layout.addWidget(self.use_mmap)
+        mem_dbg_layout.addWidget(self.use_mlock)
+        mem_dbg_layout.addWidget(self.verbose)
+        mem_dbg_layout.addWidget(self.log_timestamps)
+        adv_panel.add_layout(mem_dbg_layout)
+
+        srv_layout = QHBoxLayout()
         self.cont_batching = QCheckBox("cont batching")
         self.cont_batching.setChecked(True)
         self.cache_prompt = QCheckBox("cache prompt")
         self.cache_prompt.setChecked(True)
-        server_flags_layout.addWidget(self.parallel_slots)
-        server_flags_layout.addWidget(self.cont_batching)
-        server_flags_layout.addWidget(self.cache_prompt)
-        runtime_layout.addLayout(server_flags_layout)
-
-        extra_flags_layout = QHBoxLayout()
         self.context_shift = QCheckBox("context shift")
         self.no_webui = QCheckBox("no webui")
-        self.server_metrics = QCheckBox("metrics")
-        self.server_metrics.setChecked(True)
-        extra_flags_layout.addWidget(self.context_shift)
-        extra_flags_layout.addWidget(self.no_webui)
-        extra_flags_layout.addWidget(self.server_metrics)
-        runtime_layout.addLayout(extra_flags_layout)
+        srv_layout.addWidget(self.cont_batching)
+        srv_layout.addWidget(self.cache_prompt)
+        srv_layout.addWidget(self.context_shift)
+        srv_layout.addWidget(self.no_webui)
+        adv_panel.add_layout(srv_layout)
 
-        params_layout.addWidget(runtime_group)
-
-        # Доп. параметры
-        params_layout.addWidget(QLabel("Доп. параметры:"))
+        adv_panel.add_widget(QLabel("Доп. параметры:"))
         self.extra_args = QLineEdit()
         self.extra_args.setPlaceholderText(
             "--top-p 0.9 --min-p 0.05 --rope-scaling yarn ..."
         )
-        params_layout.addWidget(self.extra_args)
+        adv_panel.add_widget(self.extra_args)
+        left_layout.addWidget(adv_panel)
 
-        left_layout.addWidget(params_group)
+        # 5. Спойлер: Интеграция
+        int_panel = CollapsiblePanel("🔌 Интеграция (OpenCode / PI)")
+        oc_layout = QHBoxLayout()
+        oc_layout.addWidget(QLabel("OpenCode JSON:"))
+        self.opencode_config_path = QLineEdit()
+        self.opencode_config_path.setPlaceholderText("Путь к opencode.json")
+        self.opencode_config_path.editingFinished.connect(self.save_settings)
+        oc_btn = QPushButton("📂")
+        oc_btn.clicked.connect(self.browse_opencode_config)
+        oc_layout.addWidget(self.opencode_config_path)
+        oc_layout.addWidget(oc_btn)
+        int_panel.add_layout(oc_layout)
 
-        # Параметры бенчмарка
-        bench_params_group = QGroupBox("Параметры тестирования")
-        bench_layout = QHBoxLayout(bench_params_group)
+        pi_layout = QHBoxLayout()
+        pi_layout.addWidget(QLabel("PI JSON:"))
+        self.pi_config_path = QLineEdit()
+        self.pi_config_path.setPlaceholderText("Путь к PI config.json")
+        self.pi_config_path.editingFinished.connect(self.save_settings)
+        pi_btn = QPushButton("📂")
+        pi_btn.clicked.connect(self.browse_pi_config)
+        pi_layout.addWidget(self.pi_config_path)
+        pi_layout.addWidget(pi_btn)
+        int_panel.add_layout(pi_layout)
 
-        bench_layout.addWidget(QLabel("Prompt (-p):"))
+        tgt_layout = QHBoxLayout()
+        tgt_layout.addWidget(QLabel("Цель:"))
+        self.integration_target = QComboBox()
+        self.integration_target.addItem("OpenCode", "opencode")
+        self.integration_target.addItem("PI", "pi")
+        self.integration_target.currentIndexChanged.connect(
+            lambda *_: self.check_integration_models(silent=True)
+        )
+        tgt_layout.addWidget(self.integration_target)
+        self.integration_check_btn = QPushButton("Проверить")
+        self.integration_check_btn.clicked.connect(self.check_integration_models)
+        tgt_layout.addWidget(self.integration_check_btn)
+        int_panel.add_layout(tgt_layout)
+
+        self.integration_model_label = QLabel("Модель для добавления: не выбрана")
+        self.integration_model_label.setWordWrap(True)
+        int_panel.add_widget(self.integration_model_label)
+        self.integration_models_list = QListWidget()
+        self.integration_models_list.setMinimumHeight(80)
+        int_panel.add_widget(self.integration_models_list)
+
+        act_layout = QHBoxLayout()
+        self.integration_add_btn = QPushButton("Добавить")
+        self.integration_add_btn.clicked.connect(self.add_model_to_integration)
+        self.integration_remove_btn = QPushButton("Удалить")
+        self.integration_remove_btn.clicked.connect(self.remove_model_from_integration)
+        act_layout.addWidget(self.integration_add_btn)
+        act_layout.addWidget(self.integration_remove_btn)
+        int_panel.add_layout(act_layout)
+
+        self.integration_status = QLabel("Укажите путь к конфигу и нажмите Проверить")
+        self.integration_status.setWordWrap(True)
+        int_panel.add_widget(self.integration_status)
+        left_layout.addWidget(int_panel)
+
+        # 6. Спойлер: Бенчмарк
+        bench_panel = CollapsiblePanel("🧪 Бенчмарк")
+        bp_layout = QHBoxLayout()
+        bp_layout.addWidget(QLabel("Prompt (-p):"))
         self.bench_prompt = QSpinBox()
         self.bench_prompt.setRange(16, 4096)
         self.bench_prompt.setValue(128)
         self.bench_prompt.setSingleStep(64)
-        bench_layout.addWidget(self.bench_prompt)
-
-        bench_layout.addWidget(QLabel("Gen (-n):"))
+        bp_layout.addWidget(self.bench_prompt)
+        bp_layout.addSpacing(10)
+        bp_layout.addWidget(QLabel("Gen (-n):"))
         self.bench_gen = QSpinBox()
         self.bench_gen.setRange(16, 4096)
         self.bench_gen.setValue(256)
         self.bench_gen.setSingleStep(64)
-        bench_layout.addWidget(self.bench_gen)
+        bp_layout.addWidget(self.bench_gen)
+        bench_panel.add_layout(bp_layout)
+        self.test_btn = QPushButton("🧪 Тестировать скорость")
+        self.test_btn.setStyleSheet(
+            "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.test_btn.clicked.connect(self.run_benchmark)
+        bench_panel.add_widget(self.test_btn)
+        left_layout.addWidget(bench_panel)
 
-        left_layout.addWidget(bench_params_group)
+        # 7. Preview CLI
+        preview_group = QGroupBox("👁️ Preview CLI")
+        preview_layout = QVBoxLayout(preview_group)
+        self.cli_preview = QLineEdit()
+        self.cli_preview.setReadOnly(True)
+        self.cli_preview.setPlaceholderText("Команда будет отображаться здесь...")
+        self.cli_preview.setStyleSheet(
+            "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
+        )
+        preview_layout.addWidget(self.cli_preview)
+        left_layout.addWidget(preview_group)
 
-        # Скрытые виджеты оставлены для совместимости существующей логики профилей.
-        self.profile_name = QLineEdit()
-        self.profile_list = QListWidget()
-        self.profile_list.itemClicked.connect(self.load_profile)
+        # 8. Кнопки управления
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("▶ Старт Server")
+        self.start_btn.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.start_btn.clicked.connect(self.start_server)
+        self.stop_btn = QPushButton("⏹ Стоп")
+        self.stop_btn.setStyleSheet(
+            "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.stop_btn.clicked.connect(self.stop_work)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.stop_btn)
+        left_layout.addLayout(btn_layout)
 
         left_layout.addStretch()
         left_scroll = QScrollArea()
         left_scroll.setWidget(left_panel)
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(390)
+        left_scroll.setMinimumWidth(380)
         left_scroll.setMaximumWidth(520)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        main_layout.addWidget(left_scroll, 0)
 
-        # Правая панель (логи)
+        # === ПРАВАЯ ПАНЕЛЬ (ЛОГИ) ===
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 4, 4, 4)
@@ -891,158 +563,592 @@ class LlamaGUI(QMainWindow):
         clear_btn.clicked.connect(self.logs.clear)
         right_layout.addWidget(clear_btn)
 
-        main_layout.addWidget(right_panel, 2)
+        # QSplitter для изменяемых пропорций
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([420, 730])
+        main_layout.addWidget(splitter)
+
         self.setup_tooltips()
 
-    def setup_tooltips(self):
-        tips = {
-            self.exe_path: "Путь к llama-server.exe. Это основной сервер llama.cpp, который будет слушать API-порт.",
-            self.bench_path: "Путь к llama-bench.exe. Используется только для теста скорости prompt processing и generation.",
-            self.model_dir: "Корневая папка, где GUI рекурсивно ищет .gguf модели и mmproj/projector файлы.",
-            self.scan_btn: "Сканирует папку моделей в фоне. Во время сканирования эта кнопка отменяет обход.",
-            self.scan_status: "Статус фонового сканирования моделей.",
-            self.scan_progress: "Индикатор активного фонового сканирования.",
-            self.model_combo: "Выбранная GGUF-модель. Можно выбрать найденную модель или ввести путь вручную.",
-            self.auto_params: "Автоматически выставляет примерный ctx, KV cache и batch по GGUF metadata, кванту и размеру модели.",
-            self.use_mmproj: "Для multimodal/vision моделей добавляет -mm с найденным projector-файлом. Отключите, если запускаете только текст.",
-            self.mmproj_offload: "Разрешает offload mmproj/projector части. Если выключить, будет добавлен --no-mmproj-offload.",
-            self.model_info: "Краткая информация из GGUF metadata: архитектура, квант, размер, контекст и найденный mmproj.",
-            self.temperature: "Sampling temperature. Ниже - более предсказуемо, выше - разнообразнее.",
-            self.repeat_penalty: "Штраф повторов. Обычно 1.05-1.20; слишком высокое значение может портить стиль ответа.",
-            self.gpu_layers: "Сколько слоев весов модели выгружать на GPU. Влияет на VRAM и скорость, но не задает размер контекста.",
-            self.gpu_auto: "Для server передает -ngl auto. Для bench используется 99, потому что llama-bench не принимает auto.",
-            self.ctx_size: "Размер контекста. Большие значения резко увеличивают KV cache и могут вызвать OOM уже при старте.",
-            self.threads: "CPU-потоки для llama.cpp. Полезно для CPU-части и если часть модели/кэша не на GPU.",
-            self.port: "HTTP-порт llama-server. OpenAI-compatible API будет доступен на 127.0.0.1:<port>.",
-            self.flash_attn: "Flash Attention. Обычно ускоряет и уменьшает память на поддерживаемых GPU/backend.",
-            self.use_mmap: "Memory mapping модели. Обычно включен по умолчанию и ускоряет/упрощает загрузку больших файлов.",
-            self.use_mlock: "Пытается удержать модель в RAM. Используйте только если достаточно памяти.",
-            self.verbose: "Подробный лог llama.cpp. Полезно для диагностики, но увеличивает поток логов.",
-            self.log_timestamps: "Добавляет timestamps в лог llama.cpp, если сборка поддерживает этот флаг.",
-            self.cache_type_k: "Тип KV cache для key. q8_0/q4_0 экономят память, f16 обычно точнее.",
-            self.cache_type_v: "Тип KV cache для value. q8_0/q4_0 экономят память, f16 обычно точнее.",
-            self.batch_size: "Batch size для обработки prompt. Больше может ускорить prompt, но повышает пиковое потребление памяти.",
-            self.ubatch_size: "Micro-batch size. Уменьшайте при OOM или нестабильности на GPU.",
-            self.parallel_slots: "Количество server slots. Каждый слот увеличивает потребление KV cache.",
-            self.cont_batching: "Continuous batching. Обычно полезно для сервера с несколькими запросами.",
-            self.cache_prompt: "Prompt cache. Может ускорять повторное использование общего префикса.",
-            self.context_shift: "Context shift позволяет серверу продолжать работу при заполнении контекста, сдвигая старые токены.",
-            self.no_webui: "Отключает встроенный Web UI llama-server, оставляя API.",
-            self.server_metrics: "Включает --metrics. GUI начнет опрашивать /metrics только после полной загрузки сервера.",
-            self.extra_args: "Дополнительные параметры llama.cpp. Разбираются с учетом кавычек через shlex.",
-            self.bench_prompt: "Количество prompt-токенов для llama-bench (-p). Используется только в тесте.",
-            self.bench_gen: "Количество генерируемых токенов для llama-bench (-n). Используется только в тесте.",
-            self.profile_name: "Имя профиля для сохранения текущих настроек.",
-            self.profile_list: "Список сохраненных профилей. Клик по профилю загружает его параметры.",
-            self.test_btn: "Запускает llama-bench с текущей моделью и параметрами. Можно остановить кнопкой Стоп.",
-            self.start_btn: "Запускает llama-server с текущими параметрами.",
-            self.stop_btn: "Останавливает активный server, benchmark или сканирование без блокировки UI.",
-            self.speed_label: "Последняя найденная скорость prompt/gen из строк llama.cpp с tok/s.",
-            self.context_label: "Заполненность контекста по tokens_cached из JSON-ответов llama-server, если такие строки попадают в лог.",
-            self.autoscroll_logs: "Если включено, лог всегда прокручивается к новым строкам. Отключите для чтения старого вывода.",
-            self.logs: "stdout/stderr активного процесса. Цветом выделяются ошибки и benchmark.",
-        }
-        tips[self.update_llama_btn] = (
-            "Checks the latest llama.cpp GitHub release and installs Windows x64 "
-            "CUDA 12.4 build into the current llama-server.exe directory."
-        )
-        tips[self.update_status] = "llama.cpp updater status."
-        tips[self.update_progress] = (
-            "Download progress for the current llama.cpp archive."
-        )
-        for widget, text in tips.items():
-            widget.setToolTip(text)
-
-    def add_tooltip(self, widget, text):
-        widget.setToolTip(text)
-
-    def update_llamacpp(self):
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.warning(
-                self,
-                "llama.cpp updater",
-                "Stop llama-server before updating llama.cpp.",
-            )
+    def setup_tray(self):
+        """Настройка системного трея."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
             return
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setToolTip("LlamaServer GUI")
+
+        # Меню трея
+        self.tray_menu = QMenu()
+        show_action = QAction("Показать", self)
+        show_action.triggered.connect(self.showNormal)
+        self.tray_menu.addAction(show_action)
+
+        hide_action = QAction("Скрыть", self)
+        hide_action.triggered.connect(self.hide)
+        self.tray_menu.addAction(hide_action)
+
+        self.tray_menu.addSeparator()
+
+        exit_action = QAction("Выход", self)
+        exit_action.triggered.connect(self.close)
+        self.tray_menu.addAction(exit_action)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        """Обработка активации иконки трея."""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+
+    def setup_tooltips(self):
+        """Установка подсказок для виджетов."""
+        tips = {
+            self.exe_path: "Путь к llama-server.exe. Основной сервер llama.cpp.",
+            self.bench_path: "Путь к llama-bench.exe. Используется только для теста скорости.",
+            self.model_dir: "Корневая папка для рекурсивного поиска .gguf и mmproj.",
+            self.scan_btn: "Сканирует папку моделей в фоне. Повторный клик отменяет обход.",
+            self.model_combo: "Выбранная GGUF-модель. Можно выбрать из списка или ввести путь вручную.",
+            self.auto_params: "Автоматически выставляет ctx, KV cache и batch по GGUF metadata.",
+            self.use_mmproj: "Добавляет -mm с найденным projector-файлом для vision/multimodal моделей.",
+            self.mmproj_offload: "Разрешает offload mmproj. Если выключить, добавляется --no-mmproj-offload.",
+            self.gpu_layers: "Слои весов на GPU. Главный рычаг скорости и VRAM.",
+            self.gpu_auto: "Для server: -ngl auto. Для bench: 99.",
+            self.cpu_moe_layers: "CPU MoE layers (-ncmoe). Критично для MoE-моделей (например Qwen3-A3B).",
+            self.ctx_size: "Размер контекста. Резко влияет на KV cache и VRAM.",
+            self.batch_size: "Batch size (-b). Влияет на обработку промпта.",
+            self.ubatch_size: "Micro-batch (-ub). Ключевой параметр для скорости prefill.",
+            self.threads: "CPU-потоки генерации (-t).",
+            self.threads_batch: "CPU-потоки обработки промпта (-tb). 0 = same as -t.",
+            self.cache_type_k: "Тип KV cache Key. q8_0 экономит ~50% VRAM на длинных контекстах.",
+            self.cache_type_v: "Тип KV cache Value.",
+            self.flash_attn: "Flash Attention. Ускоряет и экономит память на современных GPU.",
+            self.fit_off: "Отключает авто-подгонку контекста под VRAM (--fit off).",
+            self.reasoning_mode: "Режим reasoning (-rea). Влияет на thinking-токены у MoE/Reasoning моделей.",
+            self.port: "HTTP-порт llama-server.",
+            self.parallel_slots: "Количество слотов (-np). Каждый слот увеличивает потребление KV cache.",
+            self.ctx_checkpoints: "Ctx checkpoints. Снижает пиковое RAM при длинных контекстах.",
+            self.cache_ram: "Явный лимит RAM под cache (MiB).",
+            self.temperature: "Sampling temperature. Влияет на разнообразие, не на скорость.",
+            self.repeat_penalty: "Штраф повторов. Обычно 1.05-1.20.",
+            self.use_mmap: "Memory mapping модели. Обычно ускоряет загрузку.",
+            self.use_mlock: "Удерживает модель в RAM. Требует достаточно памяти.",
+            self.verbose: "Подробный лог llama.cpp.",
+            self.log_timestamps: "Добавляет timestamps в лог.",
+            self.cont_batching: "Continuous batching. Полезно для нескольких одновременных запросов.",
+            self.cache_prompt: "Prompt cache. Ускоряет повторное использование префикса.",
+            self.context_shift: "Context shift при заполнении контекста.",
+            self.no_webui: "Отключает встроенный Web UI.",
+            self.extra_args: "Дополнительные параметры. Разбираются через shlex.",
+            self.bench_prompt: "Токены промпта для бенчмарка (-p).",
+            self.bench_gen: "Генерируемые токены для бенчмарка (-n).",
+            self.test_btn: "Запускает llama-bench с текущими параметрами.",
+            self.start_btn: "Запускает llama-server.",
+            self.stop_btn: "Останавливает сервер, бенчмарк или сканирование.",
+            self.speed_label: "Скорость prompt/gen из логов.",
+            self.context_label: "Заполненность KV cache.",
+            self.autoscroll_logs: "Автоматическая прокрутка логов вниз.",
+            self.opencode_config_path: "Путь к opencode.json для интеграции.",
+            self.pi_config_path: "Путь к config.json PI для интеграции.",
+            self.integration_target: "Выбор целевого конфига: OpenCode или PI.",
+            self.integration_check_btn: "Проверить модели в выбранном конфиге.",
+            self.integration_add_btn: "Добавить текущую модель в конфиг.",
+            self.integration_remove_btn: "Удалить модель из конфига.",
+        }
+        for widget, text in tips.items():
+            if widget:
+                widget.setToolTip(text)
+
+    # === Методы управления процессами ===
+
+    def update_cli_preview(self):
+        """Обновление preview командной строки."""
+        try:
+            args = self.build_args(for_benchmark=False)
+            if args:
+                exe = self.exe_path.text() or "llama-server.exe"
+                cmd = f"{exe} {' '.join(args)}"
+                self.cli_preview.setText(cmd)
+            else:
+                self.cli_preview.setText("")
+        except Exception:
+            self.cli_preview.setText("")
+
+    def start_server(self):
+        """Запуск llama-server."""
         if self.bench_process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(
-                self,
-                "llama.cpp updater",
-                "Stop benchmark before updating llama.cpp.",
+                self, "Benchmark запущен", "Остановите benchmark перед запуском сервера"
             )
             return
-        if self.updater and self.updater.isRunning():
-            return
-
-        exe = self.exe_path.text().strip()
+        exe = self.exe_path.text()
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(
-                self, "llama.cpp updater", "Select an existing llama-server.exe first."
+            QMessageBox.critical(self, "Ошибка", "Укажите путь к llama-server.exe")
+            return
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.log("⚠️ Сервер уже запущен")
+            return
+        args = self.build_args(for_benchmark=False)
+        if not args:
+            return
+        self.log(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
+        self.server_stop_requested = False
+        self.reset_speed_metrics()
+        self.process.start(exe, args)
+        self.start_btn.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        # Обновляем tray tooltip
+        if self.tray_icon:
+            self.tray_icon.setToolTip(
+                f"LlamaServer GUI - Running on port {self.port.value()}"
+            )
+
+    def stop_work(self):
+        """Остановка текущей работы."""
+        stopped = False
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.stop_server()
+            stopped = True
+        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
+            self.stop_benchmark()
+            stopped = True
+        if self.scanner and self.scanner.isRunning():
+            self.cancel_scan()
+            stopped = True
+        if not stopped:
+            self.update_action_buttons()
+
+    def stop_server(self):
+        """Остановка сервера с graceful shutdown."""
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            if self.server_stop_requested:
+                return
+            self.server_stop_requested = True
+            self.log("⏹ Остановка сервера...")
+            self.process.terminate()
+            QTimer.singleShot(KILL_TIMEOUT_SERVER, self.kill_server_if_running)
+
+    def kill_server_if_running(self):
+        """Принудительная остановка сервера."""
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.log("⚠️ Сервер не завершился штатно, принудительная остановка")
+            self.process.kill()
+
+    def run_benchmark(self):
+        """Запуск бенчмарка."""
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(
+                self, "Сервер запущен", "Остановите сервер перед запуском benchmark"
             )
             return
-
-        self.update_progress.setValue(0)
-        self.update_progress.setVisible(True)
-        self.update_status.setText("Checking release...")
-        self.log("llama.cpp update: checking latest release\n")
-        self.updater = LlamaCppUpdater(exe)
-        self.updater.progress.connect(self.on_update_progress)
-        self.updater.percent.connect(self.update_progress.setValue)
-        self.updater.completed.connect(self.on_update_completed)
-        self.updater.finished.connect(self.on_update_thread_finished)
-        self.updater.start()
-        self.update_action_buttons()
-
-    def on_update_progress(self, text):
-        self.update_status.setText(text)
-        self.log(f"llama.cpp update: {text}\n")
-
-    def on_update_completed(self, changed, message):
-        self.update_status.setText(message)
-        level = "error" if "failed" in message.lower() else "info"
-        self.log(f"llama.cpp update: {message}\n", level)
-        if changed:
+        bench_exe = self.bench_path.text()
+        if not bench_exe or not os.path.exists(bench_exe):
             self.auto_detect_bench()
-            self.save_settings()
+            bench_exe = self.bench_path.text()
+            if not bench_exe or not os.path.exists(bench_exe):
+                QMessageBox.critical(self, "Ошибка", "Укажите путь к llama-bench.exe")
+                return
+        args = self.build_args(for_benchmark=True)
+        if not args:
+            return
+        self.log(
+            f"🧪 Запуск бенчмарка: {os.path.basename(bench_exe)}\n"
+            f"   Модель: {self.model_combo.currentText()}\n"
+            f"   Параметры: {' '.join(args)}"
+        )
+        if self.bench_process.state() == QProcess.ProcessState.Running:
+            self.stop_benchmark()
+            return
+        self.reset_speed_metrics()
+        self.bench_stop_requested = False
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("⏳ Тестирование...")
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.bench_process.start(bench_exe, args)
 
-    def on_update_thread_finished(self):
-        self.update_progress.setVisible(False)
+    def stop_benchmark(self):
+        """Остановка бенчмарка с graceful shutdown."""
+        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
+            self.bench_stop_requested = True
+            self.log("⏹ Остановка benchmark...")
+            self.bench_process.terminate()
+            QTimer.singleShot(KILL_TIMEOUT_BENCHMARK, self.kill_benchmark_if_running)
+
+    def kill_benchmark_if_running(self):
+        """Принудительная остановка бенчмарка."""
+        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
+            self.log("⚠️ Benchmark не завершился штатно, принудительная остановка")
+            self.bench_process.kill()
+
+    # === Обработчики вывода процессов ===
+
+    def handle_stdout(self):
+        """Обработка stdout сервера."""
+        data = (
+            self.process.readAllStandardOutput().data().decode("utf-8", errors="ignore")
+        )
+        self.update_speed_metrics(data)
+        self.log(data, "info")
+
+    def handle_stderr(self):
+        """Обработка stderr сервера."""
+        data = (
+            self.process.readAllStandardError().data().decode("utf-8", errors="ignore")
+        )
+        self.update_speed_metrics(data)
+        self.log(data, "error")
+
+    def handle_state(self, state):
+        """Обработка изменения состояния процесса."""
+        if state == QProcess.ProcessState.NotRunning:
+            self.start_btn.setEnabled(True)
+            self.test_btn.setEnabled(
+                self.bench_process.state() == QProcess.ProcessState.NotRunning
+            )
+            self.update_action_buttons()
+            if self.server_stop_requested:
+                self.log("⏹ Сервер остановлен")
+            else:
+                self.log(f"⏹ Сервер остановлен (код: {self.process.exitCode()})")
+            self.server_stop_requested = False
+            # Обновляем tray tooltip
+            if self.tray_icon:
+                self.tray_icon.setToolTip("LlamaServer GUI - Stopped")
+
+    def handle_bench_stdout(self):
+        """Обработка stdout бенчмарка."""
+        data = (
+            self.bench_process.readAllStandardOutput()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self.update_speed_metrics(data)
+        self.log(data, "bench")
+
+    def handle_bench_stderr(self):
+        """Обработка stderr бенчмарка."""
+        data = (
+            self.bench_process.readAllStandardError()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self.update_speed_metrics(data)
+        self.log(data, "error")
+
+    def handle_bench_finished(self, exit_code):
+        """Обработка завершения бенчмарка."""
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("🧪 Тестировать скорость")
+        self.start_btn.setEnabled(
+            self.process.state() == QProcess.ProcessState.NotRunning
+        )
         self.update_action_buttons()
+        if self.bench_stop_requested:
+            self.log("⏹ Тестирование остановлено")
+        elif exit_code == 0:
+            self.log("✅ Тестирование завершено успешно")
+        else:
+            self.log(f"❌ Ошибка тестирования (код: {exit_code})", "error")
+        self.bench_stop_requested = False
 
-    def auto_detect_bench(self):
-        """Автоопределение пути к llama-bench рядом с llama-server"""
-        server_path = self.exe_path.text()
-        if server_path and os.path.exists(server_path):
-            dir_path = os.path.dirname(server_path)
-            base_name = os.path.basename(server_path).replace("server", "bench")
-            bench_path = os.path.join(dir_path, base_name)
-            if os.path.exists(bench_path):
-                self.bench_path.setText(bench_path)
+    # === Метрики и логирование ===
 
-    def browse_exe(self):
-        file, _ = QFileDialog.getOpenFileName(
-            self, "Выберите llama-server", "", "Executable (*.exe)"
+    def reset_speed_metrics(self):
+        """Сброс метрик скорости."""
+        self.prompt_speed = self.generation_speed = self.tokens_cached = (
+            self.kv_cache_tokens
+        ) = None
+        self.kv_cache_usage_ratio = self.effective_ctx_size = self.decode_speed_ema = (
+            None
         )
-        if file:
-            self.exe_path.setText(file)
-            self.save_settings()
+        self.decode_last_by_task = {}
+        self.speed_label.setText("Скорость: нет данных")
+        self.context_label.setText("Контекст: нет данных")
 
-    def browse_bench(self):
-        file, _ = QFileDialog.getOpenFileName(
-            self, "Выберите llama-bench", "", "Executable (*.exe)"
-        )
-        if file:
-            self.bench_path.setText(file)
-            self.save_settings()
+    def update_speed_metrics(self, text):
+        """Обновление метрик скорости из вывода."""
+        if not text:
+            return
+        self.update_metrics_from_server_log_lines(text)
+        self.update_metrics_from_json(text)
+        for line in text.splitlines():
+            lower = line.lower()
+            m = re.search(
+                r"prompt eval.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
+                lower,
+            )
+            if m:
+                self.prompt_speed = self.parse_speed_value(m.group(1))
+            m = re.search(
+                r"(?<!prompt )\beval(?: time)?\b.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
+                lower,
+            )
+            if m:
+                self.generation_speed = self.parse_speed_value(m.group(1))
+            m = re.search(
+                r"\bpp\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
+                lower,
+            )
+            if m:
+                self.prompt_speed = self.parse_speed_value(m.group(1))
+            m = re.search(
+                r"\btg\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
+                lower,
+            )
+            if m:
+                self.generation_speed = self.parse_speed_value(m.group(1))
+        self.refresh_speed_label()
 
-    def browse_model_dir(self):
-        dir = QFileDialog.getExistingDirectory(self, "Выберите папку с моделями")
-        if dir:
-            self.model_dir.setText(dir)
-            self.save_settings()
-            self.scan_models()
+    def update_metrics_from_json(self, text):
+        """Обновление метрик из JSON в выводе."""
+        for match in re.finditer(r'"timings"\s*:\s*\{', text):
+            start = text.rfind("{", 0, match.start())
+            if start < 0:
+                continue
+            payload = self.extract_json_object(text, start)
+            if not payload:
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            timings = data.get("timings")
+            if not isinstance(timings, dict):
+                continue
+            ps = timings.get("prompt_per_second")
+            gs = timings.get("predicted_per_second")
+            tc = data.get("tokens_cached")
+            if isinstance(ps, (int, float)):
+                self.prompt_speed = float(ps)
+            if isinstance(gs, (int, float)):
+                self.generation_speed = float(gs)
+            if isinstance(tc, int):
+                self.tokens_cached = tc
+            self.refresh_context_label()
+
+    def update_metrics_from_server_log_lines(self, text):
+        """Обновление метрик из строк логов сервера."""
+        now = time.monotonic()
+        changed = False
+        for line in text.splitlines():
+            lower = line.lower()
+            m = re.search(r"n_ctx\s*=\s*(\d+)\s*,\s*n_tokens\s*=\s*(\d+)", lower)
+            if m:
+                ctx, used = int(m.group(1)), int(m.group(2))
+                if ctx > 0:
+                    self.effective_ctx_size = ctx
+                if used >= 0:
+                    self.kv_cache_tokens = used
+                changed = True
+            m = re.search(
+                r"slot\s+update_batch.*?n_ctx\s*=\s*(\d+).*?n_tokens\s*=\s*(\d+)", lower
+            )
+            if m:
+                ctx, used = int(m.group(1)), int(m.group(2))
+                if ctx > 0:
+                    self.effective_ctx_size = ctx
+                if used >= 0:
+                    self.kv_cache_tokens = used
+                changed = True
+            m = re.search(r"\|\s*task\s+(\d+)\s*\|.*?n_decoded\s*=\s*(\d+)", lower)
+            if m:
+                tid, dec = m.group(1), int(m.group(2))
+                prev = self.decode_last_by_task.get(tid)
+                self.decode_last_by_task[tid] = (dec, now)
+                if prev:
+                    pd, pt = prev
+                    dt, dd = now - pt, dec - pd
+                    if dt > 0.05 and dd > 0:
+                        inst = dd / dt
+                        if 0.1 <= inst <= 1000:
+                            self.decode_speed_ema = (
+                                inst
+                                if self.decode_speed_ema is None
+                                else self.decode_speed_ema * 0.75 + inst * 0.25
+                            )
+                            self.generation_speed = self.decode_speed_ema
+                            changed = True
+            m = re.search(r"n_decoded\s*=\s*(\d+)", lower)
+            if m:
+                dec = int(m.group(1))
+                tid = "0"
+                prev = self.decode_last_by_task.get(tid)
+                self.decode_last_by_task[tid] = (dec, now)
+                if prev:
+                    pd, pt = prev
+                    dt, dd = now - pt, dec - pd
+                    if dt > 0.05 and dd > 0:
+                        inst = dd / dt
+                        if 0.1 <= inst <= 1000:
+                            self.decode_speed_ema = (
+                                inst
+                                if self.decode_speed_ema is None
+                                else self.decode_speed_ema * 0.75 + inst * 0.25
+                            )
+                            self.generation_speed = self.decode_speed_ema
+                            changed = True
+            m = re.search(r"n_tokens\s*=\s*(\d+)", lower)
+            if m:
+                tok = int(m.group(1))
+                if tok > 0:
+                    self.kv_cache_tokens = tok
+                    self.effective_ctx_size = self.effective_ctx_size or 8192
+                    changed = True
+        if changed:
+            self.refresh_speed_label()
+            self.refresh_context_label()
+
+    def extract_json_object(self, text, start):
+        """Извлечение JSON объекта из текста."""
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        return ""
+
+    def parse_speed_value(self, v):
+        """Парсинг значения скорости."""
+        try:
+            return float(v.replace(",", "."))
+        except ValueError:
+            return None
+
+    def refresh_speed_label(self):
+        """Обновление метки скорости."""
+        parts = []
+        if self.prompt_speed is not None:
+            parts.append(f"prompt {self.prompt_speed:.2f} tok/s")
+        if self.generation_speed is not None:
+            parts.append(f"gen {self.generation_speed:.2f} tok/s")
+        if parts:
+            self.speed_label.setText("Скорость: " + " | ".join(parts))
+
+    def refresh_context_label(self):
+        """Обновление метки контекста."""
+        ctx = self.effective_ctx_size or self.ctx_size.value()
+        if self.kv_cache_usage_ratio is not None:
+            pct = min(999.9, self.kv_cache_usage_ratio * 100)
+            self.context_label.setText(
+                f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({pct:.1f}%)"
+                if self.kv_cache_tokens is not None and ctx > 0
+                else f"Контекст: KV {pct:.1f}%"
+            )
+            return
+        if self.kv_cache_tokens is not None and ctx > 0:
+            self.context_label.setText(
+                f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({min(999.9, self.kv_cache_tokens / ctx * 100):.1f}%)"
+            )
+            return
+        if self.tokens_cached is not None and ctx > 0:
+            self.context_label.setText(
+                f"Контекст: cache {self.tokens_cached}/{ctx} ({min(999.9, self.tokens_cached / ctx * 100):.1f}%)"
+            )
+            return
+        if self.effective_ctx_size is not None and self.effective_ctx_size > 0:
+            self.context_label.setText(f"Контекст: {self.effective_ctx_size} (idle)")
+
+    def log(self, text: str, level: str = "info") -> None:
+        """Добавление записи в лог через буфер (batch-логирование).
+
+        Args:
+            text: Текст для добавления.
+            level: Уровень логирования (info, error, bench).
+        """
+        self.log_buffer.append((text, level))
+
+    def flush_log_buffer(self) -> None:
+        """Сброс буфера логов в UI (вызывается таймером каждые 100ms)."""
+        if not self.log_buffer:
+            return
+
+        cursor = self.logs.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        for text, level in self.log_buffer:
+            fmt = QTextCharFormat()
+            if level == "error":
+                fmt.setForeground(QColor("#f48771"))
+            elif level == "bench":
+                fmt.setForeground(QColor("#4ec9b0"))
+            elif "error" in text.lower() or "failed" in text.lower():
+                fmt.setForeground(QColor("#f48771"))
+            elif "loading model" in text.lower():
+                fmt.setForeground(QColor("#4ec9b0"))
+            elif "server started" in text.lower():
+                fmt.setForeground(QColor("#b5cea8"))
+            cursor.insertText(text, fmt)
+
+        self.log_buffer.clear()
+
+        # Ограничение размера логов
+        if self.logs.document().blockCount() > MAX_LOG_LINES:
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Down,
+                QTextCursor.MoveMode.KeepAnchor,
+                self.logs.document().blockCount() - MAX_LOG_LINES,
+            )
+            cursor.removeSelectedText()
+
+        if self.autoscroll_logs.isChecked():
+            self.logs.setTextCursor(cursor)
+            self.logs.ensureCursorVisible()
+            self.logs.verticalScrollBar().setValue(
+                self.logs.verticalScrollBar().maximum()
+            )
+
+    # === Методы управления UI ===
+
+    def update_action_buttons(self):
+        """Обновление состояния кнопок."""
+        srv = self.process.state() != QProcess.ProcessState.NotRunning
+        bnch = self.bench_process.state() != QProcess.ProcessState.NotRunning
+        scan = self.scanner is not None and self.scanner.isRunning()
+        upd = self.updater is not None and self.updater.isRunning()
+        busy = srv or bnch or scan
+        self.stop_btn.setEnabled(busy)
+        self.update_llama_btn.setEnabled(not srv and not bnch and not upd)
+        if upd:
+            self.start_btn.setEnabled(False)
+            self.test_btn.setEnabled(False)
+        if not srv and not bnch and not upd:
+            self.start_btn.setEnabled(True)
+            self.test_btn.setEnabled(True)
+
+    # === Методы сканирования моделей ===
 
     def auto_scan_models(self):
+        """Автоматическое сканирование моделей при запуске."""
         if self.models:
             self.scan_status.setText(
                 f"Кэш моделей: {len(self.models)}. Фоновая проверка..."
@@ -1052,6 +1158,7 @@ class LlamaGUI(QMainWindow):
             self.scan_models(silent=True)
 
     def scan_models(self, silent=False):
+        """Сканирование моделей."""
         base_path = self.model_dir.text()
         if not base_path or not os.path.exists(base_path):
             if not silent:
@@ -1059,12 +1166,10 @@ class LlamaGUI(QMainWindow):
                     self, "Ошибка", "Укажите существующую базовую папку"
                 )
             return
-
         if self.scanner and self.scanner.isRunning():
             if not silent:
                 self.cancel_scan()
             return
-
         self.scan_cancel_requested = False
         self.scan_btn.setEnabled(True)
         self.scan_btn.setText("⏹ Отменить")
@@ -1080,6 +1185,7 @@ class LlamaGUI(QMainWindow):
         self.scanner.start()
 
     def cancel_scan(self):
+        """Отмена сканирования."""
         if self.scanner and self.scanner.isRunning():
             self.scan_cancel_requested = True
             self.scan_status.setText("Отмена сканирования...")
@@ -1088,33 +1194,33 @@ class LlamaGUI(QMainWindow):
             self.scan_btn.setEnabled(False)
 
     def on_scan_progress(self, text):
+        """Обработка прогресса сканирования."""
         self.scan_status.setText(text)
 
     def on_models_found(self, models):
+        """Обработка найденных моделей."""
         if self.scan_cancel_requested:
             return
-
         current_path = self.model_combo.currentData() or self.settings.get(
             "last_model_path", ""
         )
         self.models = models
-        self.models_by_path = {item["path"]: item for item in models}
+        self.models_by_path = {i["path"]: i for i in models}
         self.model_combo.clear()
-        for item in models:
-            self.model_combo.addItem(item["display"], item["path"])
-
+        for i in models:
+            self.model_combo.addItem(i["display"], i["path"])
         if current_path:
             idx = self.model_combo.findData(current_path)
             if idx >= 0:
                 self.model_combo.setCurrentIndex(idx)
         elif models:
             self.model_combo.setCurrentIndex(0)
-
         self.save_settings()
         self.log(f"✅ Найдено моделей: {len(models)}")
         self.scan_status.setText(f"Найдено моделей: {len(models)}")
 
     def on_scan_finished(self):
+        """Обработка завершения сканирования."""
         self.scan_btn.setEnabled(True)
         self.scan_btn.setText("🔍 Сканировать")
         self.scan_progress.setVisible(False)
@@ -1124,17 +1230,24 @@ class LlamaGUI(QMainWindow):
         self.update_action_buttons()
 
     def on_model_selected(self, *_):
+        """Обработка выбора модели."""
         model_path = self.model_combo.currentData()
         if not model_path:
-            self.model_info.setText("Выберите модель")
-            return
-
+            # Проверяем, введен ли путь вручную
+            text = self.model_combo.currentText().strip()
+            if text and os.path.exists(text) and text.lower().endswith(".gguf"):
+                model_path = text
+                self.model_combo.setItemData(
+                    self.model_combo.currentIndex(), model_path
+                )
+            else:
+                self.model_info.setText("Выберите модель")
+                return
         info = self.models_by_path.get(model_path)
         if not info:
             info = extract_model_info(model_path)
             info["display"] = self.model_combo.currentText()
             self.models_by_path[model_path] = info
-
         max_ctx = info.get("context_length") or "не указан"
         quant = info.get("quant") or "не определено"
         arch = info.get("architecture") or "не определено"
@@ -1148,86 +1261,135 @@ class LlamaGUI(QMainWindow):
         )
         self.model_info.setText(
             f"Архитектура: {arch}; квант: {quant}; размер: {size_gib} GiB; "
-            f"ctx модели: {max_ctx}; рекомендовано: {recommended_ctx}; "
-            f"mmproj: {mmproj}{error}"
+            f"ctx модели: {max_ctx}; рекомендовано: {recommended_ctx}; mmproj: {mmproj}{error}"
         )
-
         self.settings["last_model_path"] = model_path
+        self.update_integration_model_label()
         if self.auto_params.isChecked() and not self.loading_profile:
             self.apply_recommended_params(info)
+        # Обновляем preview CLI
+        self.update_cli_preview()
 
     def apply_recommended_params(self, info):
-        recommended_ctx = info.get("recommended_ctx")
-        if recommended_ctx:
-            self.ctx_size.setValue(recommended_ctx)
-
+        """Применение рекомендуемых параметров."""
+        rec = info.get("recommended_ctx")
+        if rec:
+            self.ctx_size.setValue(rec)
         quant = (info.get("quant") or "").upper()
-        if quant.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3")):
-            self.cache_type_k.setCurrentText("q8_0")
-            self.cache_type_v.setCurrentText("q8_0")
-        elif info.get("recommended_ctx", 0) >= 16384:
+        if (
+            quant.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3"))
+            or info.get("recommended_ctx", 0) >= 16384
+        ):
             self.cache_type_k.setCurrentText("q8_0")
             self.cache_type_v.setCurrentText("q8_0")
         else:
             self.cache_type_k.setCurrentText("f16")
             self.cache_type_v.setCurrentText("f16")
-
         if self.gpu_auto.isChecked():
             self.gpu_layers.setDisabled(True)
+        self.batch_size.setValue(2048)
+        self.ubatch_size.setValue(2048)
 
-        if info.get("recommended_ctx", 0) >= 16384:
-            self.batch_size.setValue(1024)
-            self.ubatch_size.setValue(256)
-        else:
-            self.batch_size.setValue(2048)
-            self.ubatch_size.setValue(512)
+    # === Методы сборки аргументов ===
 
     def build_args(self, for_benchmark=False):
-        """Сборка аргументов командной строки"""
-        args = []
+        """Сборка аргументов командной строки.
 
-        # Модель
+        Args:
+            for_benchmark: Если True, собирает аргументы для бенчмарка.
+
+        Returns:
+            Список аргументов или None при ошибке.
+        """
+        args = []
         model_path = self.model_combo.currentData()
         if not model_path:
             QMessageBox.warning(self, "Ошибка", "Выберите модель")
             return None
-
         if for_benchmark:
-            # Для llama-bench: -m model -p 128 -n 256 -ngl 46
-            args.extend(["-m", model_path])
-            args.extend(["-p", str(self.bench_prompt.value())])
-            args.extend(["-n", str(self.bench_gen.value())])
+            args.extend(
+                [
+                    "-m",
+                    model_path,
+                    "-p",
+                    str(self.bench_prompt.value()),
+                    "-n",
+                    str(self.bench_gen.value()),
+                ]
+            )
             args.extend(["-ngl", self.gpu_layers_arg(for_benchmark=True)])
             if self.flash_attn.isChecked():
                 args.extend(["-fa", "1"])
-            args.extend(["-ctk", self.cache_type_k.currentText()])
-            args.extend(["-ctv", self.cache_type_v.currentText()])
-            args.extend(["-b", str(self.batch_size.value())])
             args.extend(
-                ["-ub", str(min(self.ubatch_size.value(), self.batch_size.value()))]
+                [
+                    "-ctk",
+                    self.cache_type_k.currentText(),
+                    "-ctv",
+                    self.cache_type_v.currentText(),
+                ]
+            )
+            args.extend(
+                [
+                    "-b",
+                    str(self.batch_size.value()),
+                    "-ub",
+                    str(min(self.ubatch_size.value(), self.batch_size.value())),
+                ]
             )
         else:
-            # Для сервера
-            args.extend(["-m", model_path])
-            args.extend(["--port", str(self.port.value())])
-            args.extend(["-ngl", self.gpu_layers_arg()])
-            args.extend(["-c", str(self.ctx_size.value())])
-            args.extend(["-t", str(self.threads.value())])
-            args.extend(["-b", str(self.batch_size.value())])
             args.extend(
-                ["-ub", str(min(self.ubatch_size.value(), self.batch_size.value()))]
+                [
+                    "-m",
+                    model_path,
+                    "--port",
+                    str(self.port.value()),
+                    "-ngl",
+                    self.gpu_layers_arg(),
+                ]
             )
-            args.extend(["-ctk", self.cache_type_k.currentText()])
-            args.extend(["-ctv", self.cache_type_v.currentText()])
+            args.extend(
+                ["-c", str(self.ctx_size.value()), "-t", str(self.threads.value())]
+            )
+            if self.threads_batch.value() > 0:
+                args.extend(["-tb", str(self.threads_batch.value())])
+            args.extend(
+                [
+                    "-b",
+                    str(self.batch_size.value()),
+                    "-ub",
+                    str(min(self.ubatch_size.value(), self.batch_size.value())),
+                ]
+            )
+            args.extend(
+                [
+                    "-ctk",
+                    self.cache_type_k.currentText(),
+                    "-ctv",
+                    self.cache_type_v.currentText(),
+                ]
+            )
             args.extend(["-np", str(self.parallel_slots.value())])
-
-            # Параметры сэмплирования для сервера
-            args.extend(["--temp", str(self.temperature.value())])
-            args.extend(["--repeat-penalty", str(self.repeat_penalty.value())])
-
+            if self.cpu_moe_layers.value() > 0:
+                args.extend(["-ncmoe", str(self.cpu_moe_layers.value())])
+            if self.fit_off.isChecked():
+                args.extend(["--fit", "off"])
+            rea = self.reasoning_mode.currentText()
+            if rea != "auto":
+                args.extend(["-rea", rea])
+            if self.ctx_checkpoints.value() >= 0:
+                args.extend(["--ctx-checkpoints", str(self.ctx_checkpoints.value())])
+            if self.cache_ram.value() >= -1:
+                args.extend(["--cache-ram", str(self.cache_ram.value())])
+            args.extend(
+                [
+                    "--temp",
+                    str(self.temperature.value()),
+                    "--repeat-penalty",
+                    str(self.repeat_penalty.value()),
+                ]
+            )
             if self.flash_attn.isChecked():
                 args.extend(["--flash-attn", "on"])
-
             model_info = self.models_by_path.get(model_path) or {}
             mmproj_path = model_info.get("mmproj_path", "")
             if self.use_mmproj.isChecked():
@@ -1237,7 +1399,6 @@ class LlamaGUI(QMainWindow):
                     args.append("--no-mmproj-offload")
             else:
                 args.append("--no-mmproj")
-
             if self.use_mmap.isChecked():
                 args.append("--mmap")
             else:
@@ -1256,870 +1417,461 @@ class LlamaGUI(QMainWindow):
                 args.append("--context-shift")
             if self.no_webui.isChecked():
                 args.append("--no-webui")
-            if self.server_metrics.isChecked():
-                args.append("--metrics")
-                args.append("--slots")
-
-            # Доп. аргументы
             if self.extra_args.text():
                 try:
-                    args.extend(shlex.split(self.extra_args.text()))
+                    extra = shlex.split(self.extra_args.text())
+                    invalid = self._validate_extra_args(extra)
+                    if invalid:
+                        QMessageBox.warning(
+                            self,
+                            "Ошибка",
+                            f"Недопустимые параметры: {', '.join(invalid)}\n"
+                            f"Разрешены только флаги из списка: {', '.join(sorted(LLAMA_ALLOWED_FLAGS))}",
+                        )
+                        return None
+                    args.extend(extra)
                 except ValueError as exc:
                     QMessageBox.warning(
                         self, "Ошибка", f"Не удалось разобрать доп. параметры: {exc}"
                     )
                     return None
-
         return args
 
+    def _validate_extra_args(self, args: List[str]) -> List[str]:
+        """Валидация дополнительных аргументов.
+
+        Проверяет:
+        1. Флаг в whitelist
+        2. Значения для флагов, принимающих пути
+        3. Значения для флагов, принимающих IP/хосты
+
+        Args:
+            args: Список аргументов.
+
+        Returns:
+            Список недопустимых аргументов с описанием ошибки.
+        """
+        invalid = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if not arg.startswith("-"):
+                i += 1
+                continue
+
+            # Проверяем флаг
+            base_arg = arg.split("=")[0] if "=" in arg else arg
+            if base_arg not in LLAMA_ALLOWED_FLAGS:
+                invalid.append(f"{arg} (неизвестный флаг)")
+                i += 1
+                continue
+
+            # Проверяем значение для path-флагов
+            path_flags = {
+                "--grammar-file",
+                "--api-key-file",
+                "--lora",
+                "--lora-scaled",
+                "--mmproj",
+                "--chat-template-file",
+            }
+            if base_arg in path_flags:
+                if "=" in arg:
+                    value = arg.split("=", 1)[1]
+                elif i + 1 < len(args):
+                    value = args[i + 1]
+                    i += 1
+                else:
+                    invalid.append(f"{arg} (требуется значение)")
+                    i += 1
+                    continue
+
+                try:
+                    # Проверяем, что путь не выходит за пределы моделей
+                    model_dir = Path(self.model_dir.text() or ".").resolve()
+                    validate_path(value, base_dir=model_dir)
+                except ValueError as e:
+                    invalid.append(f"{arg} {value} (недопустимый путь: {e})")
+
+            # Проверяем значение для host
+            if base_arg == "--host":
+                if "=" in arg:
+                    value = arg.split("=", 1)[1]
+                elif i + 1 < len(args):
+                    value = args[i + 1]
+                    i += 1
+                else:
+                    invalid.append(f"{arg} (требуется значение)")
+                    i += 1
+                    continue
+
+                if value in ("0.0.0.0", "::", ""):
+                    invalid.append(
+                        f"{arg} {value} (запрещено: открывает сервер всем интерфейсам)"
+                    )
+
+            i += 1
+
+        return invalid
+
     def gpu_layers_arg(self, for_benchmark=False):
+        """Получение аргумента GPU layers."""
         if not self.gpu_auto.isChecked():
             return str(self.gpu_layers.value())
-
-        # llama-server supports "auto"; llama-bench in current builds expects a numeric range/value.
         return "99" if for_benchmark else "auto"
 
-    def run_benchmark(self):
-        """Запуск llama-bench с текущими параметрами"""
+    # === Методы обновления llama.cpp ===
+
+    def update_llamacpp(self):
+        """Обновление llama.cpp с подтверждением и бэкапом."""
         if self.process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(
-                self, "Сервер запущен", "Остановите сервер перед запуском benchmark"
+                self,
+                "llama.cpp updater",
+                "Stop llama-server before updating llama.cpp.",
             )
             return
-
-        bench_exe = self.bench_path.text()
-        if not bench_exe or not os.path.exists(bench_exe):
-            # Попробуем автоопределить если не задан
-            self.auto_detect_bench()
-            bench_exe = self.bench_path.text()
-            if not bench_exe or not os.path.exists(bench_exe):
-                QMessageBox.critical(self, "Ошибка", "Укажите путь к llama-bench.exe")
-                return
-
-        args = self.build_args(for_benchmark=True)
-        if not args:
-            return
-
-        self.log(f"🧪 Запуск бенчмарка: {os.path.basename(bench_exe)}")
-        self.log(f"   Модель: {self.model_combo.currentText()}")
-        self.log(f"   Параметры: {' '.join(args)}")
-
-        if self.bench_process.state() == QProcess.ProcessState.Running:
-            self.stop_benchmark()
-            return
-
-        self.reset_speed_metrics()
-        self.bench_stop_requested = False
-        self.test_btn.setEnabled(False)
-        self.test_btn.setText("⏳ Тестирование...")
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.bench_process.start(bench_exe, args)
-
-    def handle_bench_stdout(self):
-        data = (
-            self.bench_process.readAllStandardOutput()
-            .data()
-            .decode("utf-8", errors="ignore")
-        )
-        self.update_speed_metrics(data)
-        self.log(data, "bench")
-
-    def handle_bench_stderr(self):
-        data = (
-            self.bench_process.readAllStandardError()
-            .data()
-            .decode("utf-8", errors="ignore")
-        )
-        self.update_speed_metrics(data)
-        self.log(data, "error")
-
-    def handle_bench_finished(self, exit_code):
-        self.test_btn.setEnabled(True)
-        self.test_btn.setText("🧪 Тестировать")
-        self.start_btn.setEnabled(
-            self.process.state() == QProcess.ProcessState.NotRunning
-        )
-        self.update_action_buttons()
-        if self.bench_stop_requested:
-            self.log("⏹ Тестирование остановлено")
-        elif exit_code == 0:
-            self.log("✅ Тестирование завершено успешно")
-        else:
-            self.log(f"❌ Ошибка тестирования (код: {exit_code})", "error")
-        self.bench_stop_requested = False
-
-    def stop_benchmark(self):
-        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
-            self.bench_stop_requested = True
-            self.log("⏹ Остановка benchmark...")
-            self.bench_process.terminate()
-            QTimer.singleShot(2500, self.kill_benchmark_if_running)
-
-    def kill_benchmark_if_running(self):
-        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
-            self.log("⚠️ Benchmark не завершился штатно, принудительная остановка")
-            self.bench_process.kill()
-
-    def start_server(self):
         if self.bench_process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(
-                self, "Benchmark запущен", "Остановите benchmark перед запуском сервера"
+                self, "llama.cpp updater", "Stop benchmark before updating llama.cpp."
             )
             return
+        if self.updater and self.updater.isRunning():
+            return
 
-        exe = self.exe_path.text()
+        reply = QMessageBox.question(
+            self,
+            "Обновление llama.cpp",
+            "Будет скачана и установлена последняя версия llama.cpp.\n"
+            "Текущие бинарники будут сохранены в папке backup.\n"
+            "Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        exe = self.exe_path.text().strip()
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(self, "Ошибка", "Укажите путь к llama-server.exe")
-            return
-
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            self.log("⚠️ Сервер уже запущен")
-            return
-
-        args = self.build_args(for_benchmark=False)
-        if not args:
-            return
-
-        self.log(f"▶ Запуск сервера: {exe}")
-        self.log(f"   Аргументы: {' '.join(args)}")
-
-        self.server_stop_requested = False
-        self.server_ready = False
-        self.stats_timer.stop()
-        self.stats_failures = 0
-        self.reset_speed_metrics()
-        self.process.start(exe, args)
-        QTimer.singleShot(1500, self.force_start_server_monitoring)
-        self.start_btn.setEnabled(False)
-        self.test_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
-    def stop_work(self):
-        stopped_any = False
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            self.stop_server()
-            stopped_any = True
-        if self.bench_process.state() != QProcess.ProcessState.NotRunning:
-            self.stop_benchmark()
-            stopped_any = True
-        if self.scanner and self.scanner.isRunning():
-            self.cancel_scan()
-            stopped_any = True
-        if not stopped_any:
-            self.update_action_buttons()
-
-    def stop_server(self):
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            if self.server_stop_requested:
-                return
-            self.server_stop_requested = True
-            self.stats_timer.stop()
-            self.log("⏹ Остановка сервера...")
-            self.process.terminate()
-            QTimer.singleShot(3000, self.kill_server_if_running)
-
-    def kill_server_if_running(self):
-        if self.process.state() != QProcess.ProcessState.NotRunning:
-            self.log("⚠️ Сервер не завершился штатно, принудительная остановка")
-            self.process.kill()
-
-    def handle_stdout(self):
-        data = (
-            self.process.readAllStandardOutput().data().decode("utf-8", errors="ignore")
-        )
-        self.maybe_start_server_monitoring(data)
-        self.update_speed_metrics(data)
-        self.log(data, "info")
-
-    def handle_stderr(self):
-        data = (
-            self.process.readAllStandardError().data().decode("utf-8", errors="ignore")
-        )
-        self.maybe_start_server_monitoring(data)
-        self.update_speed_metrics(data)
-        self.log(data, "error")
-
-    def handle_state(self, state):
-        states = {
-            QProcess.ProcessState.NotRunning: "Остановлен",
-            QProcess.ProcessState.Starting: "Запуск...",
-            QProcess.ProcessState.Running: "Работает",
-        }
-        status = states[state]
-        if state == QProcess.ProcessState.NotRunning:
-            self.stats_timer.stop()
-            self.server_ready = False
-            self.start_btn.setEnabled(True)
-            self.test_btn.setEnabled(
-                self.bench_process.state() == QProcess.ProcessState.NotRunning
+            QMessageBox.critical(
+                self, "llama.cpp updater", "Select an existing llama-server.exe first."
             )
-            self.update_action_buttons()
-            if self.server_stop_requested:
-                self.log("⏹ Сервер остановлен")
-            else:
-                self.log(f"⏹ Сервер остановлен (код: {self.process.exitCode()})")
-            self.server_stop_requested = False
-
-    def maybe_start_server_monitoring(self, text):
-        if (
-            self.server_ready
-            or self.server_stop_requested
-            or not self.server_metrics.isChecked()
-        ):
             return
 
-        lower = text.lower()
-        ready_markers = (
-            "server is listening",
-            "starting the main loop",
-            "main: model loaded",
+        self._backup_llamacpp(Path(exe).parent)
+
+        self.update_progress.setValue(0)
+        self.update_progress.setVisible(True)
+        self.update_status.setText("Checking release...")
+        self.log("llama.cpp update: checking latest release\n")
+        self.updater = LlamaCppUpdater(exe)
+        self.updater.progress.connect(self.on_update_progress)
+        self.updater.percent.connect(self.update_progress.setValue)
+        self.updater.completed.connect(self.on_update_completed)
+        self.updater.finished.connect(self.on_update_thread_finished)
+
+        # Логируем перед стартом
+        self.log(f"DEBUG: Starting updater thread for: {exe}\n")
+        self.updater.start()
+        self.log(f"DEBUG: Thread started, isRunning={self.updater.isRunning()}\n")
+
+        # Проверяем, что поток действительно запустился
+        QTimer.singleShot(500, self._check_updater_started)
+
+    def _backup_llamacpp(self, target_dir: Path) -> None:
+        """Создание бэкапа бинарников llama.cpp.
+
+        Args:
+            target_dir: Директория с бинарниками.
+        """
+        backup_dir = target_dir / "backup"
+        backup_dir.mkdir(exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_subdir = backup_dir / f"backup_{timestamp}"
+        backup_subdir.mkdir(exist_ok=True)
+
+        for pattern in ["*.exe", "*.dll"]:
+            for file in target_dir.glob(pattern):
+                try:
+                    shutil.copy2(file, backup_subdir / file.name)
+                except OSError:
+                    pass
+
+        self.log(f"💾 Бэкап создан: {backup_subdir}\n")
+
+    def on_update_progress(self, text):
+        """Обработка прогресса обновления."""
+        self.update_status.setText(text)
+        self.log(f"llama.cpp update: {text}\n")
+
+    def on_update_completed(self, changed, message):
+        """Обработка завершения обновления."""
+        self.update_status.setText(message)
+        self.log(
+            f"llama.cpp update: {message}\n",
+            "error" if "failed" in message.lower() else "info",
         )
-        if any(marker in lower for marker in ready_markers):
-            self.server_ready = True
-            self.stats_failures = 0
-            self.stats_timer.start()
-            self.poll_server_stats()
-
-    def force_start_server_monitoring(self):
-        if (
-            self.process.state() == QProcess.ProcessState.Running
-            and not self.server_stop_requested
-            and self.server_metrics.isChecked()
-        ):
-            self.server_ready = True
-            self.stats_failures = 0
-            if not self.stats_timer.isActive():
-                self.stats_timer.start()
-            self.poll_server_stats()
-
-    def update_action_buttons(self):
-        server_running = self.process.state() != QProcess.ProcessState.NotRunning
-        bench_running = self.bench_process.state() != QProcess.ProcessState.NotRunning
-        scan_running = self.scanner is not None and self.scanner.isRunning()
-        update_running = self.updater is not None and self.updater.isRunning()
-        busy = server_running or bench_running or scan_running
-        self.stop_btn.setEnabled(busy)
-        self.update_llama_btn.setEnabled(
-            not server_running and not bench_running and not update_running
-        )
-        if update_running:
-            self.start_btn.setEnabled(False)
-            self.test_btn.setEnabled(False)
-        if not server_running and not bench_running and not update_running:
-            self.start_btn.setEnabled(True)
-            self.test_btn.setEnabled(True)
-
-    def poll_server_stats(self):
-        if (
-            self.process.state() != QProcess.ProcessState.Running
-            or not self.server_metrics.isChecked()
-            or not self.server_ready
-            or self.server_stop_requested
-        ):
-            self.stats_timer.stop()
-            return
-
-        base_url = f"http://127.0.0.1:{self.port.value()}"
-
-        for endpoint in ("metrics", "slots"):
-            request = QNetworkRequest(QUrl(f"{base_url}/{endpoint}"))
-            request.setTransferTimeout(1500)
-            request.setRawHeader(b"User-Agent", b"LlamaServerGUI")
-            reply = self.stats_manager.get(request)
-            reply.setProperty("endpoint", endpoint)
-
-    def handle_stats_reply(self, reply):
-        endpoint = reply.property("endpoint")
-        if (
-            self.process.state() != QProcess.ProcessState.Running
-            or self.server_stop_requested
-        ):
-            reply.deleteLater()
-            return
-
-        if reply.error():
-            self.stats_failures += 1
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            err_text = reply.errorString()
-
-            if self.stats_failures <= 3:
-                self.log(
-                    f"⚠️ Мониторинг /{endpoint} недоступен: HTTP={status}, error={err_text}\n",
-                    "error",
-                )
-
-            reply.deleteLater()
-
-            if self.stats_failures >= 8:
-                self.context_label.setText("Контекст: мониторинг недоступен")
-            return
-
-        self.stats_failures = 0
-        data = bytes(reply.readAll()).decode("utf-8", errors="ignore").strip()
-        reply.deleteLater()
-
-        if (
-            endpoint == "metrics"
-            and len(data) >= 2
-            and data[0] == '"'
-            and data[-1] == '"'
-        ):
-            try:
-                data = bytes(data[1:-1], "utf-8").decode("unicode_escape")
-            except Exception:
-                pass
-
-        if endpoint == "metrics":
-            self.update_metrics_from_prometheus(data)
-        elif endpoint == "slots":
-            self.update_metrics_from_slots(data)
-
-    def update_metrics_from_prometheus(self, text):
-        metrics = {}
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or " " not in line:
-                continue
-            name, value = line.rsplit(None, 1)
-            name = name.split("{", 1)[0]
-            if name.startswith("llamacpp:"):
-                name = name[len("llamacpp:") :]
-            try:
-                metrics[name] = float(value)
-            except ValueError:
-                continue
-
-        prompt_speed = self.first_metric(
-            metrics,
-            (
-                "prompt_tokens_seconds",
-                "prompt_per_second",
-                "prompt_tokens_per_second",
-            ),
-        )
-        generation_speed = self.first_metric(
-            metrics,
-            (
-                "predicted_tokens_seconds",
-                "predicted_per_second",
-                "generation_tokens_per_second",
-                "tokens_predicted_seconds",
-            ),
-        )
-        kv_tokens = self.first_metric(
-            metrics,
-            (
-                "kv_cache_tokens",
-                "kv_cache_used_cells",
-                "kv_cache_used",
-            ),
-        )
-        kv_ratio = self.first_metric(
-            metrics,
-            (
-                "kv_cache_usage_ratio",
-                "kv_cache_usage",
-                "kv_cache_used_ratio",
-            ),
-        )
-        ctx_total = self.first_metric(
-            metrics,
-            (
-                "kv_cache_tokens_total",
-                "kv_cache_size",
-                "n_ctx",
-            ),
-        )
-
-        if prompt_speed is not None and prompt_speed > 0:
-            self.prompt_speed = prompt_speed
-        if generation_speed is not None and generation_speed > 0:
-            self.generation_speed = generation_speed
-        if kv_tokens is not None and kv_tokens >= 0:
-            self.kv_cache_tokens = int(kv_tokens)
-        if kv_ratio is not None and kv_ratio >= 0:
-            self.kv_cache_usage_ratio = kv_ratio / 100 if kv_ratio > 1 else kv_ratio
-        if ctx_total is not None and ctx_total > 0:
-            self.effective_ctx_size = int(ctx_total)
-
-        self.refresh_speed_label()
-        self.refresh_context_label()
-
-    def first_metric(self, metrics, names):
-        for name in names:
-            if name in metrics:
-                return metrics[name]
-        return None
-
-    def update_metrics_from_slots(self, text):
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return
-
-        slots = (
-            data
-            if isinstance(data, list)
-            else data.get("slots", [])
-            if isinstance(data, dict)
-            else []
-        )
-        if not isinstance(slots, list):
-            return
-
-        ctx_values = []
-        used_values = []
-        for slot in slots:
-            if not isinstance(slot, dict):
-                continue
-            ctx = self.first_int_value(slot, ("n_ctx", "n_ctx_slot", "ctx_size"))
-            used = self.first_int_value(
-                slot,
-                ("n_past", "n_tokens", "tokens_cached", "n_cache_tokens", "n_decoded"),
-            )
-            if ctx:
-                ctx_values.append(ctx)
-            if used:
-                used_values.append(used)
-
-        if ctx_values:
-            self.effective_ctx_size = max(ctx_values)
-        if used_values and self.kv_cache_tokens is None:
-            self.kv_cache_tokens = max(used_values)
-        elif used_values:
-            self.kv_cache_tokens = max(used_values)
-
-        self.refresh_context_label()
-
-    def first_int_value(self, data, names):
-        for name in names:
-            value = data.get(name)
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                return int(value)
-        return None
-
-    def reset_speed_metrics(self):
-        self.prompt_speed = None
-        self.generation_speed = None
-        self.tokens_cached = None
-        self.kv_cache_tokens = None
-        self.kv_cache_usage_ratio = None
-        self.effective_ctx_size = None
-        self.decode_last_by_task = {}
-        self.decode_speed_ema = None
-        self.speed_label.setText("Скорость: нет данных")
-        self.context_label.setText("Контекст: нет данных")
-
-    def update_speed_metrics(self, text):
-        if not text:
-            return
-
-        self.update_metrics_from_server_log_lines(text)
-        self.update_metrics_from_json(text)
-
-        for line in text.splitlines():
-            lower = line.lower()
-
-            prompt_match = re.search(
-                r"prompt eval.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if prompt_match:
-                self.prompt_speed = self.parse_speed_value(prompt_match.group(1))
-
-            eval_match = re.search(
-                r"(?<!prompt )\beval(?: time)?\b.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if eval_match:
-                self.generation_speed = self.parse_speed_value(eval_match.group(1))
-
-            pp_match = re.search(
-                r"\bpp\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if pp_match:
-                self.prompt_speed = self.parse_speed_value(pp_match.group(1))
-
-            tg_match = re.search(
-                r"\btg\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if tg_match:
-                self.generation_speed = self.parse_speed_value(tg_match.group(1))
-
-        self.refresh_speed_label()
-
-    def update_metrics_from_json(self, text):
-        for match in re.finditer(r'"timings"\s*:\s*\{', text):
-            start = text.rfind("{", 0, match.start())
-            if start < 0:
-                continue
-            payload = self.extract_json_object(text, start)
-            if not payload:
-                continue
-            try:
-                data = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-
-            timings = data.get("timings")
-            if not isinstance(timings, dict):
-                continue
-
-            prompt_speed = timings.get("prompt_per_second")
-            generation_speed = timings.get("predicted_per_second")
-            tokens_cached = data.get("tokens_cached")
-
-            if isinstance(prompt_speed, (int, float)):
-                self.prompt_speed = float(prompt_speed)
-            if isinstance(generation_speed, (int, float)):
-                self.generation_speed = float(generation_speed)
-            if isinstance(tokens_cached, int):
-                self.tokens_cached = tokens_cached
-
-            self.refresh_context_label()
-
-    def update_metrics_from_server_log_lines(self, text):
-        now = time.monotonic()
-        changed = False
-
-        for line in text.splitlines():
-            lower = line.lower()
-
-            ctx_match = re.search(
-                r"n_ctx\s*=\s*(\d+)\s*,\s*n_tokens\s*=\s*(\d+)", lower
-            )
-            if ctx_match:
-                ctx = int(ctx_match.group(1))
-                used = int(ctx_match.group(2))
-                if ctx > 0:
-                    self.effective_ctx_size = ctx
-                if used >= 0:
-                    self.kv_cache_tokens = used
-                changed = True
-
-            ctx_match2 = re.search(
-                r"slot\s+update_batch.*?n_ctx\s*=\s*(\d+).*?n_tokens\s*=\s*(\d+)", lower
-            )
-            if ctx_match2:
-                ctx = int(ctx_match2.group(1))
-                used = int(ctx_match2.group(2))
-                if ctx > 0:
-                    self.effective_ctx_size = ctx
-                if used >= 0:
-                    self.kv_cache_tokens = used
-                changed = True
-
-            decoded_match = re.search(
-                r"\|\s*task\s+(\d+)\s*\|.*?n_decoded\s*=\s*(\d+)", lower
-            )
-            if decoded_match:
-                task_id = decoded_match.group(1)
-                decoded = int(decoded_match.group(2))
-
-                prev = self.decode_last_by_task.get(task_id)
-                self.decode_last_by_task[task_id] = (decoded, now)
-
-                if prev:
-                    prev_decoded, prev_time = prev
-                    dt = now - prev_time
-                    dd = decoded - prev_decoded
-
-                    if dt > 0.05 and dd > 0:
-                        instant_speed = dd / dt
-
-                        if 0.1 <= instant_speed <= 1000:
-                            if self.decode_speed_ema is None:
-                                self.decode_speed_ema = instant_speed
-                            else:
-                                self.decode_speed_ema = (
-                                    self.decode_speed_ema * 0.75 + instant_speed * 0.25
-                                )
-
-                            self.generation_speed = self.decode_speed_ema
-                            changed = True
-
-            dec_match = re.search(r"n_decoded\s*=\s*(\d+)", lower)
-            if dec_match:
-                decoded = int(dec_match.group(1))
-                task_id = "0"
-
-                prev = self.decode_last_by_task.get(task_id)
-                self.decode_last_by_task[task_id] = (decoded, now)
-
-                if prev:
-                    prev_decoded, prev_time = prev
-                    dt = now - prev_time
-                    dd = decoded - prev_decoded
-
-                    if dt > 0.05 and dd > 0:
-                        instant_speed = dd / dt
-
-                        if 0.1 <= instant_speed <= 1000:
-                            if self.decode_speed_ema is None:
-                                self.decode_speed_ema = instant_speed
-                            else:
-                                self.decode_speed_ema = (
-                                    self.decode_speed_ema * 0.75 + instant_speed * 0.25
-                                )
-
-                            self.generation_speed = self.decode_speed_ema
-                            changed = True
-
-            tok_match = re.search(r"n_tokens\s*=\s*(\d+)", lower)
-            if tok_match:
-                tokens = int(tok_match.group(1))
-                if tokens > 0:
-                    self.kv_cache_tokens = tokens
-                    if self.effective_ctx_size is None:
-                        self.effective_ctx_size = 8192
-                    changed = True
-
         if changed:
-            self.refresh_speed_label()
-            self.refresh_context_label()
+            self.auto_detect_bench()
+            self.save_settings()
 
-    def extract_json_object(self, text, start):
-        depth = 0
-        in_string = False
-        escape = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
+    def on_update_thread_finished(self):
+        """Обработка завершения потока обновления."""
+        self.update_progress.setVisible(False)
+        self.update_action_buttons()
+        self.updater = None
 
-            if char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : index + 1]
-        return ""
+    def _check_updater_started(self):
+        """Проверка, что updater запустился."""
+        self.log(f"DEBUG: _check_updater_started called\n")
+        if self.updater:
+            is_running = self.updater.isRunning()
+            self.log(f"DEBUG: updater.isRunning() = {is_running}\n")
+            if not is_running:
+                self.log("⚠️ Updater failed to start or finished too quickly", "error")
+                self.update_status.setText("Failed to start updater")
+                self.update_progress.setVisible(False)
+                self.update_action_buttons()
+        else:
+            self.log("DEBUG: updater is None\n")
 
-    def parse_speed_value(self, value):
+    def auto_detect_bench(self):
+        """Автоопределение пути к бенчмарку."""
+        server_path = self.exe_path.text()
+        if server_path and os.path.exists(server_path):
+            dir_path = os.path.dirname(server_path)
+            bench_path = os.path.join(
+                dir_path, os.path.basename(server_path).replace("server", "bench")
+            )
+            if os.path.exists(bench_path):
+                self.bench_path.setText(bench_path)
+
+    # === Методы работы с файлами ===
+
+    def browse_exe(self):
+        """Выбор пути к llama-server.exe."""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Выберите llama-server", "", "Executable (*.exe)"
+        )
+        if f:
+            self.exe_path.setText(f)
+            self.save_settings()
+
+    def browse_bench(self):
+        """Выбор пути к llama-bench.exe."""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Выберите llama-bench", "", "Executable (*.exe)"
+        )
+        if f:
+            self.bench_path.setText(f)
+            self.save_settings()
+
+    def browse_model_dir(self):
+        """Выбор папки с моделями."""
+        d = QFileDialog.getExistingDirectory(self, "Выберите папку с моделями")
+        if d:
+            self.model_dir.setText(d)
+            self.save_settings()
+            self.scan_models()
+
+    def browse_opencode_config(self):
+        """Выбор пути к opencode.json."""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Выберите opencode.json", "", "JSON (*.json);;All files (*.*)"
+        )
+        if f:
+            self.opencode_config_path.setText(f)
+            self.save_settings()
+            self.check_integration_models(silent=True)
+
+    def browse_pi_config(self):
+        """Выбор пути к PI config.json."""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Выберите PI config.json", "", "JSON (*.json);;All files (*.*)"
+        )
+        if f:
+            self.pi_config_path.setText(f)
+            self.save_settings()
+            self.check_integration_models(silent=True)
+
+    # === Методы интеграции ===
+
+    def current_config_target(self):
+        """Получение текущей цели интеграции."""
+        return self.integration_target.currentData() or "opencode"
+
+    def current_config_path(self):
+        """Получение пути к текущему конфигу."""
+        return (
+            self.pi_config_path.text().strip()
+            if self.current_config_target() == "pi"
+            else self.opencode_config_path.text().strip()
+        )
+
+    def current_base_url(self):
+        """Получение базового URL."""
+        return f"http://127.0.0.1:{self.port.value()}/v1"
+
+    def current_model_id(self):
+        """Получение ID текущей модели."""
+        model_path = self.model_combo.currentData()
+        if model_path:
+            return Path(model_path).stem
+        text = self.model_combo.currentText().strip()
+        if text.lower().endswith(".gguf") and os.path.exists(text):
+            return Path(text).stem
+        return text
+
+    def update_integration_model_label(self):
+        """Обновление метки модели для интеграции."""
+        mid = self.current_model_id()
+        self.integration_model_label.setText(
+            f"Модель для добавления: {mid}"
+            if mid
+            else "Модель для добавления: не выбрана"
+        )
+
+    def read_integration_config(self):
+        """Чтение конфигурации интеграции."""
+        path = self.current_config_path()
+        if not path:
+            raise ValueError("Укажите путь к JSON-конфигу")
+        return path, load_or_create_json(path)
+
+    def integration_model_ids(self, data):
+        """Получение списка моделей из конфига."""
+        return get_model_ids(data, self.current_config_target())
+
+    def check_integration_models(self, silent=False):
+        """Проверка моделей в конфиге интеграции."""
+        self.update_integration_model_label()
+        self.integration_models_list.clear()
         try:
-            return float(value.replace(",", "."))
-        except ValueError:
-            return None
+            path, data = self.read_integration_config()
+            model_ids = self.integration_model_ids(data)
+        except Exception as exc:
+            self.integration_status.setText(f"Не удалось прочитать конфиг: {exc}")
+            if not silent:
+                QMessageBox.warning(self, "Конфиг моделей", str(exc))
+            return
+        for mid in model_ids:
+            self.integration_models_list.addItem(mid)
+        current_id = self.current_model_id()
+        target_name = self.integration_target.currentText()
+        exists_text = (
+            "есть в конфиге"
+            if current_id and current_id in model_ids
+            else "нет в конфиге"
+        )
+        self.integration_status.setText(
+            f"{target_name}: {len(model_ids)} моделей. "
+            f"Выбранная: {current_id or 'не выбрана'} ({exists_text})."
+        )
+        self.log(f"{target_name}: проверено моделей: {len(model_ids)}")
 
-    def refresh_speed_label(self):
-        parts = []
-        if self.prompt_speed is not None:
-            parts.append(f"prompt {self.prompt_speed:.2f} tok/s")
-        if self.generation_speed is not None:
-            parts.append(f"gen {self.generation_speed:.2f} tok/s")
-        if parts:
-            self.speed_label.setText("Скорость: " + " | ".join(parts))
-
-    def refresh_context_label(self):
-        ctx = self.effective_ctx_size or self.ctx_size.value()
-
-        if self.kv_cache_usage_ratio is not None:
-            percent = min(999.9, self.kv_cache_usage_ratio * 100)
-            if self.kv_cache_tokens is not None and ctx > 0:
-                self.context_label.setText(
-                    f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({percent:.1f}%)"
-                )
+    def add_model_to_integration(self):
+        """Добавление модели в конфиг интеграции."""
+        model_id = self.current_model_id()
+        if not model_id:
+            QMessageBox.warning(self, "Конфиг моделей", "Выберите модель GGUF")
+            return
+        try:
+            path, data = self.read_integration_config()
+            if self.current_config_target() == "pi":
+                _, models = ensure_pi_llamacpp_provider(data, self.current_base_url())
+                existing = {
+                    str(m.get("id") or m.get("name")): m
+                    for m in models
+                    if isinstance(m, dict) and (m.get("id") or m.get("name"))
+                }
+                if model_id not in existing:
+                    ctx = int(self.ctx_size.value())
+                    models.append(
+                        {
+                            "contextWindow": ctx,
+                            "id": model_id,
+                            "input": ["text", "image"],
+                            "maxTokens": min(16000, ctx),
+                            "name": model_id,
+                        }
+                    )
             else:
-                self.context_label.setText(f"Контекст: KV {percent:.1f}%")
-            return
+                _, models = ensure_opencode_llamacpp_provider(
+                    data, self.current_base_url()
+                )
+                models.setdefault(model_id, {"name": model_id})
+            write_json_file_safely(path, data)
+            self.save_settings()
+            self.check_integration_models(silent=True)
+            self.integration_status.setText(f"Добавлено/обновлено: {model_id}")
+            self.log(f"Конфиг моделей: добавлено/обновлено {model_id}")
+        except Exception as exc:
+            self.integration_status.setText(f"Не удалось добавить модель: {exc}")
+            QMessageBox.critical(self, "Конфиг моделей", str(exc))
 
-        if self.kv_cache_tokens is not None and ctx > 0:
-            percent = min(999.9, self.kv_cache_tokens / ctx * 100)
-            self.context_label.setText(
-                f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({percent:.1f}%)"
+    def remove_model_from_integration(self):
+        """Удаление модели из конфига интеграции."""
+        sel = self.integration_models_list.currentItem()
+        model_id = sel.text() if sel else self.current_model_id()
+        if not model_id:
+            QMessageBox.warning(
+                self, "Конфиг моделей", "Выберите модель в списке или GGUF-модель"
             )
             return
-
-        if self.tokens_cached is not None and ctx > 0:
-            percent = min(999.9, self.tokens_cached / ctx * 100)
-            self.context_label.setText(
-                f"Контекст: cache {self.tokens_cached}/{ctx} ({percent:.1f}%)"
-            )
-            return
-
-        if self.effective_ctx_size is not None and self.effective_ctx_size > 0:
-            self.context_label.setText(f"Контекст: {self.effective_ctx_size} (idle)")
-
-    def log(self, text, level="info"):
-        """Добавление текста в лог с цветом"""
-        cursor = self.logs.textCursor()
-        fmt = QTextCharFormat()
-
-        if level == "error":
-            fmt.setForeground(QColor("#f48771"))
-        elif level == "bench":
-            fmt.setForeground(QColor("#4ec9b0"))  # Бирюзовый для бенчмарка
-        elif "error" in text.lower() or "failed" in text.lower():
-            fmt.setForeground(QColor("#f48771"))
-        elif "loading model" in text.lower():
-            fmt.setForeground(QColor("#4ec9b0"))
-        elif "server started" in text.lower():
-            fmt.setForeground(QColor("#b5cea8"))
-
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text, fmt)
-        if self.autoscroll_logs.isChecked():
-            self.logs.setTextCursor(cursor)
-            self.logs.ensureCursorVisible()
-            scrollbar = self.logs.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
-
-    # === Управление данными ===
-
-    def load_data(self):
-        """Загрузка настроек и профилей"""
-        # Загрузка базовых настроек
-        if os.path.exists(self.settings_file):
-            try:
-                with open(self.settings_file, "r", encoding="utf-8") as f:
-                    self.settings = json.load(f)
-                    self.exe_path.setText(self.settings.get("exe", ""))
-                    self.bench_path.setText(self.settings.get("bench", ""))
-                    self.model_dir.setText(self.settings.get("model_dir", ""))
-
-                    # Загрузка параметров UI без запуска тяжелого сканирования.
-                    self.bench_prompt.setValue(self.settings.get("bench_prompt", 128))
-                    self.bench_gen.setValue(self.settings.get("bench_gen", 256))
-                    self.auto_params.setChecked(self.settings.get("auto_params", True))
-                    self.use_mmproj.setChecked(self.settings.get("use_mmproj", True))
-                    self.mmproj_offload.setChecked(
-                        self.settings.get("mmproj_offload", True)
-                    )
-                    self.gpu_auto.setChecked(self.settings.get("gpu_auto", True))
-                    self.gpu_layers.setValue(self.settings.get("gpu_layers", 33))
-                    self.ctx_size.setValue(self.settings.get("ctx_size", 4096))
-                    self.threads.setValue(
-                        self.settings.get("threads", os.cpu_count() or 4)
-                    )
-                    self.port.setValue(self.settings.get("port", 8080))
-                    self.temperature.setValue(self.settings.get("temperature", 0.7))
-                    self.repeat_penalty.setValue(
-                        self.settings.get("repeat_penalty", 1.1)
-                    )
-                    self.flash_attn.setChecked(self.settings.get("flash_attn", True))
-                    self.use_mmap.setChecked(self.settings.get("use_mmap", True))
-                    self.use_mlock.setChecked(self.settings.get("use_mlock", False))
-                    self.verbose.setChecked(self.settings.get("verbose", False))
-                    self.log_timestamps.setChecked(
-                        self.settings.get("log_timestamps", False)
-                    )
-                    self.cache_type_k.setCurrentText(
-                        self.settings.get("cache_type_k", "f16")
-                    )
-                    self.cache_type_v.setCurrentText(
-                        self.settings.get("cache_type_v", "f16")
-                    )
-                    self.batch_size.setValue(self.settings.get("batch_size", 2048))
-                    self.ubatch_size.setValue(self.settings.get("ubatch_size", 512))
-                    self.parallel_slots.setValue(self.settings.get("parallel_slots", 1))
-                    self.cont_batching.setChecked(
-                        self.settings.get("cont_batching", True)
-                    )
-                    self.cache_prompt.setChecked(
-                        self.settings.get("cache_prompt", True)
-                    )
-                    self.context_shift.setChecked(
-                        self.settings.get("context_shift", False)
-                    )
-                    self.no_webui.setChecked(self.settings.get("no_webui", False))
-                    self.server_metrics.setChecked(
-                        self.settings.get("server_metrics", True)
-                    )
-                    self.extra_args.setText(self.settings.get("extra_args", ""))
-
-                    cached_models = self.settings.get("model_cache", [])
-                    if cached_models:
-                        self.on_models_found(cached_models)
-            except Exception as e:
-                self.log(f"Ошибка загрузки настроек: {e}", "error")
-
-        # Загрузка профилей
-        if os.path.exists(self.profiles_file):
-            try:
-                with open(self.profiles_file, "r", encoding="utf-8") as f:
-                    self.profiles = json.load(f)
-                    self.refresh_profile_list()
-            except Exception as e:
-                self.log(f"Ошибка загрузки профилей: {e}", "error")
-
-    def save_settings(self):
-        """Сохранение базовых настроек"""
-        self.settings = {
-            "exe": self.exe_path.text(),
-            "bench": self.bench_path.text(),
-            "model_dir": self.model_dir.text(),
-            "bench_prompt": self.bench_prompt.value(),
-            "bench_gen": self.bench_gen.value(),
-            "auto_params": self.auto_params.isChecked(),
-            "use_mmproj": self.use_mmproj.isChecked(),
-            "mmproj_offload": self.mmproj_offload.isChecked(),
-            "last_model_path": self.model_combo.currentData()
-            or self.settings.get("last_model_path", ""),
-            "model_cache": self.models,
-            "temperature": self.temperature.value(),
-            "repeat_penalty": self.repeat_penalty.value(),
-            "use_mmproj": self.use_mmproj.isChecked(),
-            "mmproj_offload": self.mmproj_offload.isChecked(),
-            "gpu_auto": self.gpu_auto.isChecked(),
-            "gpu_layers": self.gpu_layers.value(),
-            "ctx_size": self.ctx_size.value(),
-            "threads": self.threads.value(),
-            "port": self.port.value(),
-            "flash_attn": self.flash_attn.isChecked(),
-            "use_mmap": self.use_mmap.isChecked(),
-            "use_mlock": self.use_mlock.isChecked(),
-            "verbose": self.verbose.isChecked(),
-            "log_timestamps": self.log_timestamps.isChecked(),
-            "cache_type_k": self.cache_type_k.currentText(),
-            "cache_type_v": self.cache_type_v.currentText(),
-            "batch_size": self.batch_size.value(),
-            "ubatch_size": self.ubatch_size.value(),
-            "parallel_slots": self.parallel_slots.value(),
-            "cont_batching": self.cont_batching.isChecked(),
-            "cache_prompt": self.cache_prompt.isChecked(),
-            "context_shift": self.context_shift.isChecked(),
-            "no_webui": self.no_webui.isChecked(),
-            "server_metrics": self.server_metrics.isChecked(),
-            "extra_args": self.extra_args.text(),
-        }
         try:
-            with open(self.settings_file, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.log(f"Ошибка сохранения настроек: {e}", "error")
+            path, data = self.read_integration_config()
+            removed = False
+            if self.current_config_target() == "pi":
+                providers = data.get("providers") or data.get("provider") or data
+                provider = (
+                    providers.get(LLAMACPP_PROVIDER_ID, {})
+                    if isinstance(providers, dict)
+                    else {}
+                )
+                models = (
+                    provider.get("models", []) if isinstance(provider, dict) else []
+                )
+                if isinstance(models, list):
+                    before = len(models)
+                    models[:] = [
+                        m
+                        for m in models
+                        if not (
+                            isinstance(m, dict)
+                            and str(m.get("id") or m.get("name")) == model_id
+                        )
+                    ]
+                    removed = len(models) != before
+            else:
+                providers = data.get("provider") or data.get("providers") or data
+                provider = (
+                    providers.get(LLAMACPP_PROVIDER_ID, {})
+                    if isinstance(providers, dict)
+                    else {}
+                )
+                models = (
+                    provider.get("models", {}) if isinstance(provider, dict) else {}
+                )
+                if isinstance(models, dict):
+                    removed = models.pop(model_id, None) is not None
+            if removed:
+                write_json_file_safely(path, data)
+            self.check_integration_models(silent=True)
+            status = "Удалено" if removed else "Модель не найдена"
+            self.integration_status.setText(f"{status}: {model_id}")
+            self.log(f"Конфиг моделей: {status.lower()} {model_id}")
+        except Exception as exc:
+            self.integration_status.setText(f"Не удалось удалить модель: {exc}")
+            QMessageBox.critical(self, "Конфиг моделей", str(exc))
 
-    def save_profiles(self):
-        try:
-            with open(self.profiles_file, "w", encoding="utf-8") as f:
-                json.dump(self.profiles, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.log(f"Ошибка сохранения профилей: {e}", "error")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить профиль: {e}")
-
-    def refresh_profile_list(self):
-        self.profile_list.clear()
-        for name in self.profiles.keys():
-            self.profile_list.addItem(name)
+    # === Методы работы с профилями ===
 
     def save_profile(self):
+        """Сохранение текущего профиля."""
         name = self.profile_name.text().strip()
         if not name:
             QMessageBox.warning(self, "Ошибка", "Введите имя профиля")
             return
-
         self.profiles[name] = {
             "model": self.model_combo.currentText(),
             "model_path": self.model_combo.currentData(),
@@ -2144,7 +1896,6 @@ class LlamaGUI(QMainWindow):
             "cache_prompt": self.cache_prompt.isChecked(),
             "context_shift": self.context_shift.isChecked(),
             "no_webui": self.no_webui.isChecked(),
-            "server_metrics": self.server_metrics.isChecked(),
             "extra_args": self.extra_args.text(),
             "bench_prompt": self.bench_prompt.value(),
             "bench_gen": self.bench_gen.value(),
@@ -2154,21 +1905,18 @@ class LlamaGUI(QMainWindow):
         self.log(f"💾 Профиль сохранен: {name}")
 
     def load_profile(self, item):
+        """Загрузка профиля."""
         name = item.text()
         if name not in self.profiles:
             return
-
         p = self.profiles[name]
         self.profile_name.setText(name)
         self.loading_profile = True
-
-        # Установка значений
         idx = self.model_combo.findData(p.get("model_path", ""))
         if idx < 0:
             idx = self.model_combo.findText(p.get("model", ""))
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
-
         self.temperature.setValue(p.get("temperature", 0.7))
         self.repeat_penalty.setValue(p.get("repeat_penalty", 1.1))
         self.use_mmproj.setChecked(p.get("use_mmproj", True))
@@ -2192,16 +1940,15 @@ class LlamaGUI(QMainWindow):
         self.cache_prompt.setChecked(p.get("cache_prompt", True))
         self.context_shift.setChecked(p.get("context_shift", False))
         self.no_webui.setChecked(p.get("no_webui", False))
-        self.server_metrics.setChecked(p.get("server_metrics", True))
         self.extra_args.setText(p.get("extra_args", ""))
         self.bench_prompt.setValue(p.get("bench_prompt", 128))
         self.bench_gen.setValue(p.get("bench_gen", 256))
         self.loading_profile = False
         self.on_model_selected()
-
         self.log(f"📂 Загружен профиль: {name}")
 
     def delete_profile(self):
+        """Удаление профиля."""
         name = self.profile_name.text().strip()
         if name in self.profiles:
             del self.profiles[name]
@@ -2210,25 +1957,225 @@ class LlamaGUI(QMainWindow):
             self.profile_name.clear()
             self.log(f"🗑 Профиль удален: {name}")
 
+    def refresh_profile_list(self):
+        """Обновление списка профилей."""
+        self.profile_list.clear()
+        for name in self.profiles.keys():
+            self.profile_list.addItem(name)
+
+    def save_profiles(self):
+        """Сохранение профилей в файл."""
+        try:
+            write_json_file_safely(self.profiles_file, self.profiles)
+        except Exception as e:
+            self.log(f"Ошибка сохранения профилей: {e}", "error")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить профиль: {e}")
+
+    # === Методы работы с настройками ===
+
+    def save_settings(self) -> None:
+        """Сохранение настроек."""
+        self.settings = {
+            "exe": self.exe_path.text(),
+            "bench": self.bench_path.text(),
+            "model_dir": self.model_dir.text(),
+            "opencode_config": self.opencode_config_path.text(),
+            "pi_config": self.pi_config_path.text(),
+            "integration_target": self.current_config_target(),
+            "bench_prompt": self.bench_prompt.value(),
+            "bench_gen": self.bench_gen.value(),
+            "auto_params": self.auto_params.isChecked(),
+            "use_mmproj": self.use_mmproj.isChecked(),
+            "mmproj_offload": self.mmproj_offload.isChecked(),
+            "last_model_path": self.model_combo.currentData()
+            or self.settings.get("last_model_path", ""),
+            "model_cache": [],
+            "temperature": self.temperature.value(),
+            "repeat_penalty": self.repeat_penalty.value(),
+            "gpu_auto": self.gpu_auto.isChecked(),
+            "gpu_layers": self.gpu_layers.value(),
+            "cpu_moe_layers": self.cpu_moe_layers.value(),
+            "ctx_size": self.ctx_size.value(),
+            "threads": self.threads.value(),
+            "threads_batch": self.threads_batch.value(),
+            "port": self.port.value(),
+            "flash_attn": self.flash_attn.isChecked(),
+            "fit_off": self.fit_off.isChecked(),
+            "reasoning_mode": self.reasoning_mode.currentText(),
+            "use_mmap": self.use_mmap.isChecked(),
+            "use_mlock": self.use_mlock.isChecked(),
+            "verbose": self.verbose.isChecked(),
+            "log_timestamps": self.log_timestamps.isChecked(),
+            "cache_type_k": self.cache_type_k.currentText(),
+            "cache_type_v": self.cache_type_v.currentText(),
+            "batch_size": self.batch_size.value(),
+            "ubatch_size": self.ubatch_size.value(),
+            "parallel_slots": self.parallel_slots.value(),
+            "ctx_checkpoints": self.ctx_checkpoints.value(),
+            "cache_ram": self.cache_ram.value(),
+            "cont_batching": self.cont_batching.isChecked(),
+            "cache_prompt": self.cache_prompt.isChecked(),
+            "context_shift": self.context_shift.isChecked(),
+            "no_webui": self.no_webui.isChecked(),
+            "extra_args": self.extra_args.text(),
+        }
+        try:
+            write_json_file_safely(self.settings_file, self.settings)
+        except Exception as e:
+            self.log(f"Ошибка сохранения настроек: {e}", "error")
+
+    def load_data(self):
+        """Загрузка настроек и профилей."""
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    self.settings = json.load(f)
+                    self.exe_path.setText(self.settings.get("exe", ""))
+                    self.bench_path.setText(self.settings.get("bench", ""))
+                    self.model_dir.setText(self.settings.get("model_dir", ""))
+                    self.opencode_config_path.setText(
+                        self.settings.get("opencode_config", "")
+                    )
+                    self.pi_config_path.setText(self.settings.get("pi_config", ""))
+                    idx = self.integration_target.findData(
+                        self.settings.get("integration_target", "opencode")
+                    )
+                    if idx >= 0:
+                        self.integration_target.setCurrentIndex(idx)
+                    self.bench_prompt.setValue(self.settings.get("bench_prompt", 128))
+                    self.bench_gen.setValue(self.settings.get("bench_gen", 256))
+                    self.auto_params.setChecked(self.settings.get("auto_params", True))
+                    self.use_mmproj.setChecked(self.settings.get("use_mmproj", True))
+                    self.mmproj_offload.setChecked(
+                        self.settings.get("mmproj_offload", True)
+                    )
+                    self.gpu_auto.setChecked(self.settings.get("gpu_auto", True))
+                    self.gpu_layers.setValue(self.settings.get("gpu_layers", 33))
+                    self.cpu_moe_layers.setValue(self.settings.get("cpu_moe_layers", 0))
+                    self.ctx_size.setValue(self.settings.get("ctx_size", 4096))
+                    self.threads.setValue(
+                        self.settings.get("threads", os.cpu_count() or 4)
+                    )
+                    self.threads_batch.setValue(self.settings.get("threads_batch", 0))
+                    self.port.setValue(self.settings.get("port", 8080))
+                    self.temperature.setValue(self.settings.get("temperature", 0.7))
+                    self.repeat_penalty.setValue(
+                        self.settings.get("repeat_penalty", 1.1)
+                    )
+                    self.flash_attn.setChecked(self.settings.get("flash_attn", True))
+                    self.fit_off.setChecked(self.settings.get("fit_off", True))
+                    self.reasoning_mode.setCurrentText(
+                        self.settings.get("reasoning_mode", "off")
+                    )
+                    self.use_mmap.setChecked(self.settings.get("use_mmap", True))
+                    self.use_mlock.setChecked(self.settings.get("use_mlock", False))
+                    self.verbose.setChecked(self.settings.get("verbose", False))
+                    self.log_timestamps.setChecked(
+                        self.settings.get("log_timestamps", False)
+                    )
+                    self.cache_type_k.setCurrentText(
+                        self.settings.get("cache_type_k", "f16")
+                    )
+                    self.cache_type_v.setCurrentText(
+                        self.settings.get("cache_type_v", "f16")
+                    )
+                    self.batch_size.setValue(self.settings.get("batch_size", 2048))
+                    self.ubatch_size.setValue(self.settings.get("ubatch_size", 2048))
+                    self.parallel_slots.setValue(self.settings.get("parallel_slots", 1))
+                    self.ctx_checkpoints.setValue(
+                        self.settings.get("ctx_checkpoints", -1)
+                    )
+                    self.cache_ram.setValue(self.settings.get("cache_ram", -2))
+                    self.cont_batching.setChecked(
+                        self.settings.get("cont_batching", True)
+                    )
+                    self.cache_prompt.setChecked(
+                        self.settings.get("cache_prompt", True)
+                    )
+                    self.context_shift.setChecked(
+                        self.settings.get("context_shift", False)
+                    )
+                    self.no_webui.setChecked(self.settings.get("no_webui", False))
+                    self.extra_args.setText(self.settings.get("extra_args", ""))
+                    cached = self.settings.get("model_cache", [])
+                    if cached:
+                        self.on_models_found(cached)
+                    self.update_integration_model_label()
+                    self.check_integration_models(silent=True)
+            except Exception as e:
+                self.log(f"Ошибка загрузки настроек: {e}", "error")
+        if os.path.exists(self.profiles_file):
+            try:
+                with open(self.profiles_file, "r", encoding="utf-8") as f:
+                    self.profiles = json.load(f)
+                    self.refresh_profile_list()
+            except Exception as e:
+                self.log(f"Ошибка загрузки профилей: {e}", "error")
+
+    # === Обработка закрытия ===
+
     def closeEvent(self, event):
-        # Сохранение настроек при выходе
+        """Обработка закрытия окна.
+
+        При запущенном сервере сворачивает в трей вместо закрытия.
+        При повторном закрытии — подтверждение и graceful shutdown.
+
+        Args:
+            event: Событие закрытия.
+        """
+        has_running = (
+            self.process.state() != QProcess.ProcessState.NotRunning
+            or self.bench_process.state() != QProcess.ProcessState.NotRunning
+        )
+
+        # Если сервер запущен и не было подтверждения — сворачиваем в трей
+        if has_running and not hasattr(self, "_close_confirmed"):
+            self.hide()
+            if self.tray_icon:
+                self.tray_icon.showMessage(
+                    "LlamaServer GUI",
+                    "Сервер работает в фоне. Двойной клик по иконке для отображения.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            event.ignore()
+            return
+
         self.save_settings()
 
-        # Остановка процессов
+        # Останавливаем batch log timer
+        if self.log_timer.isActive():
+            self.log_timer.stop()
+            self.flush_log_buffer()
+
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.terminate()
+            if not self.process.waitForFinished(2000):
+                self.process.kill()
 
         if self.bench_process.state() != QProcess.ProcessState.NotRunning:
             self.bench_process.terminate()
+            if not self.bench_process.waitForFinished(2000):
+                self.bench_process.kill()
 
         if self.scanner and self.scanner.isRunning():
             self.scanner.requestInterruption()
+            self.scanner.wait(1000)
+
+        # Скрываем tray icon
+        if self.tray_icon:
+            self.tray_icon.hide()
 
         event.accept()
 
 
-if __name__ == "__main__":
+def main():
+    """Точка входа в приложение."""
     app = QApplication(sys.argv)
     window = LlamaGUI()
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
