@@ -4,7 +4,6 @@ import shlex
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from src.core.constants import LLAMA_ALLOWED_FLAGS
 from src.utils.file_utils import validate_path
 
 
@@ -34,11 +33,6 @@ def validate_extra_args(args: List[str], model_dir: str) -> List[str]:
         else:
             base_arg, inline_value = arg, None
             has_inline = False
-
-        if base_arg not in LLAMA_ALLOWED_FLAGS:
-            invalid.append(f"{base_arg} (неизвестный флаг)")
-            i += 1
-            continue
 
         def get_value() -> tuple:
             if has_inline:
@@ -101,28 +95,26 @@ def build_args(
             str(cfg.port),
             "-ngl",
             gpu_val,
-            "-c",
-            str(cfg.ctx_size),
             "-t",
             str(cfg.threads),
         ]
+        if cfg.ctx_size >= 0:
+            args += ["-c", str(cfg.ctx_size)]
         if cfg.threads_batch > 0:
             args += ["-tb", str(cfg.threads_batch)]
-        args += [
-            "-b",
-            str(cfg.batch_size),
-            "-ub",
-            str(min(cfg.ubatch_size, cfg.batch_size)),
-        ]
+        if cfg.batch_size >= 0:
+            bs = cfg.batch_size
+            ub = cfg.ubatch_size if cfg.ubatch_size >= 0 else bs
+            args += ["-b", str(bs), "-ub", str(min(ub, bs))]
+        if cfg.parallel_slots >= 0:
+            args += ["-np", str(cfg.parallel_slots)]
         args += [
             "-ctk",
             cfg.cache_type_k,
             "-ctv",
             cfg.cache_type_v,
-            "-np",
-            str(cfg.parallel_slots),
         ]
-        if cfg.cpu_moe_layers > 0:
+        if cfg.cpu_moe_layers >= 0:
             args += ["-ncmoe", str(cfg.cpu_moe_layers)]
         if cfg.fit_off:
             args += ["--fit", "off"]
@@ -132,12 +124,10 @@ def build_args(
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:
             args += ["--cache-ram", str(cfg.cache_ram)]
-        args += [
-            "--temp",
-            str(cfg.temperature),
-            "--repeat-penalty",
-            str(cfg.repeat_penalty),
-        ]
+        if cfg.temperature >= 0:
+            args += ["--temp", str(cfg.temperature)]
+        if cfg.repeat_penalty >= 0:
+            args += ["--repeat-penalty", str(cfg.repeat_penalty)]
         if cfg.flash_attn:
             args += ["--flash-attn", "on"]
 
@@ -149,7 +139,7 @@ def build_args(
                 args += ["-mm", cfg.mmproj_path]
             if not cfg.mmproj_offload:
                 args.append("--no-mmproj-offload")
-        elif not cfg.use_mmproj:
+        if not cfg.use_mmproj:
             args.append("--no-mmproj")
 
         if cfg.use_mmap:
@@ -170,6 +160,8 @@ def build_args(
             args.append("--context-shift")
         if cfg.no_webui:
             args.append("--no-webui")
+        if cfg.jinja:
+            args.append("--jinja")
 
     if cfg.extra_args.strip():
         try:

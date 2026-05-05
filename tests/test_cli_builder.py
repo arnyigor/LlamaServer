@@ -1,4 +1,5 @@
 """Тесты для src/core/cli_builder.py"""
+
 import sys
 import os
 import unittest
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.cli_builder import build_args, validate_extra_args
 
+
 @dataclass
 class MockConfig:
     exe: str = "llama-server.exe"
@@ -17,8 +19,8 @@ class MockConfig:
     model_dir: str = "/models"
     gpu_auto: bool = True
     gpu_layers: int = 33
-    cpu_moe_layers: int = 0
-    ctx_size: int = 4096
+    cpu_moe_layers: int = -1
+    ctx_size: int = -1
     threads: int = 4
     threads_batch: int = 0
     port: int = 8080
@@ -31,9 +33,9 @@ class MockConfig:
     log_timestamps: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
-    batch_size: int = 2048
-    ubatch_size: int = 2048
-    parallel_slots: int = 1
+    batch_size: int = -1
+    ubatch_size: int = -1
+    parallel_slots: int = -1
     ctx_checkpoints: int = -1
     cache_ram: int = -2
     cont_batching: bool = True
@@ -41,13 +43,15 @@ class MockConfig:
     context_shift: bool = False
     no_webui: bool = False
     extra_args: str = ""
-    temperature: float = 0.7
-    repeat_penalty: float = 1.1
+    jinja: bool = False
+    temperature: float = -1.0
+    repeat_penalty: float = -1.0
     use_mmproj: bool = True
     mmproj_offload: bool = True
     mmproj_path: str = ""
     bench_prompt: int = 128
     bench_gen: int = 256
+
 
 class TestBuildArgs(unittest.TestCase):
     def setUp(self):
@@ -55,6 +59,7 @@ class TestBuildArgs(unittest.TestCase):
         self.model = "/models/test.gguf"
 
     def test_basic_server_args(self):
+        self.cfg.ctx_size = 4096
         args = build_args(self.cfg, self.model)
         self.assertIn("-m", args)
         self.assertIn(self.model, args)
@@ -87,7 +92,7 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.gpu_layers = 10
         args = build_args(self.cfg, self.model, for_benchmark=True)
         idx = args.index("-ngl")
-        self.assertEqual(args[idx+1], "99")
+        self.assertEqual(args[idx + 1], "99")
 
     def test_mmproj_handling(self):
         self.cfg.mmproj_path = "/models/mmproj.gguf"
@@ -136,10 +141,11 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIsNone(build_args(self.cfg, ""))
         self.assertIsNone(build_args(self.cfg, None))
 
+
 class TestValidateExtraArgs(unittest.TestCase):
-    def test_unknown_flag(self):
+    def test_unknown_flag_allowed(self):
         errs = validate_extra_args(["--unknown-flag", "val"], "/models")
-        self.assertTrue(any("неизвестный флаг" in e for e in errs))
+        self.assertEqual(len(errs), 0)
 
     def test_valid_path_flag(self):
         with patch("src.core.cli_builder.validate_path") as mock_vp:
@@ -164,6 +170,7 @@ class TestValidateExtraArgs(unittest.TestCase):
     def test_valid_host(self):
         errs = validate_extra_args(["--host", "127.0.0.1"], "/models")
         self.assertEqual(len(errs), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

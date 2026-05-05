@@ -58,50 +58,6 @@ LARGE_MODEL_THRESHOLD = 24
 MEDIUM_MODEL_THRESHOLD = 14
 SMALL_MODEL_THRESHOLD = 5
 
-# Допустимые флаги llama.cpp для extra_args (whitelist)
-LLAMA_ALLOWED_FLAGS = {
-    "--top-p",
-    "--min-p",
-    "--top-k",
-    "--typical",
-    "--repeat-last-n",
-    "--frequency-penalty",
-    "--presence-penalty",
-    "--tfs",
-    "--mirostat",
-    "--mirostat-lr",
-    "--mirostat-ent",
-    "--rope-freq-base",
-    "--rope-freq-scale",
-    "--rope-scaling",
-    "--yarn-ext-factor",
-    "--yarn-attn-factor",
-    "--yarn-beta-fast",
-    "--yarn-beta-slow",
-    "--defrag-thold",
-    "--pooling",
-    "--attention",
-    "--input-prefix",
-    "--input-suffix",
-    "--reverse-prompt",
-    "--grammar",
-    "--grammar-file",
-    "--json-schema",
-    "--chat-template",
-    "--chat-template-file",
-    "--samplers",
-    "--seed",
-    "--override-tensor",
-    "--lora",
-    "--lora-scaled",
-    "--mmproj",
-    "--host",
-    "--path",
-    "--api-key",
-    "--api-key-file",
-    "--ctx-checkpoints",
-    "--cache-ram",
-}
 
 LLAMACPP_PROVIDER_ID = "llamacpp"
 DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
