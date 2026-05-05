@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Deque, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -52,27 +53,26 @@ _TOKPS_PATTERN = re.compile(
     re.I,
 )
 
-_FORMAT_CACHE: dict[str, QTextCharFormat] = {}
 
-
-def _get_format(level: str, text: str = "") -> QTextCharFormat:
-    """Кэшированный формат — создаётся один раз."""
-    key = f"{level}:{text[:20]}"
-    if key in _FORMAT_CACHE:
-        return _FORMAT_CACHE[key]
-
+@lru_cache(maxsize=64)
+def _get_format_cached(level: str, content_key: str) -> QTextCharFormat:
+    """LRU-кэш форматов — автоматически вытесняет старые."""
     fmt = QTextCharFormat()
     color = _LEVEL_COLORS.get(level, _LEVEL_COLORS["info"])
 
-    if level == "info" and text:
+    if level == "info" and content_key:
         for pattern, content_color in _CONTENT_COLORS:
-            if pattern.search(text):
+            if pattern.search(content_key):
                 color = content_color
                 break
 
     fmt.setForeground(color)
-    _FORMAT_CACHE[key] = fmt
     return fmt
+
+
+def _get_format(level: str, text: str = "") -> QTextCharFormat:
+    content_key = text[:20].strip().lower() if text else ""
+    return _get_format_cached(level, content_key)
 
 
 class LogManager(QObject):

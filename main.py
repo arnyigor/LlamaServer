@@ -48,6 +48,7 @@ class LlamaGUI:
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
+        u.ctx_size.valueChanged.connect(self.on_ctx_changed)
         u.update_llama_btn.clicked.connect(self.update_llamacpp)
         u.integration_check_btn.clicked.connect(self.check_integration_models)
         u.integration_add_btn.clicked.connect(self.add_model_to_integration)
@@ -207,9 +208,59 @@ class LlamaGUI:
                 return
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
         self.ui.models_by_path[path] = info
-        self.ui.model_info.setText(
-            f"Архитектура: {info.get('architecture')}; квант: {info.get('quant')}; размер: {info.get('size_gib')} GiB; ctx: {info.get('context_length')}"
-        )
+
+        arch = info.get("architecture") or "?"
+        quant = info.get("quant") or "?"
+        size = info.get("size_gib", 0)
+        block_count = info.get("block_count", 0)
+        head_count = info.get("head_count", 0)
+        emb_len = info.get("embedding_length", 0)
+        expert_count = info.get("expert_count", 0)
+        expert_used = info.get("expert_used", 0)
+        ctx = info.get("context_length", 0)
+        rec_ctx = info.get("recommended_ctx", 0)
+
+        parts = [f"🏗 {arch} | {quant} | {size:.2f} GiB"]
+
+        layer_str = f"Слоёв: {block_count}" if block_count else "Слоёв: ?"
+        if head_count:
+            layer_str += f" | Heads: {head_count}"
+        if emb_len:
+            layer_str += f" | Emb: {emb_len}"
+        parts.append(f"📐 {layer_str}")
+
+        if expert_count:
+            moe_str = f"🔀 MoE: {expert_count} экспертов"
+            if expert_used:
+                moe_str += f", активных: {expert_used}"
+            parts.append(moe_str)
+
+        if ctx:
+            parts.append(f"📏 Контекст: {ctx:,} | Рек.: {rec_ctx:,}")
+
+        if info.get("mmproj_path"):
+            from pathlib import Path
+
+            mmproj_name = Path(info["mmproj_path"]).name
+            parts.append(f"🖼 mmproj: {mmproj_name}")
+
+        if info.get("metadata_error"):
+            parts.append(f"⚠️ {info['metadata_error']}")
+
+        self.ui.model_info.setText("\n".join(parts))
+
+        if expert_count:
+            from src.core.gguf_parser import recommend_moe_cpu_layers
+
+            rec_moe = recommend_moe_cpu_layers(info, self.ui.ctx_size.value())
+            tooltip = (
+                f"MoE модель: {expert_count} экспертов, {expert_used} активных\n"
+                f"Рекомендация для ctx={self.ui.ctx_size.value():,}: {rec_moe}"
+            )
+            self.ui.cpu_moe_layers.setToolTip(tooltip)
+        else:
+            self.ui.cpu_moe_layers.setToolTip("Модель не является MoE")
+
         self.config.settings.last_model_path = path
         if self.ui.auto_params.isChecked() and not self.ui.loading_profile:
             self.apply_recommended_params(info)
@@ -231,6 +282,23 @@ class LlamaGUI:
             self.ui.cache_type_v.setCurrentText("f16")
         self.ui.batch_size.setValue(2048)
         self.ui.ubatch_size.setValue(2048)
+
+    def on_ctx_changed(self, ctx_size):
+        info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
+        if not info:
+            return
+        expert_count = info.get("expert_count", 0)
+        if not expert_count:
+            return
+        from src.core.gguf_parser import recommend_moe_cpu_layers
+
+        rec_moe = recommend_moe_cpu_layers(info, ctx_size)
+        expert_used = info.get("expert_used", 0)
+        tooltip = (
+            f"MoE модель: {expert_count} экспертов, {expert_used} активных\n"
+            f"Рекомендация для ctx={ctx_size:,}: {rec_moe}"
+        )
+        self.ui.cpu_moe_layers.setToolTip(tooltip)
 
     def update_cli_preview(self):
         try:

@@ -156,6 +156,24 @@ def read_gguf_metadata(path: Union[str, Path]) -> Dict[str, Any]:
     if file_path.stat().st_size < 8:
         raise GGUFParseError(f"GGUF file too small: {file_path}")
 
+    _NEEDED_SUFFIXES = frozenset(
+        {
+            ".context_length",
+            ".block_count",
+            ".expert_count",
+            ".experts_used_count",
+            ".attention.head_count",
+            ".embedding_length",
+        }
+    )
+    _NEEDED_EXACT = frozenset(
+        {
+            "general.architecture",
+            "general.file_type",
+            "general.block_count",
+        }
+    )
+
     try:
         with open(file_path, "rb") as f:
             if f.read(4) != b"GGUF":
@@ -176,6 +194,7 @@ def read_gguf_metadata(path: Union[str, Path]) -> Dict[str, Any]:
 
             metadata["gguf.version"] = version
             metadata["gguf.tensor_count"] = tensor_count
+
             for _ in range(metadata_count):
                 key = read_gguf_string(f)
                 value_type = struct.unpack("<I", f.read(4))[0]
@@ -183,18 +202,13 @@ def read_gguf_metadata(path: Union[str, Path]) -> Dict[str, Any]:
                     value_type, str(value_type)
                 )
                 metadata[key] = read_gguf_value(f, value_type)
+
                 arch = metadata.get("general.architecture", "")
-                has_file_type = "general.file_type" in metadata
-                has_context = any(
-                    k.endswith(".context_length") and isinstance(v, int)
-                    for k, v in metadata.items()
-                )
-                has_block_count = any(
-                    k.endswith(".block_count") or k == "general.block_count"
-                    for k in metadata.keys()
-                )
-                if arch and has_file_type and has_context and has_block_count:
-                    break
+                if arch:
+                    needed = {f"{arch}{s}" for s in _NEEDED_SUFFIXES} | _NEEDED_EXACT
+                    collected = needed & set(metadata.keys())
+                    if collected >= needed:
+                        break
     except struct.error as e:
         raise GGUFParseError(f"Corrupted GGUF structure: {e}")
     except OSError as e:
@@ -305,6 +319,11 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         "quant": quant_from_filename(file_path),
         "mmproj_path": detect_mmproj_for_model(file_path),
         "metadata_error": "",
+        "block_count": 0,
+        "expert_count": 0,
+        "expert_used": 0,
+        "head_count": 0,
+        "embedding_length": 0,
     }
     try:
         metadata = read_gguf_metadata(file_path)
@@ -313,6 +332,7 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         file_type = metadata.get("general.file_type")
         if isinstance(file_type, int) and file_type in GGUF_FILE_TYPES:
             info["quant"] = GGUF_FILE_TYPES[file_type]
+
         ctx_key = f"{arch}.context_length" if arch else ""
         context_length = metadata.get(ctx_key)
         if not isinstance(context_length, int):
@@ -322,14 +342,74 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
                     break
         if isinstance(context_length, int):
             info["context_length"] = context_length
+
         block_count = metadata.get("general.block_count")
         if not isinstance(block_count, int) and arch:
             block_count = metadata.get(f"{arch}.block_count")
         if isinstance(block_count, int):
             info["block_count"] = block_count
+
+        for key_suffix in ("expert_count", "experts_used_count"):
+            val = metadata.get(f"{arch}.{key_suffix}") if arch else None
+            if not isinstance(val, int):
+                for k, v in metadata.items():
+                    if k.endswith(f".{key_suffix}") and isinstance(v, int):
+                        val = v
+                        break
+            field = "expert_count" if "expert_count" in key_suffix else "expert_used"
+            if isinstance(val, int):
+                info[field] = val
+
+        for meta_suffix, info_key in (
+            ("attention.head_count", "head_count"),
+            ("embedding_length", "embedding_length"),
+        ):
+            val = metadata.get(f"{arch}.{meta_suffix}") if arch else None
+            if isinstance(val, int):
+                info[info_key] = val
+
     except GGUFParseError as exc:
         info["metadata_error"] = f"GGUF parse error: {exc}"
     except Exception as exc:
         info["metadata_error"] = f"Unexpected error: {exc}"
     info["recommended_ctx"] = recommend_context(info)
     return info
+
+
+def recommend_moe_cpu_layers(info: Dict[str, Any], ctx_size: int) -> int:
+    """Рекомендация количества CPU MoE layers (-ncmoe).
+
+    Args:
+        info: Словарь с информацией о модели из extract_model_info.
+        ctx_size: Выбранный размер контекста.
+
+    Returns:
+        Рекомендуемое значение -ncmoe (0 = не использовать CPU MoE).
+    """
+    expert_count = info.get("expert_count", 0)
+    expert_used = info.get("expert_used", 0)
+    size_gib = info.get("size_gib", 0)
+
+    if not expert_count or expert_count <= 1:
+        return 0
+    if not size_gib:
+        return 0
+
+    inactive_ratio = (expert_count - expert_used) / expert_count if expert_used else 0.5
+
+    ctx_pressure = 0.0
+    if ctx_size >= 65536:
+        ctx_pressure = 0.8
+    elif ctx_size >= 32768:
+        ctx_pressure = 0.5
+    elif ctx_size >= 16384:
+        ctx_pressure = 0.3
+    elif ctx_size >= 8192:
+        ctx_pressure = 0.15
+
+    if size_gib >= 24:
+        ctx_pressure = min(1.0, ctx_pressure * 1.3)
+
+    recommended = int(expert_count * inactive_ratio * ctx_pressure)
+    max_safe = expert_count - (expert_used or 1)
+    return max(0, min(recommended, max_safe))
