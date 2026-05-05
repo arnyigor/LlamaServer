@@ -74,44 +74,40 @@ def json_write_encoding(path: Union[str, Path]) -> str:
 
 
 def write_json_file_safely(path: Union[str, Path], data: Any) -> None:
-    """Атомарная запись JSON файла с бэкапом.
+    """Запись JSON файла.
+
+    Простая прямая запись без временных файлов (для совместимости с PyInstaller).
 
     Args:
         path: Путь к файлу.
         data: Данные для записи.
     """
-    target = validate_path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    encoding = json_write_encoding(target)
-
-    if target.exists():
-        backup = target.with_name(f"{target.name}.bak")
-        try:
-            shutil.copy2(target, backup)
-        except OSError:
-            pass
-
-    temp_name = ""
+    target = Path(path)
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding=encoding,
-            dir=str(target.parent),
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as f:
-            temp_name = f.name
+        with open(target, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
-        os.replace(temp_name, target)
     except Exception:
-        if temp_name and os.path.exists(temp_name):
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-        raise
+        # Fallback: если не удалось записать, пробуем через временный файл
+        import tempfile
+        import os as os_module
+
+        temp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as f:
+                temp_name = f.name
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            if target.exists():
+                os_module.remove(target)
+            os_module.rename(temp_name, target)
+        except Exception:
+            if temp_name and os_module.exists(temp_name):
+                try:
+                    os_module.unlink(temp_name)
+                except OSError:
+                    pass
+            raise
 
 
 def load_or_create_json(path: Union[str, Path]) -> Dict[str, Any]:

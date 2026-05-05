@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -91,15 +92,8 @@ class LlamaGUI(QMainWindow):
         self.bench_process.finished.connect(self.handle_bench_finished)
 
         # Файлы и данные
-        # Определяем рабочую директорию (для PyInstaller используем _MEIPASS или текущую)
-        if hasattr(sys, "_MEIPASS"):
-            # При запуске из exe используем директорию exe, а не временную
-            self.work_dir = Path(sys.executable).parent
-        else:
-            self.work_dir = Path.cwd()
-
-        self.profiles_file = str(self.work_dir / "profiles.json")
-        self.settings_file = str(self.work_dir / "settings.json")
+        self.profiles_file = "profiles.json"
+        self.settings_file = "settings.json"
         self.profiles: Dict[str, Any] = {}
         self.settings: Dict[str, Any] = {}
         self.models: List[Dict[str, Any]] = []
@@ -1568,14 +1562,8 @@ class LlamaGUI(QMainWindow):
         self.updater.percent.connect(self.update_progress.setValue)
         self.updater.completed.connect(self.on_update_completed)
         self.updater.finished.connect(self.on_update_thread_finished)
-
-        # Логируем перед стартом
-        self.log(f"DEBUG: Starting updater thread for: {exe}\n")
         self.updater.start()
-        self.log(f"DEBUG: Thread started, isRunning={self.updater.isRunning()}\n")
-
-        # Проверяем, что поток действительно запустился
-        QTimer.singleShot(500, self._check_updater_started)
+        self.update_action_buttons()
 
     def _backup_llamacpp(self, target_dir: Path) -> None:
         """Создание бэкапа бинарников llama.cpp.
@@ -1623,17 +1611,13 @@ class LlamaGUI(QMainWindow):
 
     def _check_updater_started(self):
         """Проверка, что updater запустился."""
-        self.log(f"DEBUG: _check_updater_started called\n")
         if self.updater:
             is_running = self.updater.isRunning()
-            self.log(f"DEBUG: updater.isRunning() = {is_running}\n")
             if not is_running:
                 self.log("⚠️ Updater failed to start or finished too quickly", "error")
                 self.update_status.setText("Failed to start updater")
                 self.update_progress.setVisible(False)
                 self.update_action_buttons()
-        else:
-            self.log("DEBUG: updater is None\n")
 
     def auto_detect_bench(self):
         """Автоопределение пути к бенчмарку."""
