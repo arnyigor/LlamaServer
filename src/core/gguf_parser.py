@@ -189,7 +189,11 @@ def read_gguf_metadata(path: Union[str, Path]) -> Dict[str, Any]:
                     k.endswith(".context_length") and isinstance(v, int)
                     for k, v in metadata.items()
                 )
-                if arch and has_file_type and has_context:
+                has_block_count = any(
+                    k.endswith(".block_count") or k == "general.block_count"
+                    for k in metadata.keys()
+                )
+                if arch and has_file_type and has_context and has_block_count:
                     break
     except struct.error as e:
         raise GGUFParseError(f"Corrupted GGUF structure: {e}")
@@ -318,6 +322,11 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
                     break
         if isinstance(context_length, int):
             info["context_length"] = context_length
+        block_count = metadata.get("general.block_count")
+        if not isinstance(block_count, int) and arch:
+            block_count = metadata.get(f"{arch}.block_count")
+        if isinstance(block_count, int):
+            info["block_count"] = block_count
     except GGUFParseError as exc:
         info["metadata_error"] = f"GGUF parse error: {exc}"
     except Exception as exc:

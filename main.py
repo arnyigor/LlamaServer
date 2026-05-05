@@ -6,10 +6,7 @@
 import sys
 import json
 import os
-import re
 import shlex
-import shutil
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -108,16 +105,6 @@ class LlamaGUI(QMainWindow):
         self.server_stop_requested = False
         self.bench_stop_requested = False
         self.scan_cancel_requested = False
-
-        # Метрики
-        self.prompt_speed: Optional[float] = None
-        self.generation_speed: Optional[float] = None
-        self.tokens_cached: Optional[int] = None
-        self.kv_cache_tokens: Optional[int] = None
-        self.kv_cache_usage_ratio: Optional[float] = None
-        self.effective_ctx_size: Optional[int] = None
-        self.decode_last_by_task: Dict[str, tuple] = {}
-        self.decode_speed_ema: Optional[float] = None
 
         # Tray icon
         self.tray_icon: Optional[QSystemTrayIcon] = None
@@ -532,16 +519,6 @@ class LlamaGUI(QMainWindow):
 
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("Логи:"))
-        self.speed_label = QLabel("Скорость: нет данных")
-        self.speed_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        log_header.addWidget(self.speed_label, 1)
-        self.context_label = QLabel("Контекст: нет данных")
-        self.context_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        log_header.addWidget(self.context_label)
         self.autoscroll_logs = QCheckBox("Автоскролл")
         self.autoscroll_logs.setChecked(True)
         log_header.addWidget(self.autoscroll_logs)
@@ -650,8 +627,6 @@ class LlamaGUI(QMainWindow):
             self.test_btn: "Запускает llama-bench с текущими параметрами.",
             self.start_btn: "Запускает llama-server.",
             self.stop_btn: "Останавливает сервер, бенчмарк или сканирование.",
-            self.speed_label: "Скорость prompt/gen из логов.",
-            self.context_label: "Заполненность KV cache.",
             self.autoscroll_logs: "Автоматическая прокрутка логов вниз.",
             self.opencode_config_path: "Путь к opencode.json для интеграции.",
             self.pi_config_path: "Путь к config.json PI для интеграции.",
@@ -698,7 +673,6 @@ class LlamaGUI(QMainWindow):
             return
         self.log(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
         self.server_stop_requested = False
-        self.reset_speed_metrics()
         self.process.start(exe, args)
         self.start_btn.setEnabled(False)
         self.test_btn.setEnabled(False)
@@ -765,7 +739,6 @@ class LlamaGUI(QMainWindow):
         if self.bench_process.state() == QProcess.ProcessState.Running:
             self.stop_benchmark()
             return
-        self.reset_speed_metrics()
         self.bench_stop_requested = False
         self.test_btn.setEnabled(False)
         self.test_btn.setText("⏳ Тестирование...")
@@ -794,7 +767,6 @@ class LlamaGUI(QMainWindow):
         data = (
             self.process.readAllStandardOutput().data().decode("utf-8", errors="ignore")
         )
-        self.update_speed_metrics(data)
         self.log(data, "info")
 
     def handle_stderr(self):
@@ -802,7 +774,6 @@ class LlamaGUI(QMainWindow):
         data = (
             self.process.readAllStandardError().data().decode("utf-8", errors="ignore")
         )
-        self.update_speed_metrics(data)
         self.log(data, "error")
 
     def handle_state(self, state):
@@ -829,7 +800,6 @@ class LlamaGUI(QMainWindow):
             .data()
             .decode("utf-8", errors="ignore")
         )
-        self.update_speed_metrics(data)
         self.log(data, "bench")
 
     def handle_bench_stderr(self):
@@ -839,7 +809,6 @@ class LlamaGUI(QMainWindow):
             .data()
             .decode("utf-8", errors="ignore")
         )
-        self.update_speed_metrics(data)
         self.log(data, "error")
 
     def handle_bench_finished(self, exit_code):
@@ -859,217 +828,6 @@ class LlamaGUI(QMainWindow):
         self.bench_stop_requested = False
 
     # === Метрики и логирование ===
-
-    def reset_speed_metrics(self):
-        """Сброс метрик скорости."""
-        self.prompt_speed = self.generation_speed = self.tokens_cached = (
-            self.kv_cache_tokens
-        ) = None
-        self.kv_cache_usage_ratio = self.effective_ctx_size = self.decode_speed_ema = (
-            None
-        )
-        self.decode_last_by_task = {}
-        self.speed_label.setText("Скорость: нет данных")
-        self.context_label.setText("Контекст: нет данных")
-
-    def update_speed_metrics(self, text):
-        """Обновление метрик скорости из вывода."""
-        if not text:
-            return
-        self.update_metrics_from_server_log_lines(text)
-        self.update_metrics_from_json(text)
-        for line in text.splitlines():
-            lower = line.lower()
-            m = re.search(
-                r"prompt eval.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if m:
-                self.prompt_speed = self.parse_speed_value(m.group(1))
-            m = re.search(
-                r"(?<!prompt )\beval(?: time)?\b.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if m:
-                self.generation_speed = self.parse_speed_value(m.group(1))
-            m = re.search(
-                r"\bpp\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if m:
-                self.prompt_speed = self.parse_speed_value(m.group(1))
-            m = re.search(
-                r"\btg\s+[0-9]+.*?([0-9]+(?:[.,][0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)",
-                lower,
-            )
-            if m:
-                self.generation_speed = self.parse_speed_value(m.group(1))
-        self.refresh_speed_label()
-
-    def update_metrics_from_json(self, text):
-        """Обновление метрик из JSON в выводе."""
-        for match in re.finditer(r'"timings"\s*:\s*\{', text):
-            start = text.rfind("{", 0, match.start())
-            if start < 0:
-                continue
-            payload = self.extract_json_object(text, start)
-            if not payload:
-                continue
-            try:
-                data = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            timings = data.get("timings")
-            if not isinstance(timings, dict):
-                continue
-            ps = timings.get("prompt_per_second")
-            gs = timings.get("predicted_per_second")
-            tc = data.get("tokens_cached")
-            if isinstance(ps, (int, float)):
-                self.prompt_speed = float(ps)
-            if isinstance(gs, (int, float)):
-                self.generation_speed = float(gs)
-            if isinstance(tc, int):
-                self.tokens_cached = tc
-            self.refresh_context_label()
-
-    def update_metrics_from_server_log_lines(self, text):
-        """Обновление метрик из строк логов сервера."""
-        now = time.monotonic()
-        changed = False
-        for line in text.splitlines():
-            lower = line.lower()
-            m = re.search(r"n_ctx\s*=\s*(\d+)\s*,\s*n_tokens\s*=\s*(\d+)", lower)
-            if m:
-                ctx, used = int(m.group(1)), int(m.group(2))
-                if ctx > 0:
-                    self.effective_ctx_size = ctx
-                if used >= 0:
-                    self.kv_cache_tokens = used
-                changed = True
-            m = re.search(
-                r"slot\s+update_batch.*?n_ctx\s*=\s*(\d+).*?n_tokens\s*=\s*(\d+)", lower
-            )
-            if m:
-                ctx, used = int(m.group(1)), int(m.group(2))
-                if ctx > 0:
-                    self.effective_ctx_size = ctx
-                if used >= 0:
-                    self.kv_cache_tokens = used
-                changed = True
-            m = re.search(r"\|\s*task\s+(\d+)\s*\|.*?n_decoded\s*=\s*(\d+)", lower)
-            if m:
-                tid, dec = m.group(1), int(m.group(2))
-                prev = self.decode_last_by_task.get(tid)
-                self.decode_last_by_task[tid] = (dec, now)
-                if prev:
-                    pd, pt = prev
-                    dt, dd = now - pt, dec - pd
-                    if dt > 0.05 and dd > 0:
-                        inst = dd / dt
-                        if 0.1 <= inst <= 1000:
-                            self.decode_speed_ema = (
-                                inst
-                                if self.decode_speed_ema is None
-                                else self.decode_speed_ema * 0.75 + inst * 0.25
-                            )
-                            self.generation_speed = self.decode_speed_ema
-                            changed = True
-            m = re.search(r"n_decoded\s*=\s*(\d+)", lower)
-            if m:
-                dec = int(m.group(1))
-                tid = "0"
-                prev = self.decode_last_by_task.get(tid)
-                self.decode_last_by_task[tid] = (dec, now)
-                if prev:
-                    pd, pt = prev
-                    dt, dd = now - pt, dec - pd
-                    if dt > 0.05 and dd > 0:
-                        inst = dd / dt
-                        if 0.1 <= inst <= 1000:
-                            self.decode_speed_ema = (
-                                inst
-                                if self.decode_speed_ema is None
-                                else self.decode_speed_ema * 0.75 + inst * 0.25
-                            )
-                            self.generation_speed = self.decode_speed_ema
-                            changed = True
-            m = re.search(r"n_tokens\s*=\s*(\d+)", lower)
-            if m:
-                tok = int(m.group(1))
-                if tok > 0:
-                    self.kv_cache_tokens = tok
-                    self.effective_ctx_size = self.effective_ctx_size or 8192
-                    changed = True
-        if changed:
-            self.refresh_speed_label()
-            self.refresh_context_label()
-
-    def extract_json_object(self, text, start):
-        """Извлечение JSON объекта из текста."""
-        depth = 0
-        in_str = False
-        esc = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == "\\":
-                    esc = True
-                elif c == '"':
-                    in_str = False
-                continue
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-        return ""
-
-    def parse_speed_value(self, v):
-        """Парсинг значения скорости."""
-        try:
-            return float(v.replace(",", "."))
-        except ValueError:
-            return None
-
-    def refresh_speed_label(self):
-        """Обновление метки скорости."""
-        parts = []
-        if self.prompt_speed is not None:
-            parts.append(f"prompt {self.prompt_speed:.2f} tok/s")
-        if self.generation_speed is not None:
-            parts.append(f"gen {self.generation_speed:.2f} tok/s")
-        if parts:
-            self.speed_label.setText("Скорость: " + " | ".join(parts))
-
-    def refresh_context_label(self):
-        """Обновление метки контекста."""
-        ctx = self.effective_ctx_size or self.ctx_size.value()
-        if self.kv_cache_usage_ratio is not None:
-            pct = min(999.9, self.kv_cache_usage_ratio * 100)
-            self.context_label.setText(
-                f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({pct:.1f}%)"
-                if self.kv_cache_tokens is not None and ctx > 0
-                else f"Контекст: KV {pct:.1f}%"
-            )
-            return
-        if self.kv_cache_tokens is not None and ctx > 0:
-            self.context_label.setText(
-                f"Контекст: KV {self.kv_cache_tokens}/{ctx} ({min(999.9, self.kv_cache_tokens / ctx * 100):.1f}%)"
-            )
-            return
-        if self.tokens_cached is not None and ctx > 0:
-            self.context_label.setText(
-                f"Контекст: cache {self.tokens_cached}/{ctx} ({min(999.9, self.tokens_cached / ctx * 100):.1f}%)"
-            )
-            return
-        if self.effective_ctx_size is not None and self.effective_ctx_size > 0:
-            self.context_label.setText(f"Контекст: {self.effective_ctx_size} (idle)")
 
     def log(self, text: str, level: str = "info") -> None:
         """Добавление записи в лог через буфер (batch-логирование).
@@ -1248,6 +1006,7 @@ class LlamaGUI(QMainWindow):
         size_gib = info.get("size_gib", 0)
         recommended_ctx = info.get("recommended_ctx", 4096)
         mmproj = info.get("mmproj_path") or "не найден"
+        layers = info.get("block_count") if info.get("block_count") is not None else "не определено"
         error = (
             f"\nMetadata: {info['metadata_error']}"
             if info.get("metadata_error")
@@ -1255,7 +1014,7 @@ class LlamaGUI(QMainWindow):
         )
         self.model_info.setText(
             f"Архитектура: {arch}; квант: {quant}; размер: {size_gib} GiB; "
-            f"ctx модели: {max_ctx}; рекомендовано: {recommended_ctx}; mmproj: {mmproj}{error}"
+            f"слои: {layers}; ctx модели: {max_ctx}; рекомендовано: {recommended_ctx}; mmproj: {mmproj}{error}"
         )
         self.settings["last_model_path"] = model_path
         self.update_integration_model_label()
@@ -1551,8 +1310,6 @@ class LlamaGUI(QMainWindow):
             )
             return
 
-        self._backup_llamacpp(Path(exe).parent)
-
         self.update_progress.setValue(0)
         self.update_progress.setVisible(True)
         self.update_status.setText("Checking release...")
@@ -1564,28 +1321,6 @@ class LlamaGUI(QMainWindow):
         self.updater.finished.connect(self.on_update_thread_finished)
         self.updater.start()
         self.update_action_buttons()
-
-    def _backup_llamacpp(self, target_dir: Path) -> None:
-        """Создание бэкапа бинарников llama.cpp.
-
-        Args:
-            target_dir: Директория с бинарниками.
-        """
-        backup_dir = target_dir / "backup"
-        backup_dir.mkdir(exist_ok=True)
-
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        backup_subdir = backup_dir / f"backup_{timestamp}"
-        backup_subdir.mkdir(exist_ok=True)
-
-        for pattern in ["*.exe", "*.dll"]:
-            for file in target_dir.glob(pattern):
-                try:
-                    shutil.copy2(file, backup_subdir / file.name)
-                except OSError:
-                    pass
-
-        self.log(f"💾 Бэкап создан: {backup_subdir}\n")
 
     def on_update_progress(self, text):
         """Обработка прогресса обновления."""

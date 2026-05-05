@@ -112,8 +112,9 @@ class TestLlamaCppUpdater(unittest.TestCase):
             ("b1234", 1234),
             ("v1.0", None),
             ("", None),
-            ("b999", None),  # Слишком маленький номер (< 1000)
+            ("b999", 999),  # Маленький номер тоже валиден
             ("b1000", 1000),
+            ("4600", 4600),  # Без префикса b
         ]
         for tag, expected in test_cases:
             with self.subTest(tag=tag):

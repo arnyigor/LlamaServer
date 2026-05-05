@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -79,6 +80,12 @@ class LlamaCppUpdater(QThread):
                 self.percent.emit(100)
                 self.completed.emit(False, f"Already up to date: build {current_build}")
                 return
+
+            # Create backup before downloading new version
+            self.progress.emit("Creating backup...")
+            backup_path = self.backup_binaries(target_dir)
+            self.progress.emit(f"Backup created: {backup_path.name}")
+
             assets = self.select_assets(release)
             if not assets:
                 raise RuntimeError(
@@ -142,8 +149,17 @@ class LlamaCppUpdater(QThread):
             raise RuntimeError(f"Network error: {e.reason}") from e
 
     def parse_build_number(self, value):
-        match = re.search(r"b?(\d+)", value or "")
-        return int(match.group(1)) if match else None
+        # Сначала ищем формат bXXXX (стандартный для llama.cpp)
+        match = re.search(r"b(\d+)", value or "")
+        if match:
+            num = int(match.group(1))
+            return num if num >= 1 else None
+        # Fallback: число в конце строки (для тегов без префикса)
+        match = re.search(r"(\d+)$", value or "")
+        if match:
+            num = int(match.group(1))
+            return num if num >= 1 else None
+        return None
 
     def select_assets(self, release):
         assets = release.get("assets", [])
@@ -205,3 +221,35 @@ class LlamaCppUpdater(QThread):
                 shutil.copytree(item, target, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, target)
+
+    @staticmethod
+    def backup_binaries(target_dir: Path, keep: int = 5) -> Path:
+        """Создание бэкапа бинарников с ограничением количества."""
+        backup_dir = target_dir / "backup"
+        backup_dir.mkdir(exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_subdir = backup_dir / f"backup_{timestamp}"
+        backup_subdir.mkdir(exist_ok=True)
+
+        for pattern in ["*.exe", "*.dll"]:
+            for file in target_dir.glob(pattern):
+                try:
+                    shutil.copy2(file, backup_subdir / file.name)
+                except OSError:
+                    pass
+
+        # Оставляем только последние `keep` бэкапов
+        backups = sorted(
+            [
+                d
+                for d in backup_dir.iterdir()
+                if d.is_dir() and d.name.startswith("backup_")
+            ],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        for old in backups[keep:]:
+            shutil.rmtree(old, ignore_errors=True)
+
+        return backup_subdir
