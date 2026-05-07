@@ -15,7 +15,9 @@ from PySide6.QtWidgets import (
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
+from src.core.mem_viz_parser import MemoryData, parse_line
 from src.core.server_manager import ServerManager
+from src.services.integration_manager import IntegrationManager
 from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
@@ -98,6 +100,12 @@ class LlamaGUI:
         )
         self.server.state_changed.connect(self.update_action_buttons)
         self.server.bench_finished.connect(lambda _: self.update_action_buttons())
+
+        # Парсинг логов для визуализации памяти
+        self._mem_data = MemoryData()
+        self.server.log_received.connect(self._on_log_for_mem_viz)
+        self.server.server_stopped.connect(self._on_server_stopped)
+        self.server.bench_finished.connect(lambda _: self._on_server_stopped())
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -393,6 +401,29 @@ class LlamaGUI:
         except Exception:
             self.ui.cli_preview.setText("")
 
+    def _on_log_for_mem_viz(self, text: str, level: str):
+        """Обработка логов для визуализации памяти."""
+        for line in text.splitlines():
+            parse_line(line, self._mem_data)
+        # Принудительно обновляем UI после каждого блока логов
+        self.ui.mem_viz.update_from_data(self._mem_data)
+        # Обрабатываем события Qt чтобы UI не зависал
+        QApplication.processEvents()
+
+    def _reset_mem_viz(self):
+        """Сброс визуализации памяти."""
+        self._mem_data = MemoryData()
+        self.ui.mem_viz.clear()
+
+    def _on_server_stopped(self):
+        """Обработчик остановки сервера — финальное обновление визуализации."""
+        # Устанавливаем флаг завершения процесса
+        self._mem_data.process_exit_code = self.server.server_proc.exitCode()
+        # Обновляем UI с финальными данными
+        self.ui.mem_viz.update_from_data(self._mem_data)
+        # Переключаемся на вкладку памяти чтобы увидеть результат
+        self.ui.tabs.setCurrentIndex(1)
+
     def start_server(self):
         if self.server.is_bench_running():
             QMessageBox.warning(
@@ -417,6 +448,7 @@ class LlamaGUI:
         if not args:
             return
         self.log_mgr.append(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
+        self._reset_mem_viz()
         self.server.start_server(exe, args)
         self.ui.start_btn.setEnabled(False)
         self.ui.test_btn.setEnabled(False)
@@ -452,6 +484,7 @@ class LlamaGUI:
         self.log_mgr.append(
             f"🧪 Запуск бенчмарка: {os.path.basename(bexe)}\n   Параметры: {' '.join(args)}"
         )
+        self._reset_mem_viz()
         self.server.start_bench(bexe, args)
         self.ui.test_btn.setEnabled(False)
         self.ui.test_btn.setText("⏳ Тестирование...")
@@ -507,14 +540,48 @@ class LlamaGUI:
 
     # Integration & Profiles logic (abbreviated, same as original but using config/ui refs)
     def check_integration_models(self, silent=False):
-        # ... (логика из оригинала, использует self.ui и self.config)
-        pass
+        target = self.ui.current_config_target()
+        config_path = self.ui.current_config_path()
+        mgr = IntegrationManager(base_url=self.ui.current_base_url())
+        result = mgr.check_models(config_path, target)
+        self.ui.integration_status.setText(result.message)
+        self.ui.integration_models_list.clear()
+        self.ui.integration_models_list.addItems(result.model_ids)
+        if not silent and not result.success:
+            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
 
     def add_model_to_integration(self):
-        pass
+        model_id = self.ui.current_model_id()
+        if not model_id:
+            QMessageBox.warning(self.ui, "Ошибка", "Сначала выберите модель")
+            return
+        target = self.ui.current_config_target()
+        config_path = self.ui.current_config_path()
+        mgr = IntegrationManager(base_url=self.ui.current_base_url())
+        result = mgr.add_model(config_path, target, model_id)
+        self.ui.integration_status.setText(result.message)
+        if result.success:
+            self.ui.integration_models_list.clear()
+            self.ui.integration_models_list.addItems(result.model_ids)
+        else:
+            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
 
     def remove_model_from_integration(self):
-        pass
+        selected = self.ui.integration_models_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self.ui, "Ошибка", "Выберите модель для удаления")
+            return
+        model_id = selected.text()
+        target = self.ui.current_config_target()
+        config_path = self.ui.current_config_path()
+        mgr = IntegrationManager(base_url=self.ui.current_base_url())
+        result = mgr.remove_model(config_path, target, model_id)
+        self.ui.integration_status.setText(result.message)
+        if result.success:
+            self.ui.integration_models_list.clear()
+            self.ui.integration_models_list.addItems(result.model_ids)
+        else:
+            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
 
     def quit_app(self):
         self.save_settings()

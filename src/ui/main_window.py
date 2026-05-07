@@ -27,6 +27,7 @@ from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QFont
 
 from src.ui.widgets import CollapsiblePanel
+from src.ui.mem_viz_widget import MemoryVisualizationWidget
 
 
 class MainWindowUI(QMainWindow):
@@ -440,17 +441,34 @@ class MainWindowUI(QMainWindow):
         panel = QWidget()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(4, 4, 4, 4)
+
+        # Вкладки: Логи и Визуализация
+        from PySide6.QtWidgets import QTabWidget
+
+        self.tabs = QTabWidget()
+
+        # Вкладка логов
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(0, 0, 0, 0)
         hdr = QHBoxLayout()
         hdr.addWidget(QLabel("Логи:"))
         self.autoscroll_logs = QCheckBox("Автоскролл", checked=True)
         hdr.addWidget(self.autoscroll_logs)
-        lay.addLayout(hdr)
+        log_layout.addLayout(hdr)
         self.logs = QTextEdit(readOnly=True, font=QFont("Consolas", 9))
         self.logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
-        lay.addWidget(self.logs)
+        log_layout.addWidget(self.logs)
         clr = QPushButton("🧹 Очистить логи")
         clr.clicked.connect(self.logs.clear)
-        lay.addWidget(clr)
+        log_layout.addWidget(clr)
+        self.tabs.addTab(log_tab, "📝 Логи")
+
+        # Вкладка визуализации памяти
+        self.mem_viz = MemoryVisualizationWidget()
+        self.tabs.addTab(self.mem_viz, "📊 Память")
+
+        lay.addWidget(self.tabs)
         return panel
 
     def _setup_tooltips(self):

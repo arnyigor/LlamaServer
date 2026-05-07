@@ -1,11 +1,14 @@
 """Управление процессами llama-server и llama-bench."""
+
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from src.core.constants import KILL_TIMEOUT_SERVER, KILL_TIMEOUT_BENCHMARK
 
+
 class ServerManager(QObject):
     log_received = Signal(str, str)  # text, level
-    state_changed = Signal(bool)     # is_busy
-    bench_finished = Signal(int)     # exit_code
+    state_changed = Signal(bool)  # is_busy
+    bench_finished = Signal(int)  # exit_code
+    server_stopped = Signal()  # server stopped
 
     def __init__(self):
         super().__init__()
@@ -25,10 +28,37 @@ class ServerManager(QObject):
         if text.strip():
             self.log_received.emit(text, level)
 
-    def _srv_stdout(self): self._emit(self.server_proc.readAllStandardOutput().data().decode("utf-8", errors="ignore"), "info")
-    def _srv_stderr(self): self._emit(self.server_proc.readAllStandardError().data().decode("utf-8", errors="ignore"), "error")
-    def _bench_stdout(self): self._emit(self.bench_proc.readAllStandardOutput().data().decode("utf-8", errors="ignore"), "bench")
-    def _bench_stderr(self): self._emit(self.bench_proc.readAllStandardError().data().decode("utf-8", errors="ignore"), "error")
+    def _srv_stdout(self):
+        data = (
+            self.server_proc.readAllStandardOutput()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self._emit(data, "info")
+
+    def _srv_stderr(self):
+        data = (
+            self.server_proc.readAllStandardError()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self._emit(data, "error")
+
+    def _bench_stdout(self):
+        data = (
+            self.bench_proc.readAllStandardOutput()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self._emit(data, "bench")
+
+    def _bench_stderr(self):
+        data = (
+            self.bench_proc.readAllStandardError()
+            .data()
+            .decode("utf-8", errors="ignore")
+        )
+        self._emit(data, "error")
 
     def _srv_state(self, state):
         if state == QProcess.ProcessState.NotRunning:
@@ -38,6 +68,7 @@ class ServerManager(QObject):
             else:
                 self._emit(f"⏹ Сервер остановлен (код: {self.server_proc.exitCode()})")
             self.server_stop_requested = False
+            self.server_stopped.emit()
 
     def _bench_finished(self, code):
         self.state_changed.emit(False)
@@ -57,7 +88,8 @@ class ServerManager(QObject):
 
     def stop_server(self):
         if self.server_proc.state() != QProcess.ProcessState.NotRunning:
-            if self.server_stop_requested: return
+            if self.server_stop_requested:
+                return
             self.server_stop_requested = True
             self._emit("⏹ Остановка сервера...")
             self.server_proc.terminate()
@@ -85,13 +117,18 @@ class ServerManager(QObject):
             self._emit("⚠️ Benchmark не завершился штатно, принудительная остановка")
             self.bench_proc.kill()
 
-    def is_server_running(self): return self.server_proc.state() != QProcess.ProcessState.NotRunning
-    def is_bench_running(self): return self.bench_proc.state() != QProcess.ProcessState.NotRunning
+    def is_server_running(self):
+        return self.server_proc.state() != QProcess.ProcessState.NotRunning
+
+    def is_bench_running(self):
+        return self.bench_proc.state() != QProcess.ProcessState.NotRunning
 
     def terminate_all(self):
         if self.is_server_running():
             self.server_proc.terminate()
-            if not self.server_proc.waitForFinished(2000): self.server_proc.kill()
+            if not self.server_proc.waitForFinished(2000):
+                self.server_proc.kill()
         if self.is_bench_running():
             self.bench_proc.terminate()
-            if not self.bench_proc.waitForFinished(2000): self.bench_proc.kill()
+            if not self.bench_proc.waitForFinished(2000):
+                self.bench_proc.kill()

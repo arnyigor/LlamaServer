@@ -149,9 +149,17 @@ class LogManager(QObject):
         try:
             for entry in entries:
                 fmt = _get_format(entry.level, entry.text)
-                text = entry.text if entry.text.endswith("\n") else entry.text + "\n"
-                cursor.insertText(text, fmt)
-                self._line_count += text.count("\n")
+                text = entry.text
+
+                # Обрабатываем точки прогресса: если текущий текст — только точки
+                stripped = text.strip()
+                if stripped and all(c in ". " for c in stripped):
+                    # Точки прогресса — вставляем без переноса строки, рядом с предыдущим текстом
+                    cursor.insertText(stripped.replace(" ", ""), fmt)
+                else:
+                    text = text if text.endswith("\n") else text + "\n"
+                    cursor.insertText(text, fmt)
+                    self._line_count += text.count("\n")
 
             if self._line_count > MAX_LOG_LINES:
                 self._trim_old_lines()
