@@ -35,8 +35,8 @@ jobs:
 
       - name: Build executables
         run: |
-          pyinstaller --noconfirm --clean LlamaServer.spec
-          pyinstaller --noconfirm --clean LlamaServerGUI.spec
+          pyinstaller --noconfirm --clean --onefile --windowed --name LlamaServer --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
 
       - name: Add default config files
         shell: pwsh
