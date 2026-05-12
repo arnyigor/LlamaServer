@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch, MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.constants import LLAMA_ALLOWED_FLAGS
+from src.core.mem_viz_parser import MemoryData, parse_line
 from src.core.gguf_parser import (
     extract_model_info,
     recommend_context,
@@ -197,6 +198,20 @@ class TestLlamaCppUpdater(unittest.TestCase):
                 self.updater.safe_extract_zip(zip_path, tmpdir / "extract")
 
 
+class TestMemoryVizParser(unittest.TestCase):
+    """Тесты парсера вкладки Memory."""
+
+    def test_unload_clears_allocations(self):
+        data = MemoryData()
+        parse_line("CUDA0 model buffer size = 4096.00 MiB", data)
+        self.assertGreater(data.grand_total(), 0)
+
+        parse_line("llama_model_unload: model unloaded", data)
+
+        self.assertEqual(data.grand_total(), 0)
+        self.assertFalse(data.server_ready)
+
+
 class TestConstants(unittest.TestCase):
     """Тесты констант."""
 
@@ -267,6 +282,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestValidatePath))
     suite.addTests(loader.loadTestsFromTestCase(TestGGUFParser))
     suite.addTests(loader.loadTestsFromTestCase(TestLlamaCppUpdater))
+    suite.addTests(loader.loadTestsFromTestCase(TestMemoryVizParser))
     suite.addTests(loader.loadTestsFromTestCase(TestConstants))
     suite.addTests(loader.loadTestsFromTestCase(TestFileUtils))
     suite.addTests(loader.loadTestsFromTestCase(TestIntegration))

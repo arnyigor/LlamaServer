@@ -159,6 +159,13 @@ class MemoryData:
             self.raw_devices[device].get(component, 0.0) + mib
         )
 
+    def clear_loaded_model(self) -> None:
+        """Сбрасывает данные, которые относятся к выгруженной модели."""
+        self.raw_devices.clear()
+        self.model_info.clear()
+        self.server_ready = False
+        self.process_exit_code = None
+
     def note_warning(self, line: str) -> None:
         if line not in self.warnings:
             self.warnings.append(line)
@@ -526,8 +533,10 @@ def parse_line(line: str, data: MemoryData, debug: bool = False) -> None:
     if re.search(
         r"llama_model_unload|model\s+unloaded|freeing\s+model", line, re.IGNORECASE
     ):
-        # Mark that model is being unloaded - memory will be released
-        data.server_ready = False
+        # При выгрузке модель освобождает RAM/VRAM, поэтому старые числа
+        # больше нельзя показывать как актуальные.
+        data.clear_loaded_model()
+        return
 
     if should_stop(line):
         data.server_ready = True

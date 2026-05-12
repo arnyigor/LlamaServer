@@ -477,11 +477,20 @@ class MainWindowUI(QMainWindow):
         self.start_btn.setStyleSheet(
             "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
         )
+        self.reload_btn = QPushButton("Restart", enabled=False)
+        self.reload_btn.setVisible(False)
+        self.reload_btn.setToolTip(
+            "Restart the running server and apply the current model parameters"
+        )
+        self.reload_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+        )
         self.stop_btn = QPushButton("Stop", enabled=False)
         self.stop_btn.setStyleSheet(
             "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
         )
         btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.reload_btn)
         btn_row.addWidget(self.stop_btn)
         lay.addLayout(btn_row)
         lay.addStretch()
@@ -538,6 +547,7 @@ class MainWindowUI(QMainWindow):
             self.model_combo: "Selected GGUF model",
             self.auto_params: "Automatically sets parameters",
             self.start_btn: "Starts llama-server",
+            self.reload_btn: "Restarts llama-server with current parameters",
             self.stop_btn: "Stops server",
             self.autoscroll_logs: "Auto-scroll logs",
         }

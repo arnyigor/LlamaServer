@@ -31,6 +31,9 @@ class LlamaGUI:
         self.server = ServerManager()
         self.scanner = None
         self.updater = None
+        self._restart_pending = False
+        self._pending_restart_launch = None
+        self._restart_needed = False
 
         self.log_mgr = LogManager(self.ui.logs)
         self.log_mgr.speed_updated.connect(self.ui.speed_label.setText)
@@ -47,6 +50,7 @@ class LlamaGUI:
     def _connect_signals(self):
         u = self.ui
         u.start_btn.clicked.connect(self.start_server)
+        u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
@@ -114,7 +118,7 @@ class LlamaGUI:
         self._mem_data = MemoryData()
         self.server.log_received.connect(self._on_log_for_mem_viz)
         self.server.server_stopped.connect(self._on_server_stopped)
-        self.server.bench_finished.connect(lambda _: self._on_server_stopped())
+        self.server.bench_finished.connect(self._on_bench_finished)
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -389,6 +393,7 @@ class LlamaGUI:
         self._try_load_perf_preset(path, ctx_size)
 
         self.update_cli_preview()
+        self._mark_restart_needed()
 
     def _refresh_tooltips(self, info):
         """Обновление tooltip для ncmoe и ctx при смене модели."""
@@ -491,6 +496,8 @@ class LlamaGUI:
         if not preset_loaded:
             self.update_cli_preview()
 
+        self._mark_restart_needed()
+
     def _on_gpu_layers_changed(self, value):
         if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
             return
@@ -500,6 +507,7 @@ class LlamaGUI:
             self._refresh_tooltips(info)
 
         self.update_cli_preview()
+        self._mark_restart_needed()
 
     def _on_param_changed(self, _value=None):
         if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
@@ -510,6 +518,7 @@ class LlamaGUI:
             self._refresh_tooltips(info)
 
         self.update_cli_preview()
+        self._mark_restart_needed()
 
     def update_cli_preview(self):
         try:
@@ -520,6 +529,26 @@ class LlamaGUI:
         except Exception:
             self.ui.cli_preview.setText("")
 
+    def _mark_restart_needed(self):
+        """Подсвечивает, что запущенному серверу нужен рестарт для новых параметров."""
+        if not self.server.is_server_running():
+            return
+        self._restart_needed = True
+        self.ui.start_btn.setVisible(False)
+        self.ui.reload_btn.setVisible(True)
+        self.ui.reload_btn.setText("Restart to apply")
+        self.ui.reload_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.ui.reload_btn.setEnabled(True)
+
+    def _reset_restart_indicator(self):
+        self._restart_needed = False
+        self.ui.reload_btn.setText("Restart")
+        self.ui.reload_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+        )
+
     def _on_log_for_mem_viz(self, text: str, level: str):
         """Обработка логов для визуализации памяти."""
         for line in text.splitlines():
@@ -529,32 +558,52 @@ class LlamaGUI:
         # Обрабатываем события Qt чтобы UI не зависал
         QApplication.processEvents()
 
-    def _reset_mem_viz(self):
+    def _reset_mem_viz(self, status: str | None = None):
         """Сброс визуализации памяти."""
         self._mem_data = MemoryData()
         self.ui.mem_viz.clear()
+        if status:
+            self.ui.mem_viz.status_label.setText(status)
 
-    def _on_server_stopped(self):
-        """Обработчик остановки сервера — финальное обновление визуализации."""
-        # Устанавливаем флаг завершения процесса
-        self._mem_data.process_exit_code = self.server.server_proc.exitCode()
-        # Обновляем UI с финальными данными
-        self.ui.mem_viz.update_from_data(self._mem_data)
-        # Переключаемся на вкладку памяти чтобы увидеть результат
+    def _finalize_mem_viz_after_stop(self, exit_code: int | None, status: str):
+        """Обновляет вкладку Memory после выгрузки модели/остановки процесса."""
+        if self._mem_data.fatal_error:
+            # При ошибке оставляем диагностические данные, чтобы было видно,
+            # какой компонент и сколько памяти пытались выделить.
+            self._mem_data.process_exit_code = exit_code
+            self.ui.mem_viz.update_from_data(self._mem_data)
+        else:
+            # Нормальная выгрузка освобождает RAM/VRAM — старые allocations
+            # больше неактуальны, поэтому полностью очищаем вкладку.
+            self._reset_mem_viz(status)
         self.ui.tabs.setCurrentIndex(1)
 
-    def start_server(self):
+    def _on_server_stopped(self):
+        """Обработчик остановки сервера."""
+        if self._restart_pending:
+            self._reset_mem_viz("Сервер остановлен, перезапуск с новыми параметрами...")
+            QTimer.singleShot(150, self._start_pending_restart)
+            return
+        self._finalize_mem_viz_after_stop(
+            self.server.server_proc.exitCode(),
+            "Сервер остановлен",
+        )
+
+    def _on_bench_finished(self, exit_code: int):
+        self._finalize_mem_viz_after_stop(exit_code, "Benchmark завершён")
+
+    def _prepare_server_launch(self):
         if self.server.is_bench_running():
             QMessageBox.warning(
                 self.ui,
                 "Benchmark running",
                 "Stop benchmark before starting server",
             )
-            return
+            return None
         exe = self.ui.exe_path.text()
         if not exe or not os.path.exists(exe):
             QMessageBox.critical(self.ui, "Error", "Specify path to llama-server.exe")
-            return
+            return None
         self.config.read_from_ui(self.ui)
         # resolve mmproj
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData()) or {}
@@ -563,19 +612,64 @@ class LlamaGUI:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
         except ValueError as e:
             QMessageBox.warning(self.ui, "Error", str(e))
-            return
+            return None
         if not args:
-            return
-        self.log_mgr.append(f"Starting server: {exe}\n   Args: {' '.join(args)}")
+            return None
+        return exe, args
+
+    def _launch_server(self, exe: str, args: list[str], action: str = "Starting server"):
+        self.log_mgr.append(f"{action}: {exe}\n   Args: {' '.join(args)}")
         self._reset_mem_viz()
         self.server.start_server(exe, args)
+        self._reset_restart_indicator()
+        self.ui.start_btn.setVisible(False)
+        self.ui.reload_btn.setVisible(True)
         self.ui.start_btn.setEnabled(False)
+        self.ui.reload_btn.setEnabled(True)
         self.ui.test_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
         if hasattr(self, "tray"):
             self.tray.setToolTip(
                 f"LlamaServer GUI - Running on port {self.ui.port.value()}"
             )
+
+    def _start_pending_restart(self):
+        if not self._restart_pending:
+            return
+        if self.server.is_server_running():
+            QTimer.singleShot(150, self._start_pending_restart)
+            return
+        launch = self._pending_restart_launch
+        self._restart_pending = False
+        self._pending_restart_launch = None
+        if launch:
+            exe, args = launch
+            self._launch_server(exe, args, action="Restarting server")
+
+    def restart_server(self):
+        """Перезапускает llama-server с текущими параметрами UI."""
+        if not self.server.is_server_running():
+            self.start_server()
+            return
+        launch = self._prepare_server_launch()
+        if not launch:
+            return
+        self._pending_restart_launch = launch
+        self._restart_pending = True
+        self.log_mgr.append("Restart requested: stopping current server...")
+        self._reset_mem_viz("Остановка сервера для перезапуска...")
+        self.server.stop_server()
+        self.update_action_buttons()
+
+    def start_server(self):
+        if self.server.is_server_running():
+            self.restart_server()
+            return
+        launch = self._prepare_server_launch()
+        if not launch:
+            return
+        exe, args = launch
+        self._launch_server(exe, args)
 
     def run_benchmark(self):
         if self.server.is_server_running():
@@ -611,6 +705,10 @@ class LlamaGUI:
         self.ui.stop_btn.setEnabled(True)
 
     def stop_work(self):
+        if self._restart_pending:
+            self._restart_pending = False
+            self._pending_restart_launch = None
+            self.log_mgr.append("Restart cancelled")
         if self.server.is_server_running():
             self.server.stop_server()
         if self.server.is_bench_running():
@@ -624,11 +722,24 @@ class LlamaGUI:
         bnch = self.server.is_bench_running()
         scan = self.scanner and self.scanner.isRunning()
         upd = self.updater and self.updater.isRunning()
-        busy = srv or bnch or scan
+        busy = srv or bnch or scan or self._restart_pending
+        show_reload = srv or self._restart_pending
+        self.ui.start_btn.setVisible(not show_reload)
+        self.ui.reload_btn.setVisible(show_reload)
         self.ui.stop_btn.setEnabled(busy)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
+        self.ui.reload_btn.setEnabled(
+            srv
+            and not bnch
+            and not scan
+            and not upd
+            and not self._restart_pending
+            and not self.server.server_stop_requested
+        )
         self.ui.test_btn.setEnabled(not busy and not upd)
+        if not srv and not self._restart_pending:
+            self._reset_restart_indicator()
 
     def update_llamacpp(self):
         if self.server.is_server_running() or self.server.is_bench_running():
