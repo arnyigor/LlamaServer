@@ -34,8 +34,8 @@ class MainWindowUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LLama.cpp GUI Manager")
-        self.setGeometry(100, 100, 1150, 720)
-        self.setMinimumSize(900, 560)
+        self.setGeometry(100, 100, 1550, 720)
+        self.setMinimumSize(1300, 560)
 
         self.models = []
         self.models_by_path = {}
@@ -58,20 +58,23 @@ class MainWindowUI(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([420, 730])
+        splitter.setSizes([820, 730])
         main_layout.addWidget(splitter)
 
     def _build_left_panel(self):
         panel = QWidget()
+        panel.setMinimumWidth(720)
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(6)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(10)
 
         # === 1. Пути ===
         g_paths = QGroupBox("Paths")
         lp = QVBoxLayout(g_paths)
+        lp.setContentsMargins(12, 18, 12, 12)
+        lp.setSpacing(8)
 
         self.exe_path = QLineEdit(placeholderText="Path to llama-server.exe")
         self.bench_path = QLineEdit(placeholderText="Path to llama-bench.exe (auto)")
@@ -105,6 +108,8 @@ class MainWindowUI(QMainWindow):
         # === 2. Модель ===
         g_model = QGroupBox("Model")
         lm = QVBoxLayout(g_model)
+        lm.setContentsMargins(12, 18, 12, 12)
+        lm.setSpacing(8)
 
         scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan")
@@ -118,6 +123,16 @@ class MainWindowUI(QMainWindow):
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
+        self.model_combo.setMinimumHeight(30)
+        self.model_combo.setMaxVisibleItems(25)
+        self.model_combo.setMinimumContentsLength(80)
+        self.model_combo.setStyleSheet(
+            "QComboBox { padding-left: 6px; padding-right: 34px; } "
+            "QComboBox::drop-down { width: 30px; }"
+        )
+        if self.model_combo.lineEdit():
+            self.model_combo.lineEdit().setTextMargins(6, 0, 34, 0)
+
         lm.addWidget(QLabel("Found GGUF:"))
         lm.addWidget(self.model_combo)
 
@@ -147,6 +162,8 @@ class MainWindowUI(QMainWindow):
         # === 3. Производительность ===
         g_perf = QGroupBox("Performance and Memory")
         lperf = QVBoxLayout(g_perf)
+        lperf.setContentsMargins(12, 18, 12, 12)
+        lperf.setSpacing(8)
 
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 200)
@@ -186,9 +203,33 @@ class MainWindowUI(QMainWindow):
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("Context Size (-c):"))
         r2.addWidget(self.ctx_size)
-        r2.addWidget(self.save_preset_btn)
-        r2.addWidget(self.preset_status)
+
+        self.ctx_quick_buttons = []
+        for label, value in [
+            ("8K", 8192),
+            ("16K", 16384),
+            ("24K", 24576),
+            ("32K", 32768),
+            ("41K", 40960),
+            ("65K", 65536),
+            ("128K", 131072),
+            ("256K", 262144),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(42 if len(label) <= 3 else 50)
+            btn.setFixedHeight(24)
+            btn.setToolTip(f"Set Context Size to {value}")
+            btn.setProperty("ctx_value", value)
+            self.ctx_quick_buttons.append(btn)
+            r2.addWidget(btn)
+
+        r2.addStretch(1)
         lperf.addLayout(r2)
+
+        r2b = QHBoxLayout()
+        r2b.addWidget(self.save_preset_btn)
+        r2b.addWidget(self.preset_status, 1)
+        lperf.addLayout(r2b)
 
         self.batch_size = QSpinBox()
         self.batch_size.setRange(-1, 32768)
@@ -242,9 +283,15 @@ class MainWindowUI(QMainWindow):
         self.reasoning_mode = QComboBox()
         self.reasoning_mode.addItems(["off", "auto", "on"])
         self.reasoning_mode.setCurrentText("off")
+        self.enable_thinking = QComboBox()
+        self.enable_thinking.addItems(["off", "false", "true"])
+        self.enable_thinking.setCurrentText("off")
         r7 = QHBoxLayout()
         r7.addWidget(QLabel("Reasoning (-rea):"))
         r7.addWidget(self.reasoning_mode)
+        r7.addSpacing(10)
+        r7.addWidget(QLabel("Thinking (--ctk):"))
+        r7.addWidget(self.enable_thinking)
         lperf.addLayout(r7)
 
         self.port = QSpinBox()
@@ -444,8 +491,8 @@ class MainWindowUI(QMainWindow):
             horizontalScrollBarPolicy=Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
         scroll.setWidget(panel)
-        scroll.setMinimumWidth(380)
-        scroll.setMaximumWidth(520)
+        scroll.setMinimumWidth(720)
+        scroll.setMaximumWidth(940)
         return scroll
 
     def _build_right_panel(self):

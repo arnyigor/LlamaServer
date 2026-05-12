@@ -48,6 +48,7 @@ class MockConfig:
     repeat_penalty: float = -1.0
     use_mmproj: bool = True
     mmproj_offload: bool = True
+    enable_thinking: str = "off"
     mmproj_path: str = ""
     bench_prompt: int = 128
     bench_gen: int = 256
@@ -121,6 +122,31 @@ class TestBuildArgs(unittest.TestCase):
         args = build_args(self.cfg, self.model)
         self.assertIn("-rea", args)
         self.assertIn("on", args)
+
+    def test_enable_thinking_modes(self):
+        self.cfg.enable_thinking = "off"
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--chat-template-kwargs", args)
+
+        self.cfg.enable_thinking = "false"
+        args = build_args(self.cfg, self.model)
+        idx = args.index("--chat-template-kwargs")
+        self.assertEqual(args[idx + 1], '{"enable_thinking":false}')
+
+        self.cfg.enable_thinking = "true"
+        args = build_args(self.cfg, self.model)
+        idx = args.index("--chat-template-kwargs")
+        self.assertEqual(args[idx + 1], '{"enable_thinking":true}')
+
+    def test_enable_thinking_legacy_bool(self):
+        self.cfg.enable_thinking = True
+        args = build_args(self.cfg, self.model)
+        idx = args.index("--chat-template-kwargs")
+        self.assertEqual(args[idx + 1], '{"enable_thinking":true}')
+
+        self.cfg.enable_thinking = False
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--chat-template-kwargs", args)
 
     def test_flash_attn_and_fit_off(self):
         self.cfg.flash_attn = False

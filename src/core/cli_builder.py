@@ -120,6 +120,18 @@ def build_args(
             args += ["--fit", "off"]
         if cfg.reasoning_mode != "auto":
             args += ["-rea", cfg.reasoning_mode]
+        thinking = getattr(cfg, "enable_thinking", "off")
+        if thinking is True:
+            thinking = "true"
+        elif thinking is False or thinking is None:
+            thinking = "off"
+        else:
+            thinking = str(thinking).strip().lower()
+        if thinking in {"false", "true"}:
+            args += [
+                "--chat-template-kwargs",
+                f'{{"enable_thinking":{thinking}}}',
+            ]
         if cfg.ctx_checkpoints >= 0:
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:

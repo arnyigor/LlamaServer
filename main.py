@@ -52,6 +52,12 @@ class LlamaGUI:
         u.scan_btn.clicked.connect(self.scan_models)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
+        for btn in getattr(u, "ctx_quick_buttons", []):
+            btn.clicked.connect(
+                lambda _checked=False, b=btn: self._set_context_size_from_button(
+                    b.property("ctx_value")
+                )
+            )
         u.gpu_layers.valueChanged.connect(self._on_gpu_layers_changed)
         u.cache_type_k.currentIndexChanged.connect(self._on_param_changed)
         u.cache_type_v.currentIndexChanged.connect(self._on_param_changed)
@@ -82,6 +88,7 @@ class LlamaGUI:
         u.mmproj_offload.stateChanged.connect(self._on_param_changed)
         u.extra_args.textChanged.connect(self._on_param_changed)
         u.jinja.stateChanged.connect(self._on_param_changed)
+        u.enable_thinking.currentIndexChanged.connect(self._on_param_changed)
         u.update_llama_btn.clicked.connect(self.update_llamacpp)
         u.integration_check_btn.clicked.connect(self.check_integration_models)
         u.integration_add_btn.clicked.connect(self.add_model_to_integration)
@@ -433,6 +440,15 @@ class LlamaGUI:
         self.ui.batch_size.setValue(2048)
         self.ui.ubatch_size.setValue(2048)
 
+    def _set_context_size_from_button(self, ctx_size):
+        ctx_size = int(ctx_size)
+        if self.ui.ctx_size.value() == ctx_size:
+            # setValue() не эмитит valueChanged для того же значения, поэтому
+            # явно повторяем логику загрузки пресета по кнопке.
+            self.on_ctx_changed(ctx_size)
+        else:
+            self.ui.ctx_size.setValue(ctx_size)
+
     def on_ctx_changed(self, ctx_size):
         if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
             return
@@ -467,9 +483,13 @@ class LlamaGUI:
         )
         self.ui.ctx_size.setToolTip(tooltip_ctx)
 
+        preset_loaded = False
         model_path = self._current_model_path()
         if model_path:
-            self._try_load_perf_preset(model_path, ctx_size)
+            preset_loaded = self._try_load_perf_preset(model_path, ctx_size)
+
+        if not preset_loaded:
+            self.update_cli_preview()
 
     def _on_gpu_layers_changed(self, value):
         if getattr(self, "_loading_preset", False) or self.ui.loading_profile:

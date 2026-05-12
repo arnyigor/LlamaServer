@@ -64,6 +64,7 @@ class AppSettings:
     no_webui: bool = False
     jinja: bool = False
     extra_args: str = ""
+    enable_thinking: str = "off"
 
 
 # Явная таблица маппинга: поле -> атрибут виджета в UI
@@ -108,6 +109,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "no_webui": "no_webui",
     "jinja": "jinja",
     "extra_args": "extra_args",
+    "enable_thinking": "enable_thinking",
 }
 
 _PERF_PRESETS_ROOT = "__perf_presets__"
@@ -143,7 +145,21 @@ _PERF_PRESET_FIELDS = (
     "use_mmproj",
     "mmproj_offload",
     "extra_args",
+    "enable_thinking",
 )
+
+
+def _normalize_enable_thinking(value: Any) -> str:
+    """Нормализует Thinking в одно из значений ComboBox: off/false/true."""
+    if value is True:
+        return "true"
+    if value is False or value is None:
+        return "off"
+
+    text = str(value).strip().lower()
+    if text in {"off", "false", "true"}:
+        return text
+    return "off"
 
 
 def _widget_get(widget: Any) -> Any:
@@ -178,8 +194,7 @@ def _widget_set(widget: Any, value: Any) -> None:
             idx = widget.findText(str(value))
         if idx >= 0:
             widget.setCurrentIndex(idx)
-        else:
-            widget.setCurrentText(str(value))
+        # else: не устанавливаем невалидное значение
     elif isinstance(widget, QLineEdit):
         widget.setText(str(value) if value is not None else "")
     else:
@@ -208,6 +223,8 @@ class ConfigManager:
                 for k, v in data.items():
                     if k in valid_fields:
                         try:
+                            if k == "enable_thinking":
+                                v = _normalize_enable_thinking(v)
                             setattr(self.settings, k, v)
                         except (TypeError, ValueError):
                             pass  # Игнорируем невалидные значения
@@ -256,14 +273,19 @@ class ConfigManager:
                 continue
             try:
                 value = _widget_get(widget)
-                # Приводим к типу поля
-                field_type = type(getattr(s, field_name))
+                # Приводим к объявленному типу поля, а не к текущему типу значения.
+                # Это важно для миграции старых settings.json, где enable_thinking
+                # мог быть bool: bool("off") == True ломал CLI Preview.
+                field_def = next((f for f in fields(AppSettings) if f.name == field_name), None)
+                field_type = field_def.type if field_def is not None else type(getattr(s, field_name))
                 if field_type is bool:
                     setattr(s, field_name, bool(value))
                 elif field_type is int:
                     setattr(s, field_name, int(value))
                 elif field_type is float:
                     setattr(s, field_name, float(value))
+                elif field_type is str:
+                    setattr(s, field_name, str(value))
                 else:
                     setattr(s, field_name, value)
             except (TypeError, ValueError, AttributeError):
@@ -292,6 +314,8 @@ class ConfigManager:
         for k, v in profile.items():
             if k in valid_fields:
                 try:
+                    if k == "enable_thinking":
+                        v = _normalize_enable_thinking(v)
                     setattr(self.settings, k, v)
                 except (TypeError, ValueError):
                     pass
@@ -379,6 +403,8 @@ class ConfigManager:
                 continue
 
             try:
+                if field_name == "enable_thinking":
+                    value = _normalize_enable_thinking(value)
                 setattr(self.settings, field_name, value)
             except (TypeError, ValueError):
                 continue
