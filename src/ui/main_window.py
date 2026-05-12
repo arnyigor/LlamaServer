@@ -70,12 +70,12 @@ class MainWindowUI(QMainWindow):
         lay.setSpacing(6)
 
         # === 1. Пути ===
-        g_paths = QGroupBox("📁 Пути")
+        g_paths = QGroupBox("Paths")
         lp = QVBoxLayout(g_paths)
 
-        self.exe_path = QLineEdit(placeholderText="Путь к llama-server.exe")
-        self.bench_path = QLineEdit(placeholderText="Путь к llama-bench.exe (авто)")
-        self.model_dir = QLineEdit(placeholderText="Базовая папка с моделями")
+        self.exe_path = QLineEdit(placeholderText="Path to llama-server.exe")
+        self.bench_path = QLineEdit(placeholderText="Path to llama-bench.exe (auto)")
+        self.model_dir = QLineEdit(placeholderText="Base folder with models")
 
         for line, label, slot in [
             (self.exe_path, "Exe:", "_browse_exe_clicked"),
@@ -85,14 +85,14 @@ class MainWindowUI(QMainWindow):
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addWidget(line, 1)
-            btn = QPushButton("📂")
+            btn = QPushButton("...")
             btn.setFixedWidth(32)
             btn.clicked.connect(getattr(self, slot))
             row.addWidget(btn)
             lp.addLayout(row)
 
         upd_row = QHBoxLayout()
-        self.update_llama_btn = QPushButton("🔄 Update llama.cpp")
+        self.update_llama_btn = QPushButton("Update llama.cpp")
         self.update_status = QLabel("idle", wordWrap=True)
         upd_row.addWidget(self.update_llama_btn)
         upd_row.addWidget(self.update_status, 1)
@@ -103,30 +103,30 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(g_paths)
 
         # === 2. Модель ===
-        g_model = QGroupBox("🤖 Модель")
+        g_model = QGroupBox("Model")
         lm = QVBoxLayout(g_model)
 
         scan_row = QHBoxLayout()
-        self.scan_btn = QPushButton("🔍 Сканировать")
+        self.scan_btn = QPushButton("Scan")
         scan_row.addWidget(self.scan_btn)
         lm.addLayout(scan_row)
 
-        self.scan_status = QLabel("Модели не сканировались")
+        self.scan_status = QLabel("Models not scanned")
         self.scan_progress = QProgressBar(visible=False, minimum=0, maximum=0)
         lm.addWidget(self.scan_status)
         lm.addWidget(self.scan_progress)
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        lm.addWidget(QLabel("Найденные GGUF:"))
+        lm.addWidget(QLabel("Found GGUF:"))
         lm.addWidget(self.model_combo)
 
-        self.auto_params = QCheckBox("Автонастройка ctx/GPU/cache по GGUF")
+        self.auto_params = QCheckBox("Auto setup ctx/GPU/cache by GGUF")
         self.auto_params.setChecked(True)
         lm.addWidget(self.auto_params)
 
         mmproj_row = QHBoxLayout()
-        self.use_mmproj = QCheckBox("Использовать mmproj")
+        self.use_mmproj = QCheckBox("Use mmproj")
         self.use_mmproj.setChecked(True)
         self.mmproj_offload = QCheckBox("mmproj offload")
         self.mmproj_offload.setChecked(True)
@@ -134,18 +134,18 @@ class MainWindowUI(QMainWindow):
         mmproj_row.addWidget(self.mmproj_offload)
         lm.addLayout(mmproj_row)
 
-        self.model_info = QLabel("Выберите модель")
+        self.model_info = QLabel("Select model")
         lm.addWidget(self.model_info)
         lay.addWidget(g_model)
 
-        self.speed_label = QLabel("Скорость: —")
+        self.speed_label = QLabel("Speed: -")
         self.speed_label.setStyleSheet(
             "color: #4ec9b0; font-family: Consolas; font-weight: bold;"
         )
         lay.addWidget(self.speed_label)
 
         # === 3. Производительность ===
-        g_perf = QGroupBox("🚀 Производительность и память")
+        g_perf = QGroupBox("Performance and Memory")
         lperf = QVBoxLayout(g_perf)
 
         self.gpu_layers = QSpinBox()
@@ -174,9 +174,16 @@ class MainWindowUI(QMainWindow):
         self.ctx_size.setSingleStep(512)
         self.ctx_size.setValue(-1)
         self.ctx_size.setSpecialValueText("auto")
+
+        self.save_preset_btn = QPushButton("Save Preset")
+        self.save_preset_btn.setToolTip(
+            "Save parameters (ngl, ncmoe, etc.) for current model and context"
+        )
+
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("Context Size (-c):"))
         r2.addWidget(self.ctx_size)
+        r2.addWidget(self.save_preset_btn)
         lperf.addLayout(r2)
 
         self.batch_size = QSpinBox()
@@ -269,7 +276,7 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(g_perf)
 
         # === 4. Спойлеры ===
-        self.adv_panel = CollapsiblePanel("⚙️ Сэмплинг, отладка и сервер")
+        self.adv_panel = CollapsiblePanel("Advanced: Sampling, Debug, Server")
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(-1.0, 2.0)
         self.temperature.setSingleStep(0.1)
@@ -318,18 +325,18 @@ class MainWindowUI(QMainWindow):
             s3.addWidget(w)
         self.adv_panel.add_layout(s3)
 
-        self.adv_panel.add_widget(QLabel("Доп. параметры:"))
+        self.adv_panel.add_widget(QLabel("Extra params:"))
         self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
         self.adv_panel.add_widget(self.extra_args)
         lay.addWidget(self.adv_panel)
 
         # === 5. Интеграция ===
-        self.int_panel = CollapsiblePanel("🔌 Интеграция (OpenCode / PI)")
+        self.int_panel = CollapsiblePanel("Integration (OpenCode / PI)")
 
         oc_layout = QHBoxLayout()
         oc_layout.addWidget(QLabel("OpenCode JSON:"))
-        self.opencode_config_path = QLineEdit(placeholderText="Путь к opencode.json")
-        oc_btn = QPushButton("📂")
+        self.opencode_config_path = QLineEdit(placeholderText="Path to opencode.json")
+        oc_btn = QPushButton("...")
         oc_btn.clicked.connect(self._browse_opencode_clicked)
         oc_layout.addWidget(self.opencode_config_path)
         oc_layout.addWidget(oc_btn)
@@ -337,25 +344,25 @@ class MainWindowUI(QMainWindow):
 
         pi_layout = QHBoxLayout()
         pi_layout.addWidget(QLabel("PI JSON:"))
-        self.pi_config_path = QLineEdit(placeholderText="Путь к PI config.json")
-        pi_btn = QPushButton("📂")
+        self.pi_config_path = QLineEdit(placeholderText="Path to PI config.json")
+        pi_btn = QPushButton("...")
         pi_btn.clicked.connect(self._browse_pi_clicked)
         pi_layout.addWidget(self.pi_config_path)
         pi_layout.addWidget(pi_btn)
         self.int_panel.add_layout(pi_layout)
 
         tgt_layout = QHBoxLayout()
-        tgt_layout.addWidget(QLabel("Цель:"))
+        tgt_layout.addWidget(QLabel("Target:"))
         self.integration_target = QComboBox()
         self.integration_target.addItem("OpenCode", "opencode")
         self.integration_target.addItem("PI", "pi")
         tgt_layout.addWidget(self.integration_target)
-        self.integration_check_btn = QPushButton("Проверить")
+        self.integration_check_btn = QPushButton("Check")
         tgt_layout.addWidget(self.integration_check_btn)
         self.int_panel.add_layout(tgt_layout)
 
         self.integration_model_label = QLabel(
-            "Модель для добавления: не выбрана", wordWrap=True
+            "Model to add: not selected", wordWrap=True
         )
         self.int_panel.add_widget(self.integration_model_label)
 
@@ -364,20 +371,20 @@ class MainWindowUI(QMainWindow):
         self.int_panel.add_widget(self.integration_models_list)
 
         act_layout = QHBoxLayout()
-        self.integration_add_btn = QPushButton("Добавить")
-        self.integration_remove_btn = QPushButton("Удалить")
+        self.integration_add_btn = QPushButton("Add")
+        self.integration_remove_btn = QPushButton("Remove")
         act_layout.addWidget(self.integration_add_btn)
         act_layout.addWidget(self.integration_remove_btn)
         self.int_panel.add_layout(act_layout)
 
         self.integration_status = QLabel(
-            "Укажите путь к конфигу и нажмите Проверить", wordWrap=True
+            "Specify config path and click Check", wordWrap=True
         )
         self.int_panel.add_widget(self.integration_status)
         lay.addWidget(self.int_panel)
 
         # === 6. Бенчмарк ===
-        self.bench_panel = CollapsiblePanel("🧪 Бенчмарк")
+        self.bench_panel = CollapsiblePanel("Benchmark")
         bp_layout = QHBoxLayout()
         bp_layout.addWidget(QLabel("Prompt (-p):"))
         self.bench_prompt = QSpinBox()
@@ -394,7 +401,7 @@ class MainWindowUI(QMainWindow):
         bp_layout.addWidget(self.bench_gen)
         self.bench_panel.add_layout(bp_layout)
 
-        self.test_btn = QPushButton("🧪 Тестировать скорость")
+        self.test_btn = QPushButton("Test Speed")
         self.test_btn.setStyleSheet(
             "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
         )
@@ -402,9 +409,9 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(self.bench_panel)
 
         # === 7. Preview CLI ===
-        g_cli = QGroupBox("👁️ Preview CLI")
+        g_cli = QGroupBox("CLI Preview")
         self.cli_preview = QLineEdit(
-            placeholderText="Команда будет отображаться здесь...", readOnly=True
+            placeholderText="Command will be displayed here...", readOnly=True
         )
         self.cli_preview.setStyleSheet(
             "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
@@ -415,11 +422,11 @@ class MainWindowUI(QMainWindow):
 
         # === 8. Кнопки управления ===
         btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("▶ Старт Server")
+        self.start_btn = QPushButton("Start Server")
         self.start_btn.setStyleSheet(
             "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
         )
-        self.stop_btn = QPushButton("⏹ Стоп", enabled=False)
+        self.stop_btn = QPushButton("Stop", enabled=False)
         self.stop_btn.setStyleSheet(
             "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
         )
@@ -452,36 +459,36 @@ class MainWindowUI(QMainWindow):
         log_layout = QVBoxLayout(log_tab)
         log_layout.setContentsMargins(0, 0, 0, 0)
         hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("Логи:"))
-        self.autoscroll_logs = QCheckBox("Автоскролл", checked=True)
+        hdr.addWidget(QLabel("Logs:"))
+        self.autoscroll_logs = QCheckBox("Auto-scroll", checked=True)
         hdr.addWidget(self.autoscroll_logs)
         log_layout.addLayout(hdr)
         self.logs = QTextEdit(readOnly=True, font=QFont("Consolas", 9))
         self.logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         log_layout.addWidget(self.logs)
-        clr = QPushButton("🧹 Очистить логи")
+        clr = QPushButton("Clear")
         clr.clicked.connect(self.logs.clear)
         log_layout.addWidget(clr)
-        self.tabs.addTab(log_tab, "📝 Логи")
+        self.tabs.addTab(log_tab, "Logs")
 
         # Вкладка визуализации памяти
         self.mem_viz = MemoryVisualizationWidget()
-        self.tabs.addTab(self.mem_viz, "📊 Память")
+        self.tabs.addTab(self.mem_viz, "Memory")
 
         lay.addWidget(self.tabs)
         return panel
 
     def _setup_tooltips(self):
         tips = {
-            self.exe_path: "Путь к llama-server.exe",
-            self.bench_path: "Путь к llama-bench.exe",
-            self.model_dir: "Корневая папка для поиска .gguf",
-            self.scan_btn: "Сканирует папку моделей",
-            self.model_combo: "Выбранная GGUF-модель",
-            self.auto_params: "Автоматически выставляет параметры",
-            self.start_btn: "Запускает llama-server",
-            self.stop_btn: "Останавливает сервер",
-            self.autoscroll_logs: "Автопрокрутка логов",
+            self.exe_path: "Path to llama-server.exe",
+            self.bench_path: "Path to llama-bench.exe",
+            self.model_dir: "Root folder for .gguf search",
+            self.scan_btn: "Scans models folder",
+            self.model_combo: "Selected GGUF model",
+            self.auto_params: "Automatically sets parameters",
+            self.start_btn: "Starts llama-server",
+            self.stop_btn: "Stops server",
+            self.autoscroll_logs: "Auto-scroll logs",
         }
         for widget, text in tips.items():
             if widget:

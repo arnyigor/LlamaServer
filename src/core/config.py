@@ -261,3 +261,41 @@ class ConfigManager:
                     pass
         self.apply_to_ui(ui)
         return True
+
+    def save_perf_preset(self, model_name: str, ctx_size: int, ui: Any) -> None:
+        """Сохранение связки параметров производительности для конкретной модели и контекста."""
+        self.read_from_ui(ui)
+        # Изолируем только железо-зависимые параметры
+        perf_keys = [
+            "gpu_auto",
+            "gpu_layers",
+            "cpu_moe_layers",
+            "threads",
+            "threads_batch",
+            "cache_type_k",
+            "cache_type_v",
+            "batch_size",
+            "ubatch_size",
+            "parallel_slots",
+            "flash_attn",
+            "ctx_checkpoints",
+            "cache_ram",
+        ]
+        preset = {k: getattr(self.settings, k) for k in perf_keys}
+        key = f"perf_{model_name}_{ctx_size}"
+        self.profiles[key] = preset
+        self.save_profiles()
+
+    def load_perf_preset(self, model_name: str, ctx_size: int, ui: Any) -> bool:
+        """Загрузка параметров без затирания глобальных настроек (портов, путей)."""
+        key = f"perf_{model_name}_{ctx_size}"
+        preset = self.profiles.get(key)
+        if not preset:
+            return False
+
+        for k, v in preset.items():
+            if hasattr(self.settings, k):
+                setattr(self.settings, k, v)
+
+        self.apply_to_ui(ui)
+        return True

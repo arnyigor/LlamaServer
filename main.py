@@ -86,14 +86,16 @@ class LlamaGUI:
         u.integration_check_btn.clicked.connect(self.check_integration_models)
         u.integration_add_btn.clicked.connect(self.add_model_to_integration)
         u.integration_remove_btn.clicked.connect(self.remove_model_from_integration)
+        u.integration_target.currentIndexChanged.connect(self.check_integration_models)
+        u.opencode_config_path.editingFinished.connect(self._on_config_path_changed)
+        u.pi_config_path.editingFinished.connect(self._on_config_path_changed)
         u.exe_path.textChanged.connect(self.auto_detect_bench)
-        u.opencode_config_path.editingFinished.connect(self.save_settings)
-        u.pi_config_path.editingFinished.connect(self.save_settings)
         u._browse_exe_clicked = self.browse_exe
         u._browse_bench_clicked = self.browse_bench
         u._browse_model_dir_clicked = self.browse_model_dir
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
+        u.save_preset_btn.clicked.connect(self.save_preset)
 
         self.server.log_received.connect(
             lambda text, level: self.log_mgr.append(text, level)
@@ -147,6 +149,23 @@ class LlamaGUI:
         self.config.read_from_ui(self.ui)
         self.config.settings.model_cache = self.ui.models
         self.config.save()
+
+    def save_preset(self):
+        path = self.ui.model_combo.currentData()
+        if not path:
+            QMessageBox.warning(self.ui, "Ошибка", "Сначала выберите модель")
+            return
+
+        model_name = os.path.basename(path)
+        ctx = self.ui.ctx_size.value()
+
+        self.config.save_perf_preset(model_name, ctx, self.ui)
+        self.log_mgr.append(
+            f"Сохранены параметры производительности для {model_name} (ctx: {ctx})"
+        )
+        QMessageBox.information(
+            self.ui, "Сохранено", f"Параметры для контекста {ctx} успешно сохранены."
+        )
 
     def auto_detect_bench(self):
         srv = self.ui.exe_path.text()
@@ -204,7 +223,7 @@ class LlamaGUI:
         if self.scanner:
             self.scanner.deleteLater()
             self.scanner = None
-        self.ui.scan_btn.setText("⏹ Отменить")
+        self.ui.scan_btn.setText("Отменить")
         self.ui.scan_progress.setVisible(True)
         self.ui.scan_status.setText("Сканирование GGUF...")
         self.scanner = ModelScanner(bp)
@@ -212,7 +231,7 @@ class LlamaGUI:
         self.scanner.models_found.connect(self.on_models_found)
         self.scanner.error.connect(lambda msg: self.log_mgr.append(msg, "error"))
         self.scanner.finished.connect(
-            lambda: self.ui.scan_btn.setText("🔍 Сканировать")
+            lambda: self.ui.scan_btn.setText("Сканировать")
             or self.ui.scan_progress.setVisible(False)
         )
         self.scanner.start()
@@ -230,7 +249,7 @@ class LlamaGUI:
         elif models:
             self.ui.model_combo.setCurrentIndex(0)
         self.save_settings()
-        self.log_mgr.append(f"✅ Найдено моделей: {len(models)}")
+        self.log_mgr.append(f"Найдено моделей: {len(models)}")
         self.ui.scan_status.setText(f"Найдено моделей: {len(models)}")
 
     def on_model_selected(self, *_):
@@ -259,32 +278,32 @@ class LlamaGUI:
         ctx = info.get("context_length", 0)
         rec_ctx = info.get("recommended_ctx", 0)
 
-        parts = [f"🏗 {arch} | {quant} | {size:.2f} GiB"]
+        parts = [f"Architecture: {arch} | {quant} | {size:.2f} GiB"]
 
-        layer_str = f"Слоёв: {block_count}" if block_count else "Слоёв: ?"
+        layer_str = f"Layers: {block_count}" if block_count else "Layers: ?"
         if head_count:
             layer_str += f" | Heads: {head_count}"
         if emb_len:
             layer_str += f" | Emb: {emb_len}"
-        parts.append(f"📐 {layer_str}")
+        parts.append(layer_str)
 
         if expert_count:
-            moe_str = f"🔀 MoE: {expert_count} экспертов"
+            moe_str = f"MoE: {expert_count} experts"
             if expert_used:
-                moe_str += f", активных: {expert_used}"
+                moe_str += f", active: {expert_used}"
             parts.append(moe_str)
 
         if ctx:
-            parts.append(f"📏 Контекст: {ctx:,} | Рек.: {rec_ctx:,}")
+            parts.append(f"Context: {ctx:,} | Rec: {rec_ctx:,}")
 
         if info.get("mmproj_path"):
             from pathlib import Path
 
             mmproj_name = Path(info["mmproj_path"]).name
-            parts.append(f"🖼 mmproj: {mmproj_name}")
+            parts.append(f"mmproj: {mmproj_name}")
 
         if info.get("metadata_error"):
-            parts.append(f"⚠️ {info['metadata_error']}")
+            parts.append(f"Warning: {info['metadata_error']}")
 
         self.ui.model_info.setText("\n".join(parts))
 
@@ -315,7 +334,7 @@ class LlamaGUI:
             )
             self.ui.cpu_moe_layers.setToolTip(tooltip)
         else:
-            self.ui.cpu_moe_layers.setToolTip("Модель не MoE")
+            self.ui.cpu_moe_layers.setToolTip("Model is not MoE")
 
         tooltip_ctx = build_ctx_tooltip(
             info=info,
@@ -346,6 +365,10 @@ class LlamaGUI:
         self.ui.ubatch_size.setValue(2048)
 
     def on_ctx_changed(self, ctx_size):
+        # Блокируем рекурсивные вызовы при программном изменении виджетов
+        if getattr(self, "_loading_preset", False):
+            return
+
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if not info:
             return
@@ -380,6 +403,22 @@ class LlamaGUI:
             parallel_slots=self.ui.parallel_slots.value(),
         )
         self.ui.ctx_size.setToolTip(tooltip_ctx)
+
+        # --- Загрузка пресета параметров ---
+        path = self.ui.model_combo.currentData()
+        model_name = os.path.basename(path) if path else None
+
+        if model_name:
+            self._loading_preset = True
+            try:
+                if self.config.load_perf_preset(model_name, ctx_size, self.ui):
+                    self.ui.ctx_size.setValue(ctx_size)  # Страхуем контекст от сброса
+                    self.log_mgr.append(
+                        f"Loaded preset for {model_name} (ctx: {ctx_size})"
+                    )
+                    self.update_cli_preview()
+            finally:
+                self._loading_preset = False
 
     def _on_gpu_layers_changed(self, value):
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
@@ -447,7 +486,7 @@ class LlamaGUI:
             return
         if not args:
             return
-        self.log_mgr.append(f"▶ Запуск сервера: {exe}\n   Аргументы: {' '.join(args)}")
+        self.log_mgr.append(f"Starting server: {exe}\n   Args: {' '.join(args)}")
         self._reset_mem_viz()
         self.server.start_server(exe, args)
         self.ui.start_btn.setEnabled(False)
@@ -482,12 +521,12 @@ class LlamaGUI:
         if not args:
             return
         self.log_mgr.append(
-            f"🧪 Запуск бенчмарка: {os.path.basename(bexe)}\n   Параметры: {' '.join(args)}"
+            f"Running benchmark: {os.path.basename(bexe)}\n   Params: {' '.join(args)}"
         )
         self._reset_mem_viz()
         self.server.start_bench(bexe, args)
         self.ui.test_btn.setEnabled(False)
-        self.ui.test_btn.setText("⏳ Тестирование...")
+        self.ui.test_btn.setText("Testing...")
         self.ui.start_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
 
@@ -538,7 +577,7 @@ class LlamaGUI:
         self.updater.start()
         self.update_action_buttons()
 
-    # Integration & Profiles logic (abbreviated, same as original but using config/ui refs)
+    # Integration & Profiles logic
     def check_integration_models(self, silent=False):
         target = self.ui.current_config_target()
         config_path = self.ui.current_config_path()
@@ -546,9 +585,14 @@ class LlamaGUI:
         result = mgr.check_models(config_path, target)
         self.ui.integration_status.setText(result.message)
         self.ui.integration_models_list.clear()
-        self.ui.integration_models_list.addItems(result.model_ids)
+        if result.model_ids:
+            self.ui.integration_models_list.addItems(result.model_ids)
         if not silent and not result.success:
             QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
+
+    def _on_config_path_changed(self):
+        self.save_settings()
+        self.check_integration_models(silent=True)
 
     def add_model_to_integration(self):
         model_id = self.ui.current_model_id()
