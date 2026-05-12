@@ -251,13 +251,11 @@ class TestFileUtils(unittest.TestCase):
 class TestIntegration(unittest.TestCase):
     """Тесты интеграции."""
 
-    def test_build_args_validation(self):
-        """Проверка, что build_args не падает без модели."""
-        # Это интеграционный тест — нужен GUI
-        # Проверим хотя бы импорты
-        from main import LlamaGUI
+    def test_build_args_import(self):
+        """Проверка импорта build_args."""
+        from src.core.cli_builder import build_args
 
-        self.assertTrue(hasattr(LlamaGUI, "build_args"))
+        self.assertTrue(callable(build_args))
 
 
 def run_tests():

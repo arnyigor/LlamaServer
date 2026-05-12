@@ -3,6 +3,7 @@
 
 import json
 import os
+import hashlib
 from dataclasses import dataclass, field, asdict, fields
 from typing import Any, Dict, Optional, Type
 from pathlib import Path
@@ -108,6 +109,41 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "jinja": "jinja",
     "extra_args": "extra_args",
 }
+
+_PERF_PRESETS_ROOT = "__perf_presets__"
+
+_PERF_PRESET_FIELDS = (
+    "gpu_auto",
+    "gpu_layers",
+    "cpu_moe_layers",
+    "ctx_size",
+    "threads",
+    "threads_batch",
+    "cache_type_k",
+    "cache_type_v",
+    "batch_size",
+    "ubatch_size",
+    "parallel_slots",
+    "flash_attn",
+    "fit_off",
+    "reasoning_mode",
+    "ctx_checkpoints",
+    "cache_ram",
+    "temperature",
+    "repeat_penalty",
+    "use_mmap",
+    "use_mlock",
+    "verbose",
+    "log_timestamps",
+    "cont_batching",
+    "cache_prompt",
+    "context_shift",
+    "no_webui",
+    "jinja",
+    "use_mmproj",
+    "mmproj_offload",
+    "extra_args",
+)
 
 
 def _widget_get(widget: Any) -> Any:
@@ -262,40 +298,102 @@ class ConfigManager:
         self.apply_to_ui(ui)
         return True
 
-    def save_perf_preset(self, model_name: str, ctx_size: int, ui: Any) -> None:
-        """Сохранение связки параметров производительности для конкретной модели и контекста."""
-        self.read_from_ui(ui)
-        # Изолируем только железо-зависимые параметры
-        perf_keys = [
-            "gpu_auto",
-            "gpu_layers",
-            "cpu_moe_layers",
-            "threads",
-            "threads_batch",
-            "cache_type_k",
-            "cache_type_v",
-            "batch_size",
-            "ubatch_size",
-            "parallel_slots",
-            "flash_attn",
-            "ctx_checkpoints",
-            "cache_ram",
+    def _perf_preset_key(self, model_path: str, ctx_size: int) -> str:
+        normalized = os.path.normcase(os.path.abspath(str(model_path).strip()))
+        digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[
+            :16
         ]
-        preset = {k: getattr(self.settings, k) for k in perf_keys}
-        key = f"perf_{model_name}_{ctx_size}"
-        self.profiles[key] = preset
+        return f"{digest}::ctx={int(ctx_size)}"
+
+    def save_perf_preset(self, model_path: str, ctx_size: int, ui: Any) -> None:
+        """
+        Сохраняет параметры производительности для пары:
+        конкретная GGUF-модель + конкретный context size.
+        """
+        if not model_path:
+            raise ValueError("Model not selected")
+
+        if ctx_size <= 0:
+            raise ValueError("Preset requires specific Context Size, not auto")
+
+        self.read_from_ui(ui)
+
+        params = {
+            field_name: getattr(self.settings, field_name)
+            for field_name in _PERF_PRESET_FIELDS
+            if hasattr(self.settings, field_name)
+        }
+
+        params["ctx_size"] = int(ctx_size)
+
+        root = self.profiles.setdefault(_PERF_PRESETS_ROOT, {})
+        if not isinstance(root, dict):
+            root = {}
+            self.profiles[_PERF_PRESETS_ROOT] = root
+
+        key = self._perf_preset_key(model_path, ctx_size)
+
+        root[key] = {
+            "model_path": str(model_path),
+            "model_name": Path(model_path).name,
+            "ctx_size": int(ctx_size),
+            "params": params,
+        }
+
         self.save_profiles()
 
-    def load_perf_preset(self, model_name: str, ctx_size: int, ui: Any) -> bool:
-        """Загрузка параметров без затирания глобальных настроек (портов, путей)."""
-        key = f"perf_{model_name}_{ctx_size}"
-        preset = self.profiles.get(key)
-        if not preset:
+    def load_perf_preset(self, model_path: str, ctx_size: int, ui: Any) -> bool:
+        """
+        Загружает только параметры производительности.
+        Не трогает глобальные настройки: exe, bench, model_dir, port, интеграции.
+        """
+        if not model_path or ctx_size <= 0:
             return False
 
-        for k, v in preset.items():
-            if hasattr(self.settings, k):
-                setattr(self.settings, k, v)
+        root = self.profiles.get(_PERF_PRESETS_ROOT, {})
+        if not isinstance(root, dict):
+            return False
 
-        self.apply_to_ui(ui)
+        key = self._perf_preset_key(model_path, ctx_size)
+        preset_obj = root.get(key)
+
+        # Backward compatibility со старым форматом perf_<model_name>_<ctx>
+        if not preset_obj:
+            legacy_key = f"perf_{Path(model_path).name}_{ctx_size}"
+            legacy_preset = self.profiles.get(legacy_key)
+            if isinstance(legacy_preset, dict):
+                preset_obj = {"params": legacy_preset}
+
+        if not isinstance(preset_obj, dict):
+            return False
+
+        params = preset_obj.get("params", {})
+        if not isinstance(params, dict):
+            return False
+
+        params = dict(params)
+        params["ctx_size"] = int(ctx_size)
+
+        for field_name, value in params.items():
+            if not hasattr(self.settings, field_name):
+                continue
+
+            try:
+                setattr(self.settings, field_name, value)
+            except (TypeError, ValueError):
+                continue
+
+            widget_attr = _FIELD_WIDGET_MAP.get(field_name)
+            if not widget_attr:
+                continue
+
+            widget = getattr(ui, widget_attr, None)
+            if widget is None:
+                continue
+
+            try:
+                _widget_set(widget, value)
+            except (TypeError, ValueError):
+                pass
+
         return True

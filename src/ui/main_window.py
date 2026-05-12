@@ -180,10 +180,14 @@ class MainWindowUI(QMainWindow):
             "Save parameters (ngl, ncmoe, etc.) for current model and context"
         )
 
+        self.preset_status = QLabel("Preset: none")
+        self.preset_status.setStyleSheet("color: #888;")
+
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("Context Size (-c):"))
         r2.addWidget(self.ctx_size)
         r2.addWidget(self.save_preset_btn)
+        r2.addWidget(self.preset_status)
         lperf.addLayout(r2)
 
         self.batch_size = QSpinBox()

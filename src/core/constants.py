@@ -71,3 +71,55 @@ class AppState(Enum):
     RUNNING = auto()
     STOPPING = auto()
     ERROR = auto()
+
+
+# Допустимые флаги командной строки llama.cpp
+LLAMA_ALLOWED_FLAGS = frozenset(
+    {
+        "--port",
+        "--host",
+        "--ctx-size",
+        "--threads",
+        "--threads-batch",
+        "--batch-size",
+        "--ubatch-size",
+        "--n-gpu-layers",
+        "--split-mode",
+        "--main-gpu",
+        "--tensor-split",
+        "--cache-type-k",
+        "--cache-type-v",
+        "--flash-attn",
+        "--no-mmap",
+        "--mmap",
+        "--mlock",
+        "--no-mlock",
+        "--verbose",
+        "--log-timestamps",
+        "--cont-batching",
+        "--no-cont-batching",
+        "--cache-prompt",
+        "--no-cache-prompt",
+        "--ctx-checkpoints",
+        "--cache-ram",
+        "--temp",
+        "--repeat-penalty",
+        "--top-p",
+        "--min-p",
+        "--seed",
+        "--jinja",
+        "--no-webui",
+        "--mmproj",
+        "--no-mmproj",
+        "--no-mmproj-offload",
+        "--fit",
+        "--rope-scaling",
+        "--rope-freq-base",
+        "--rope-freq-scale",
+        "--yarn-ext-factor",
+        "--yarn-attn-factor",
+        "--yarn-beta-fast",
+        "--yarn-beta-slow",
+        "--yarn-orig-ctx",
+    }
+)

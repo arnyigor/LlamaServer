@@ -111,7 +111,7 @@ class LlamaGUI:
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
-            self.ui, "Выберите opencode.json", "", "JSON (*.json);;All files (*.*)"
+            self.ui, "Select opencode.json", "", "JSON (*.json);;All files (*.*)"
         )
         if f:
             self.ui.opencode_config_path.setText(f)
@@ -120,7 +120,7 @@ class LlamaGUI:
 
     def browse_pi_config(self):
         f, _ = QFileDialog.getOpenFileName(
-            self.ui, "Выберите PI config.json", "", "JSON (*.json);;All files (*.*)"
+            self.ui, "Select PI config.json", "", "JSON (*.json);;All files (*.*)"
         )
         if f:
             self.ui.pi_config_path.setText(f)
@@ -133,10 +133,10 @@ class LlamaGUI:
         self.tray = QSystemTrayIcon(self.ui)
         self.tray.setToolTip("LlamaServer GUI")
         menu = QMenu()
-        menu.addAction("Показать", self.ui.showNormal)
-        menu.addAction("Скрыть", self.ui.hide)
+        menu.addAction("Show", self.ui.showNormal)
+        menu.addAction("Hide", self.ui.hide)
         menu.addSeparator()
-        menu.addAction("Выход", self.quit_app)
+        menu.addAction("Exit", self.quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
             lambda r: self.ui.hide()
@@ -150,22 +150,84 @@ class LlamaGUI:
         self.config.settings.model_cache = self.ui.models
         self.config.save()
 
-    def save_preset(self):
+    def _current_model_path(self):
         path = self.ui.model_combo.currentData()
-        if not path:
-            QMessageBox.warning(self.ui, "Ошибка", "Сначала выберите модель")
+        if path:
+            return path
+
+        text = self.ui.model_combo.currentText().strip()
+        if text and os.path.exists(text) and text.lower().endswith(".gguf"):
+            return text
+
+        return None
+
+    def save_preset(self):
+        model_path = self._current_model_path()
+        if not model_path:
+            QMessageBox.warning(self.ui, "Error", "Select a model first")
             return
 
-        model_name = os.path.basename(path)
         ctx = self.ui.ctx_size.value()
+        if ctx <= 0:
+            QMessageBox.warning(
+                self.ui,
+                "Error",
+                "Preset requires specific Context Size, not auto",
+            )
+            return
 
-        self.config.save_perf_preset(model_name, ctx, self.ui)
+        try:
+            self.config.save_perf_preset(model_path, ctx, self.ui)
+        except ValueError as e:
+            QMessageBox.warning(self.ui, "Error", str(e))
+            return
+        except OSError as e:
+            QMessageBox.critical(
+                self.ui,
+                "Error",
+                f"Failed to save preset: {e}",
+            )
+            return
+
         self.log_mgr.append(
-            f"Сохранены параметры производительности для {model_name} (ctx: {ctx})"
+            f"Preset saved: {os.path.basename(model_path)} | ctx={ctx:,}"
         )
         QMessageBox.information(
-            self.ui, "Сохранено", f"Параметры для контекста {ctx} успешно сохранены."
+            self.ui,
+            "Saved",
+            f"Parameters for ctx={ctx:,} saved.",
         )
+
+    def _try_load_perf_preset(self, model_path: str, ctx_size: int) -> bool:
+        if not model_path or ctx_size <= 0:
+            return False
+
+        if getattr(self, "_loading_preset", False):
+            return False
+
+        self._loading_preset = True
+        try:
+            loaded = self.config.load_perf_preset(model_path, ctx_size, self.ui)
+        finally:
+            self._loading_preset = False
+
+        if not loaded:
+            return False
+
+        self.log_mgr.append(
+            f"Loaded preset: {os.path.basename(model_path)} | ctx={ctx_size:,}"
+        )
+
+        if hasattr(self.ui, "preset_status"):
+            self.ui.preset_status.setText(f"Preset: loaded ctx={ctx_size:,}")
+            self.ui.preset_status.setStyleSheet("color: #4CAF50;")
+
+        info = self.ui.models_by_path.get(model_path)
+        if info:
+            self._refresh_tooltips(info)
+
+        self.update_cli_preview()
+        return True
 
     def auto_detect_bench(self):
         srv = self.ui.exe_path.text()
@@ -178,7 +240,7 @@ class LlamaGUI:
 
     def browse_exe(self):
         f, _ = QFileDialog.getOpenFileName(
-            self.ui, "Выберите llama-server", "", "Executable (*.exe)"
+            self.ui, "Select llama-server", "", "Executable (*.exe)"
         )
         if f:
             self.ui.exe_path.setText(f)
@@ -186,14 +248,14 @@ class LlamaGUI:
 
     def browse_bench(self):
         f, _ = QFileDialog.getOpenFileName(
-            self.ui, "Выберите llama-bench", "", "Executable (*.exe)"
+            self.ui, "Select llama-bench", "", "Executable (*.exe)"
         )
         if f:
             self.ui.bench_path.setText(f)
             self.save_settings()
 
     def browse_model_dir(self):
-        d = QFileDialog.getExistingDirectory(self.ui, "Выберите папку с моделями")
+        d = QFileDialog.getExistingDirectory(self.ui, "Select models folder")
         if d:
             self.ui.model_dir.setText(d)
             self.save_settings()
@@ -202,7 +264,7 @@ class LlamaGUI:
     def auto_scan_models(self):
         if self.ui.models:
             self.ui.scan_status.setText(
-                f"Кэш моделей: {len(self.ui.models)}. Фоновая проверка..."
+                f"Model cache: {len(self.ui.models)}. Background check..."
             )
         bp = self.ui.model_dir.text()
         if bp and os.path.exists(bp):
@@ -212,9 +274,7 @@ class LlamaGUI:
         bp = self.ui.model_dir.text()
         if not bp or not os.path.exists(bp):
             if not silent:
-                QMessageBox.warning(
-                    self.ui, "Ошибка", "Укажите существующую базовую папку"
-                )
+                QMessageBox.warning(self.ui, "Error", "Specify existing base folder")
             return
         if self.scanner and self.scanner.isRunning():
             if not silent:
@@ -223,15 +283,15 @@ class LlamaGUI:
         if self.scanner:
             self.scanner.deleteLater()
             self.scanner = None
-        self.ui.scan_btn.setText("Отменить")
+        self.ui.scan_btn.setText("Cancel")
         self.ui.scan_progress.setVisible(True)
-        self.ui.scan_status.setText("Сканирование GGUF...")
+        self.ui.scan_status.setText("Scanning GGUF...")
         self.scanner = ModelScanner(bp)
         self.scanner.progress.connect(self.ui.scan_status.setText)
         self.scanner.models_found.connect(self.on_models_found)
         self.scanner.error.connect(lambda msg: self.log_mgr.append(msg, "error"))
         self.scanner.finished.connect(
-            lambda: self.ui.scan_btn.setText("Сканировать")
+            lambda: self.ui.scan_btn.setText("Scan")
             or self.ui.scan_progress.setVisible(False)
         )
         self.scanner.start()
@@ -249,8 +309,8 @@ class LlamaGUI:
         elif models:
             self.ui.model_combo.setCurrentIndex(0)
         self.save_settings()
-        self.log_mgr.append(f"Найдено моделей: {len(models)}")
-        self.ui.scan_status.setText(f"Найдено моделей: {len(models)}")
+        self.log_mgr.append(f"Found models: {len(models)}")
+        self.ui.scan_status.setText(f"Found models: {len(models)}")
 
     def on_model_selected(self, *_):
         path = self.ui.model_combo.currentData()
@@ -262,7 +322,7 @@ class LlamaGUI:
                     self.ui.model_combo.currentIndex(), path
                 )
             else:
-                self.ui.model_info.setText("Выберите модель")
+                self.ui.model_info.setText("Select model")
                 return
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
         self.ui.models_by_path[path] = info
@@ -310,8 +370,17 @@ class LlamaGUI:
         self._refresh_tooltips(info)
 
         self.config.settings.last_model_path = path
+
         if self.ui.auto_params.isChecked() and not self.ui.loading_profile:
-            self.apply_recommended_params(info)
+            self._loading_preset = True
+            try:
+                self.apply_recommended_params(info)
+            finally:
+                self._loading_preset = False
+
+        ctx_size = self.ui.ctx_size.value()
+        self._try_load_perf_preset(path, ctx_size)
+
         self.update_cli_preview()
 
     def _refresh_tooltips(self, info):
@@ -365,18 +434,12 @@ class LlamaGUI:
         self.ui.ubatch_size.setValue(2048)
 
     def on_ctx_changed(self, ctx_size):
-        # Блокируем рекурсивные вызовы при программном изменении виджетов
-        if getattr(self, "_loading_preset", False):
+        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
             return
 
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if not info:
             return
-
-        info_key = (
-            next((k for k, v in self.ui.models_by_path.items() if v is info), None)
-            or self.ui.model_combo.currentData()
-        )
 
         gpu_layers_val = (
             999 if self.ui.gpu_auto.isChecked() else self.ui.gpu_layers.value()
@@ -404,31 +467,28 @@ class LlamaGUI:
         )
         self.ui.ctx_size.setToolTip(tooltip_ctx)
 
-        # --- Загрузка пресета параметров ---
-        path = self.ui.model_combo.currentData()
-        model_name = os.path.basename(path) if path else None
-
-        if model_name:
-            self._loading_preset = True
-            try:
-                if self.config.load_perf_preset(model_name, ctx_size, self.ui):
-                    self.ui.ctx_size.setValue(ctx_size)  # Страхуем контекст от сброса
-                    self.log_mgr.append(
-                        f"Loaded preset for {model_name} (ctx: {ctx_size})"
-                    )
-                    self.update_cli_preview()
-            finally:
-                self._loading_preset = False
+        model_path = self._current_model_path()
+        if model_path:
+            self._try_load_perf_preset(model_path, ctx_size)
 
     def _on_gpu_layers_changed(self, value):
+        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+            return
+
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if info:
             self._refresh_tooltips(info)
 
+        self.update_cli_preview()
+
     def _on_param_changed(self, _value=None):
+        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+            return
+
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if info:
             self._refresh_tooltips(info)
+
         self.update_cli_preview()
 
     def update_cli_preview(self):
@@ -467,13 +527,13 @@ class LlamaGUI:
         if self.server.is_bench_running():
             QMessageBox.warning(
                 self.ui,
-                "Benchmark запущен",
-                "Остановите benchmark перед запуском сервера",
+                "Benchmark running",
+                "Stop benchmark before starting server",
             )
             return
         exe = self.ui.exe_path.text()
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-server.exe")
+            QMessageBox.critical(self.ui, "Error", "Specify path to llama-server.exe")
             return
         self.config.read_from_ui(self.ui)
         # resolve mmproj
@@ -482,7 +542,7 @@ class LlamaGUI:
         try:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
         except ValueError as e:
-            QMessageBox.warning(self.ui, "Ошибка", str(e))
+            QMessageBox.warning(self.ui, "Error", str(e))
             return
         if not args:
             return
@@ -500,13 +560,13 @@ class LlamaGUI:
     def run_benchmark(self):
         if self.server.is_server_running():
             QMessageBox.warning(
-                self.ui, "Сервер запущен", "Остановите сервер перед запуском benchmark"
+                self.ui, "Server running", "Stop server before running benchmark"
             )
             return
         self.auto_detect_bench()
         bexe = self.ui.bench_path.text()
         if not bexe or not os.path.exists(bexe):
-            QMessageBox.critical(self.ui, "Ошибка", "Укажите путь к llama-bench.exe")
+            QMessageBox.critical(self.ui, "Error", "Specify path to llama-bench.exe")
             return
         self.config.read_from_ui(self.ui)
         try:
@@ -516,7 +576,7 @@ class LlamaGUI:
                 for_benchmark=True,
             )
         except ValueError as e:
-            QMessageBox.warning(self.ui, "Ошибка", str(e))
+            QMessageBox.warning(self.ui, "Error", str(e))
             return
         if not args:
             return
@@ -588,7 +648,7 @@ class LlamaGUI:
         if result.model_ids:
             self.ui.integration_models_list.addItems(result.model_ids)
         if not silent and not result.success:
-            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
+            QMessageBox.warning(self.ui, "Integration Error", result.message)
 
     def _on_config_path_changed(self):
         self.save_settings()
@@ -597,7 +657,7 @@ class LlamaGUI:
     def add_model_to_integration(self):
         model_id = self.ui.current_model_id()
         if not model_id:
-            QMessageBox.warning(self.ui, "Ошибка", "Сначала выберите модель")
+            QMessageBox.warning(self.ui, "Error", "Select a model first")
             return
         target = self.ui.current_config_target()
         config_path = self.ui.current_config_path()
@@ -608,12 +668,12 @@ class LlamaGUI:
             self.ui.integration_models_list.clear()
             self.ui.integration_models_list.addItems(result.model_ids)
         else:
-            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
+            QMessageBox.warning(self.ui, "Integration Error", result.message)
 
     def remove_model_from_integration(self):
         selected = self.ui.integration_models_list.currentItem()
         if not selected:
-            QMessageBox.warning(self.ui, "Ошибка", "Выберите модель для удаления")
+            QMessageBox.warning(self.ui, "Error", "Select a model to remove")
             return
         model_id = selected.text()
         target = self.ui.current_config_target()
@@ -625,7 +685,7 @@ class LlamaGUI:
             self.ui.integration_models_list.clear()
             self.ui.integration_models_list.addItems(result.model_ids)
         else:
-            QMessageBox.warning(self.ui, "Ошибка интеграции", result.message)
+            QMessageBox.warning(self.ui, "Integration Error", result.message)
 
     def quit_app(self):
         self.save_settings()
