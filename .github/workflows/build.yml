@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  QT_QPA_PLATFORM: offscreen
+
 jobs:
   build:
     name: ${{ matrix.platform }} build
@@ -44,6 +47,22 @@ jobs:
         with:
           python-version: '3.13'
           cache: pip
+
+      - name: Install Linux Qt runtime libraries
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0
 
       - name: Create virtual environment
         run: python -m venv .venv
