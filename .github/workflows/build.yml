@@ -4,15 +4,36 @@ on:
   push:
     branches:
       - '**'
+    tags:
+      - '*'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  windows-build:
-    name: Windows build
-    runs-on: windows-latest
+  build:
+    name: ${{ matrix.platform }} build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            archive_format: zip
+            archive_ext: zip
+            venv_python: ./.venv/Scripts/python.exe
+          - os: ubuntu-latest
+            platform: linux
+            archive_format: gztar
+            archive_ext: tar.gz
+            venv_python: ./.venv/bin/python
+          - os: macos-latest
+            platform: macos
+            archive_format: zip
+            archive_ext: zip
+            venv_python: ./.venv/bin/python
 
     steps:
       - name: Checkout
@@ -24,35 +45,71 @@ jobs:
           python-version: '3.13'
           cache: pip
 
+      - name: Create virtual environment
+        run: python -m venv .venv
+
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller pytest
+          ${{ matrix.venv_python }} -m pip install --upgrade pip
+          ${{ matrix.venv_python }} -m pip install -r requirements.txt
+          ${{ matrix.venv_python }} -m pip install pyinstaller pytest
 
       - name: Run tests
-        run: pytest
+        run: ${{ matrix.venv_python }} -m pytest
 
       - name: Build executables
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name LlamaServer --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
-          pyinstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
+          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServer --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
+          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
 
-      - name: Add default config files
-        shell: pwsh
+      - name: Add default config files and create archive
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
-          Copy-Item profiles.json dist\profiles.json -ErrorAction SilentlyContinue
-          Copy-Item settings.json dist\settings.json -ErrorAction SilentlyContinue
+          ${{ matrix.venv_python }} - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
 
-      - name: Create archive
-        shell: pwsh
-        run: |
-          $sha = "${{ github.sha }}".Substring(0, 7)
-          Compress-Archive -Path dist\* -DestinationPath "LlamaServer-windows-$sha.zip" -Force
+          dist = Path("dist")
+          for name in ("profiles.json", "settings.json"):
+              source = Path(name)
+              if source.exists():
+                  shutil.copy2(source, dist / name)
+
+          sha = os.environ["GITHUB_SHA"][:7]
+          base_name = f"LlamaServer-{os.environ['PLATFORM']}-{sha}"
+          shutil.make_archive(base_name, os.environ["ARCHIVE_FORMAT"], root_dir=dist)
+          PY
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LlamaServer-windows-${{ github.sha }}
-          path: LlamaServer-windows-*.zip
+          name: LlamaServer-${{ matrix.platform }}-${{ github.sha }}
+          path: LlamaServer-${{ matrix.platform }}-*.${{ matrix.archive_ext }}
           if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: LlamaServer-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
