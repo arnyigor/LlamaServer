@@ -7,6 +7,11 @@ on:
     tags:
       - '*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag for manual release, for example v1.0.0'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -115,7 +120,7 @@ jobs:
     name: GitHub release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
 
@@ -130,5 +135,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: release-assets/*
           generate_release_notes: true
