@@ -636,7 +636,9 @@ class LlamaGUI:
             return None
         return exe, args
 
-    def _launch_server(self, exe: str, args: list[str], action: str = "Starting server"):
+    def _launch_server(
+        self, exe: str, args: list[str], action: str = "Starting server"
+    ):
         self.log_mgr.append(f"{action}: {exe}\n   Args: {' '.join(args)}")
         self._reset_mem_viz()
         self.server.start_server(exe, args)
@@ -647,7 +649,6 @@ class LlamaGUI:
         self.ui.reload_btn.setEnabled(True)
         self.ui.test_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
-        self.ui.force_stop_btn.setEnabled(True)
         if hasattr(self, "tray"):
             self.tray.setToolTip(
                 f"LlamaServer GUI - Running on port {self.ui.port.value()}"
@@ -856,9 +857,13 @@ class LlamaGUI:
             generation_tokens=self.ui.bench_gen.value(),
             per_run_timeout_sec=options["per_run_timeout_sec"],
         )
-        self.ui.autotune.prepare_run(len(plan.candidates), options["per_run_timeout_sec"])
+        self.ui.autotune.prepare_run(
+            len(plan.candidates), options["per_run_timeout_sec"]
+        )
         self.autotune.log.connect(lambda text, level: self.log_mgr.append(text, level))
-        self.autotune.log.connect(lambda text, _level: self.ui.autotune.append_activity(text))
+        self.autotune.log.connect(
+            lambda text, _level: self.ui.autotune.append_activity(text)
+        )
         self.autotune.progress.connect(self.ui.autotune.set_progress)
         self.autotune.run_started.connect(self.ui.autotune.mark_running)
         self.autotune.run_finished.connect(self.ui.autotune.update_result)
@@ -893,7 +898,9 @@ class LlamaGUI:
                 f"AutoTune finished: best={best.candidate_id}, score={best.score:.3f}, results={output_dir}"
             )
         else:
-            self.log_mgr.append(f"AutoTune finished: no successful result, results={output_dir}", "warn")
+            self.log_mgr.append(
+                f"AutoTune finished: no successful result, results={output_dir}", "warn"
+            )
         self.update_action_buttons()
 
     def apply_autotune_best(self, silent=False):
@@ -910,21 +917,51 @@ class LlamaGUI:
             self.ui.gpu_auto.setChecked(is_auto_ngl)
             if not is_auto_ngl:
                 self.ui.gpu_layers.setValue(int(ngl))
-            self.ui.ctx_size.setValue(int(params.get("ctx_size", self.ui.ctx_size.value())))
-            self.ui.batch_size.setValue(int(params.get("batch_size", self.ui.batch_size.value())))
-            self.ui.ubatch_size.setValue(int(params.get("ubatch_size", self.ui.ubatch_size.value())))
-            self.ui.cache_type_k.setCurrentText(str(params.get("cache_type_k", self.ui.cache_type_k.currentText())))
-            self.ui.cache_type_v.setCurrentText(str(params.get("cache_type_v", self.ui.cache_type_v.currentText())))
-            self.ui.threads.setValue(int(params.get("threads", self.ui.threads.value())))
-            self.ui.threads_batch.setValue(int(params.get("threads_batch", self.ui.threads_batch.value())))
-            self.ui.parallel_slots.setValue(int(params.get("parallel_slots", self.ui.parallel_slots.value())))
-            self.ui.flash_attn.setChecked(bool(params.get("flash_attn", self.ui.flash_attn.isChecked())))
-            self.ui.fit_off.setChecked(bool(params.get("fit_off", self.ui.fit_off.isChecked())))
-            self.ui.cache_prompt.setChecked(bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked())))
-            self.ui.cpu_moe_layers.setValue(int(params.get("ncmoe", self.ui.cpu_moe_layers.value())))
-            self.ui.ctx_checkpoints.setValue(int(params.get("ctx_checkpoints", self.ui.ctx_checkpoints.value())))
-            self.ui.cache_ram.setValue(int(params.get("cache_ram", self.ui.cache_ram.value())))
-            self.ui.use_mmproj.setChecked(bool(params.get("use_mmproj", self.ui.use_mmproj.isChecked())))
+            self.ui.ctx_size.setValue(
+                int(params.get("ctx_size", self.ui.ctx_size.value()))
+            )
+            self.ui.batch_size.setValue(
+                int(params.get("batch_size", self.ui.batch_size.value()))
+            )
+            self.ui.ubatch_size.setValue(
+                int(params.get("ubatch_size", self.ui.ubatch_size.value()))
+            )
+            self.ui.cache_type_k.setCurrentText(
+                str(params.get("cache_type_k", self.ui.cache_type_k.currentText()))
+            )
+            self.ui.cache_type_v.setCurrentText(
+                str(params.get("cache_type_v", self.ui.cache_type_v.currentText()))
+            )
+            self.ui.threads.setValue(
+                int(params.get("threads", self.ui.threads.value()))
+            )
+            self.ui.threads_batch.setValue(
+                int(params.get("threads_batch", self.ui.threads_batch.value()))
+            )
+            self.ui.parallel_slots.setValue(
+                int(params.get("parallel_slots", self.ui.parallel_slots.value()))
+            )
+            self.ui.flash_attn.setChecked(
+                bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))
+            )
+            self.ui.fit_off.setChecked(
+                bool(params.get("fit_off", self.ui.fit_off.isChecked()))
+            )
+            self.ui.cache_prompt.setChecked(
+                bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked()))
+            )
+            self.ui.cpu_moe_layers.setValue(
+                int(params.get("ncmoe", self.ui.cpu_moe_layers.value()))
+            )
+            self.ui.ctx_checkpoints.setValue(
+                int(params.get("ctx_checkpoints", self.ui.ctx_checkpoints.value()))
+            )
+            self.ui.cache_ram.setValue(
+                int(params.get("cache_ram", self.ui.cache_ram.value()))
+            )
+            self.ui.use_mmproj.setChecked(
+                bool(params.get("use_mmproj", self.ui.use_mmproj.isChecked()))
+            )
         finally:
             self._loading_preset = False
 
@@ -935,7 +972,9 @@ class LlamaGUI:
             f"AutoTune best applied: {self.autotune_best_result.candidate_id if self.autotune_best_result else ''}"
         )
         if not silent:
-            QMessageBox.information(self.ui, "AutoTune", "Best parameters applied to UI")
+            QMessageBox.information(
+                self.ui, "AutoTune", "Best parameters applied to UI"
+            )
         return True
 
     def save_autotune_best_preset(self):
@@ -962,7 +1001,9 @@ class LlamaGUI:
         except (ValueError, OSError) as e:
             QMessageBox.warning(self.ui, "AutoTune", str(e))
             return
-        self.log_mgr.append(f"AutoTune preset saved: {Path(model_path).name} | ctx={ctx:,}")
+        self.log_mgr.append(
+            f"AutoTune preset saved: {Path(model_path).name} | ctx={ctx:,}"
+        )
         QMessageBox.information(self.ui, "AutoTune", "Best AutoTune preset saved")
 
     def show_autotune_report_path(self):
@@ -976,7 +1017,9 @@ class LlamaGUI:
         )
 
     def open_autotune_results_folder(self):
-        if not self.autotune_results_dir or not os.path.isdir(self.autotune_results_dir):
+        if not self.autotune_results_dir or not os.path.isdir(
+            self.autotune_results_dir
+        ):
             QMessageBox.information(self.ui, "AutoTune", "No results folder yet")
             return
         if sys.platform.startswith("win"):
@@ -1006,12 +1049,32 @@ class LlamaGUI:
             self._restart_pending = False
             self._pending_restart_launch = None
             self.log_mgr.append("Restart cancelled")
-        if not self.server.is_server_running():
-            self.log_mgr.append("Force stop skipped: server is not running", "warn")
+        if self.server.is_server_running():
+            self.log_mgr.append(
+                "Force stop requested: killing llama-server now", "error"
+            )
+            self.server.force_stop_server()
             self.update_action_buttons()
             return
-        self.log_mgr.append("Force stop requested: killing llama-server now", "error")
-        self.server.force_stop_server()
+        # Нет своего процесса — попробуем убить внешние llama процессы
+        external = self._external_llama_processes()
+        if external:
+            self.log_mgr.append(
+                f"Force stop: killing {len(external)} external llama process(es)...",
+                "error",
+            )
+            if sys.platform.startswith("win"):
+                for proc in external:
+                    pid = proc.get("ProcessId")
+                    if pid:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(pid), "/T", "/F"],
+                            capture_output=True,
+                            timeout=10,
+                        )
+            self.update_action_buttons()
+            return
+        self.log_mgr.append("Force stop skipped: no llama processes found", "warn")
         self.update_action_buttons()
 
     def update_action_buttons(self, busy=False):
@@ -1025,7 +1088,7 @@ class LlamaGUI:
         self.ui.start_btn.setVisible(not show_reload)
         self.ui.reload_btn.setVisible(show_reload)
         self.ui.stop_btn.setEnabled(busy)
-        self.ui.force_stop_btn.setEnabled(srv)
+        self.ui.force_stop_btn.setEnabled(True)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
         self.ui.reload_btn.setEnabled(
