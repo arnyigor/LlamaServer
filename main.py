@@ -52,6 +52,7 @@ class LlamaGUI:
         u.start_btn.clicked.connect(self.start_server)
         u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
+        u.force_stop_btn.clicked.connect(self.force_stop_server)
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
@@ -628,6 +629,7 @@ class LlamaGUI:
         self.ui.reload_btn.setEnabled(True)
         self.ui.test_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
+        self.ui.force_stop_btn.setEnabled(True)
         if hasattr(self, "tray"):
             self.tray.setToolTip(
                 f"LlamaServer GUI - Running on port {self.ui.port.value()}"
@@ -717,6 +719,19 @@ class LlamaGUI:
             self.scanner.requestInterruption()
         self.update_action_buttons()
 
+    def force_stop_server(self):
+        if self._restart_pending:
+            self._restart_pending = False
+            self._pending_restart_launch = None
+            self.log_mgr.append("Restart cancelled")
+        if not self.server.is_server_running():
+            self.log_mgr.append("Force stop skipped: server is not running", "warn")
+            self.update_action_buttons()
+            return
+        self.log_mgr.append("Force stop requested: killing llama-server now", "error")
+        self.server.force_stop_server()
+        self.update_action_buttons()
+
     def update_action_buttons(self, busy=False):
         srv = self.server.is_server_running()
         bnch = self.server.is_bench_running()
@@ -727,6 +742,7 @@ class LlamaGUI:
         self.ui.start_btn.setVisible(not show_reload)
         self.ui.reload_btn.setVisible(show_reload)
         self.ui.stop_btn.setEnabled(busy)
+        self.ui.force_stop_btn.setEnabled(srv)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
         self.ui.reload_btn.setEnabled(

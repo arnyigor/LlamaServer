@@ -1,5 +1,7 @@
 """Управление процессами llama-server и llama-bench."""
 
+import sys
+
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from src.core.constants import KILL_TIMEOUT_SERVER, KILL_TIMEOUT_BENCHMARK
 
@@ -95,10 +97,21 @@ class ServerManager(QObject):
             self.server_proc.terminate()
             QTimer.singleShot(KILL_TIMEOUT_SERVER, self._kill_server_if_needed)
 
+    def force_stop_server(self):
+        if self.server_proc.state() == QProcess.ProcessState.NotRunning:
+            return
+        self.server_stop_requested = True
+        self._emit("⛔ Force stop: принудительная остановка llama-server...")
+        pid = int(self.server_proc.processId() or 0)
+        if pid and sys.platform.startswith("win"):
+            QProcess.execute("taskkill", ["/PID", str(pid), "/T", "/F"])
+        if self.server_proc.state() != QProcess.ProcessState.NotRunning:
+            self.server_proc.kill()
+
     def _kill_server_if_needed(self):
         if self.server_proc.state() != QProcess.ProcessState.NotRunning:
             self._emit("⚠️ Сервер не завершился штатно, принудительная остановка")
-            self.server_proc.kill()
+            self.force_stop_server()
 
     def start_bench(self, exe: str, args: list):
         self.bench_stop_requested = False

@@ -489,9 +489,17 @@ class MainWindowUI(QMainWindow):
         self.stop_btn.setStyleSheet(
             "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
         )
+        self.force_stop_btn = QPushButton("Force Stop", enabled=False)
+        self.force_stop_btn.setToolTip(
+            "Immediately kills llama-server process tree if normal stop is stuck"
+        )
+        self.force_stop_btn.setStyleSheet(
+            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
+        )
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.reload_btn)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.force_stop_btn)
         lay.addLayout(btn_row)
         lay.addStretch()
 
@@ -549,6 +557,7 @@ class MainWindowUI(QMainWindow):
             self.start_btn: "Starts llama-server",
             self.reload_btn: "Restarts llama-server with current parameters",
             self.stop_btn: "Stops server",
+            self.force_stop_btn: "Force kills llama-server immediately",
             self.autoscroll_logs: "Auto-scroll logs",
         }
         for widget, text in tips.items():
