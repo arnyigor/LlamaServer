@@ -28,6 +28,7 @@ from PySide6.QtGui import QFont
 
 from src.ui.widgets import CollapsiblePanel
 from src.ui.mem_viz_widget import MemoryVisualizationWidget
+from src.ui.autotune_widget import AutoTuneWidget
 
 
 class MainWindowUI(QMainWindow):
@@ -452,11 +453,21 @@ class MainWindowUI(QMainWindow):
         bp_layout.addWidget(self.bench_gen)
         self.bench_panel.add_layout(bp_layout)
 
+        bench_buttons = QHBoxLayout()
         self.test_btn = QPushButton("Test Speed")
         self.test_btn.setStyleSheet(
             "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
         )
-        self.bench_panel.add_widget(self.test_btn)
+        self.autotune_btn = QPushButton("AutoTune...")
+        self.autotune_btn.setToolTip(
+            "Open AutoTune, build candidates from current model/context, then run automatic benchmark"
+        )
+        self.autotune_btn.setStyleSheet(
+            "background-color: #673AB7; color: white; font-weight: bold; padding: 6px;"
+        )
+        bench_buttons.addWidget(self.test_btn)
+        bench_buttons.addWidget(self.autotune_btn)
+        self.bench_panel.add_layout(bench_buttons)
         lay.addWidget(self.bench_panel)
 
         # === 7. Preview CLI ===
@@ -543,6 +554,10 @@ class MainWindowUI(QMainWindow):
         self.mem_viz = MemoryVisualizationWidget()
         self.tabs.addTab(self.mem_viz, "Memory")
 
+        # Вкладка AutoTune
+        self.autotune = AutoTuneWidget()
+        self.tabs.addTab(self.autotune, "AutoTune")
+
         lay.addWidget(self.tabs)
         return panel
 
@@ -555,6 +570,7 @@ class MainWindowUI(QMainWindow):
             self.model_combo: "Selected GGUF model",
             self.auto_params: "Automatically sets parameters",
             self.start_btn: "Starts llama-server",
+            self.autotune_btn: "Opens AutoTune and builds a plan from current settings",
             self.reload_btn: "Restarts llama-server with current parameters",
             self.stop_btn: "Stops server",
             self.force_stop_btn: "Force kills llama-server immediately",

@@ -163,6 +163,29 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--seed", args)
         self.assertIn("42", args)
 
+    def test_extra_args_managed_duplicates_are_filtered(self):
+        self.cfg.ctx_size = 131072
+        self.cfg.ctx_checkpoints = 0
+        self.cfg.cache_ram = 0
+        self.cfg.jinja = True
+        self.cfg.extra_args = "--ctx-checkpoints 0 --cache-ram=0 --jinja --top-p 0.9"
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertEqual(args.count("--ctx-checkpoints"), 1)
+        self.assertEqual(args.count("--cache-ram"), 1)
+        self.assertEqual(args.count("--jinja"), 1)
+        self.assertIn("--top-p", args)
+        self.assertIn("0.9", args)
+
+    def test_extra_args_unmanaged_jinja_still_allowed(self):
+        self.cfg.jinja = False
+        self.cfg.extra_args = "--jinja"
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertEqual(args.count("--jinja"), 1)
+
     def test_empty_model_returns_none(self):
         self.assertIsNone(build_args(self.cfg, ""))
         self.assertIsNone(build_args(self.cfg, None))

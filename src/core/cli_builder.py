@@ -68,6 +68,129 @@ def validate_extra_args(args: List[str], model_dir: str) -> List[str]:
     return invalid
 
 
+def _flag_base(arg: str) -> str:
+    return arg.split("=", 1)[0] if arg.startswith("-") else arg
+
+
+def _filter_duplicate_extra_args(extra: List[str], existing_args: List[str]) -> List[str]:
+    """Удаляет из extra_args флаги, которыми уже управляют UI/AutoTune.
+
+    Это предотвращает CLI вроде `--ctx-checkpoints 0 ... --ctx-checkpoints 0`.
+    Если флаг не был добавлен UI, он остаётся валидным extra arg.
+    """
+    flags_with_values = {
+        "-m",
+        "--model",
+        "--port",
+        "-ngl",
+        "--n-gpu-layers",
+        "-t",
+        "--threads",
+        "-tb",
+        "--threads-batch",
+        "-c",
+        "--ctx-size",
+        "-b",
+        "--batch-size",
+        "-ub",
+        "--ubatch-size",
+        "-np",
+        "--parallel",
+        "-ctk",
+        "--cache-type-k",
+        "-ctv",
+        "--cache-type-v",
+        "-ncmoe",
+        "--n-cpu-moe",
+        "--fit",
+        "-rea",
+        "--reasoning",
+        "--ctx-checkpoints",
+        "--cache-ram",
+        "--temp",
+        "--repeat-penalty",
+        "--flash-attn",
+        "-mm",
+        "--mmproj",
+    }
+    bool_flags = {
+        "--no-mmproj",
+        "--no-mmproj-offload",
+        "--mmap",
+        "--no-mmap",
+        "--mlock",
+        "--verbose",
+        "--log-timestamps",
+        "--no-cont-batching",
+        "--no-cache-prompt",
+        "--context-shift",
+        "--no-webui",
+        "--jinja",
+    }
+    managed = {_flag_base(a) for a in existing_args if str(a).startswith("-")}
+    filtered: List[str] = []
+    i = 0
+    while i < len(extra):
+        arg = extra[i]
+        base = _flag_base(arg)
+        if base in managed and base in flags_with_values:
+            if "=" not in arg and i + 1 < len(extra) and not extra[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        if base in managed and base in bool_flags:
+            i += 1
+            continue
+        filtered.append(arg)
+        i += 1
+    return filtered
+
+
+def build_benchmark_args_from_params(
+    model_path: str,
+    params: Dict[str, Any],
+    prompt_tokens: int = 128,
+    generation_tokens: int = 256,
+) -> Optional[List[str]]:
+    """Сборка аргументов llama-bench для одного AutoTune-кандидата."""
+    if not model_path:
+        return None
+
+    args = ["-m", model_path, "-p", str(prompt_tokens), "-n", str(generation_tokens)]
+
+    # Важно: llama-bench CLI отличается от llama-server.
+    # В актуальных сборках llama-bench нет -c/-np/-tb/--ctx-checkpoints/--cache-ram/--no-mmproj.
+    # Context Size остаётся частью AutoTune-плана/пресета, но в llama-bench проверяется через
+    # выбранные prompt/gen размеры; полный server-context тест будет отдельным server-engine этапом.
+    ngl = params.get("ngl", "auto")
+    args += ["-ngl", "99" if str(ngl).lower() == "auto" else str(ngl)]
+
+    flash_attn = bool(params.get("flash_attn", True))
+    args += ["-fa", "1" if flash_attn else "0"]
+
+    args += [
+        "-ctk",
+        str(params.get("cache_type_k", "q8_0")),
+        "-ctv",
+        str(params.get("cache_type_v", "q8_0")),
+    ]
+
+    batch_size = int(params.get("batch_size") or 512)
+    ubatch_size = int(params.get("ubatch_size") or min(batch_size, 512))
+    args += ["-b", str(batch_size), "-ub", str(min(ubatch_size, batch_size))]
+
+    threads = int(params.get("threads") or 0)
+    if threads > 0:
+        args += ["-t", str(threads)]
+
+    ncmoe = int(params.get("ncmoe", -1))
+    if ncmoe >= 0:
+        args += ["-ncmoe", str(ncmoe)]
+
+    return args
+
+
 def build_args(
     cfg: Any, model_path: str, for_benchmark: bool = False
 ) -> Optional[List[str]]:
@@ -181,7 +304,7 @@ def build_args(
             errs = validate_extra_args(extra, cfg.model_dir)
             if errs:
                 raise ValueError("; ".join(errs))
-            args.extend(extra)
+            args.extend(_filter_duplicate_extra_args(extra, args))
         except ValueError as e:
             raise ValueError(f"Ошибка доп. параметров: {e}")
     return args

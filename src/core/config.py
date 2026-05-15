@@ -329,7 +329,13 @@ class ConfigManager:
         ]
         return f"{digest}::ctx={int(ctx_size)}"
 
-    def save_perf_preset(self, model_path: str, ctx_size: int, ui: Any) -> None:
+    def save_perf_preset(
+        self,
+        model_path: str,
+        ctx_size: int,
+        ui: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Сохраняет параметры производительности для пары:
         конкретная GGUF-модель + конкретный context size.
@@ -357,12 +363,16 @@ class ConfigManager:
 
         key = self._perf_preset_key(model_path, ctx_size)
 
-        root[key] = {
+        preset = {
             "model_path": str(model_path),
             "model_name": Path(model_path).name,
             "ctx_size": int(ctx_size),
             "params": params,
         }
+        if metadata:
+            preset["benchmark"] = metadata
+
+        root[key] = preset
 
         self.save_profiles()
 

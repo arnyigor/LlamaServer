@@ -1,7 +1,10 @@
 """LlamaServer GUI - точка входа."""
 
+import json
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -12,11 +15,13 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
+from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
 from src.core.mem_viz_parser import MemoryData, parse_line
 from src.core.server_manager import ServerManager
+from src.services.autotune_manager import AutoTuneManager
 from src.services.integration_manager import IntegrationManager
 from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
@@ -31,6 +36,11 @@ class LlamaGUI:
         self.server = ServerManager()
         self.scanner = None
         self.updater = None
+        self.autotune = None
+        self.autotune_plan = None
+        self.autotune_results_dir = ""
+        self.autotune_best_result = None
+        self._autotune_running = False
         self._restart_pending = False
         self._pending_restart_launch = None
         self._restart_needed = False
@@ -108,6 +118,14 @@ class LlamaGUI:
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
         u.save_preset_btn.clicked.connect(self.save_preset)
+        u.autotune_btn.clicked.connect(self.open_autotune_tab)
+        u.autotune.build_plan_requested.connect(self.build_autotune_plan)
+        u.autotune.start_requested.connect(self.start_autotune)
+        u.autotune.cancel_requested.connect(self.cancel_autotune)
+        u.autotune.apply_best_requested.connect(self.apply_autotune_best)
+        u.autotune.save_best_requested.connect(self.save_autotune_best_preset)
+        u.autotune.export_report_requested.connect(self.show_autotune_report_path)
+        u.autotune.open_results_requested.connect(self.open_autotune_results_folder)
 
         self.server.log_received.connect(
             lambda text, level: self.log_mgr.append(text, level)
@@ -706,6 +724,268 @@ class LlamaGUI:
         self.ui.start_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
 
+    def _current_model_info(self):
+        model_path = self._current_model_path()
+        if not model_path:
+            return {}
+        info = self.ui.models_by_path.get(model_path)
+        if not info:
+            info = extract_model_info(model_path)
+            self.ui.models_by_path[model_path] = info
+        return info
+
+    def open_autotune_tab(self):
+        """Открывает вкладку AutoTune и строит свежий план из текущих настроек."""
+        self.ui.tabs.setCurrentWidget(self.ui.autotune)
+        self.build_autotune_plan()
+
+    def build_autotune_plan(self):
+        model_path = self._current_model_path()
+        if not model_path:
+            QMessageBox.warning(self.ui, "AutoTune", "Select a GGUF model first")
+            return None
+        self.config.read_from_ui(self.ui)
+        options = self.ui.autotune.options()
+        plan = build_autotune_plan(
+            self.config.settings,
+            model_path,
+            self._current_model_info(),
+            mode=options["mode"],
+            target=options["target"],
+            engine=options["engine"],
+            time_budget_sec=options["time_budget_sec"],
+            max_runs=options["max_runs"],
+            repeat_top=options["repeat_top"],
+        )
+        self.autotune_plan = plan
+        self.autotune_best_result = None
+        self.autotune_results_dir = ""
+        self.ui.autotune.set_plan(plan)
+        self.ui.tabs.setCurrentWidget(self.ui.autotune)
+        self.log_mgr.append(
+            f"AutoTune plan built: {len(plan.candidates)} candidates | ctx={plan.ctx_size:,} | {plan.mode}/{plan.target}"
+        )
+        return plan
+
+    def _external_llama_processes(self):
+        """Ищет orphan/external llama.cpp процессы, которые ломают benchmark."""
+        if not sys.platform.startswith("win"):
+            return []
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.Name -match '^llama-(server|bench)(\\.exe)?$' } | "
+                    "Select-Object ProcessId,Name,ExecutablePath | ConvertTo-Json -Compress",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                encoding="utf-8",
+                errors="ignore",
+            )
+            text = (proc.stdout or "").strip()
+            if not text:
+                return []
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data = [data]
+            return [p for p in data if isinstance(p, dict)]
+        except Exception:
+            return []
+
+    def _warn_if_external_llama_processes(self) -> bool:
+        processes = self._external_llama_processes()
+        if not processes:
+            return False
+        details = "\n".join(
+            f"PID {p.get('ProcessId')}: {p.get('Name')} — {p.get('ExecutablePath') or ''}"
+            for p in processes[:8]
+        )
+        QMessageBox.warning(
+            self.ui,
+            "AutoTune blocked",
+            "Found already running llama.cpp process. It can occupy VRAM/GPU and make AutoTune results invalid.\n\n"
+            "Stop it first, then start AutoTune again.\n\n"
+            f"{details}",
+        )
+        self.log_mgr.append(
+            "AutoTune blocked: external llama.cpp process is running. Stop it before benchmarking.",
+            "warn",
+        )
+        return True
+
+    def start_autotune(self):
+        if self.server.is_server_running() or self.server.is_bench_running():
+            QMessageBox.warning(
+                self.ui, "AutoTune", "Stop server/manual benchmark before AutoTune"
+            )
+            return
+        if self._warn_if_external_llama_processes():
+            return
+        if self.autotune and self.autotune.isRunning():
+            return
+        self.auto_detect_bench()
+        bexe = self.ui.bench_path.text().strip()
+        if not bexe or not os.path.exists(bexe):
+            QMessageBox.critical(self.ui, "AutoTune", "Specify path to llama-bench.exe")
+            return
+        plan = self.autotune_plan or self.build_autotune_plan()
+        if not plan:
+            return
+        options = self.ui.autotune.options()
+        if str(options.get("engine", "llama-bench")) == "llama-server":
+            QMessageBox.information(
+                self.ui,
+                "AutoTune",
+                "Server AutoTune is planned for a later version. MVP uses llama-bench.",
+            )
+            return
+        self.ui.autotune.clear_results()
+        self.ui.autotune.set_plan(plan)
+        self.autotune_best_result = None
+        self.autotune_results_dir = ""
+        self.autotune = AutoTuneManager(
+            bexe,
+            plan,
+            model_info=self._current_model_info(),
+            prompt_tokens=self.ui.bench_prompt.value(),
+            generation_tokens=self.ui.bench_gen.value(),
+            per_run_timeout_sec=options["per_run_timeout_sec"],
+        )
+        self.ui.autotune.prepare_run(len(plan.candidates), options["per_run_timeout_sec"])
+        self.autotune.log.connect(lambda text, level: self.log_mgr.append(text, level))
+        self.autotune.log.connect(lambda text, _level: self.ui.autotune.append_activity(text))
+        self.autotune.progress.connect(self.ui.autotune.set_progress)
+        self.autotune.run_started.connect(self.ui.autotune.mark_running)
+        self.autotune.run_finished.connect(self.ui.autotune.update_result)
+        self.autotune.autotune_finished.connect(self._on_autotune_finished)
+        self.autotune.finished.connect(self.update_action_buttons)
+        self._autotune_running = True
+        self.ui.autotune.set_running(True)
+        self.autotune.start()
+        self.update_action_buttons()
+
+    def cancel_autotune(self):
+        if self.autotune and self.autotune.isRunning():
+            self.log_mgr.append("AutoTune cancel requested", "warn")
+            self.autotune.cancel()
+
+    def _best_autotune_params(self):
+        if not self.autotune_plan or not self.autotune_best_result:
+            return {}
+        for candidate in self.autotune_plan.candidates:
+            if candidate.id == self.autotune_best_result.candidate_id:
+                return dict(candidate.params)
+        return {}
+
+    def _on_autotune_finished(self, best, output_dir):
+        self.autotune_best_result = best
+        self.autotune_results_dir = output_dir
+        self._autotune_running = False
+        self.ui.autotune.set_running(False)
+        self.ui.autotune.show_best(best, self._best_autotune_params(), output_dir)
+        if best:
+            self.log_mgr.append(
+                f"AutoTune finished: best={best.candidate_id}, score={best.score:.3f}, results={output_dir}"
+            )
+        else:
+            self.log_mgr.append(f"AutoTune finished: no successful result, results={output_dir}", "warn")
+        self.update_action_buttons()
+
+    def apply_autotune_best(self, silent=False):
+        params = self._best_autotune_params()
+        if not params:
+            if not silent:
+                QMessageBox.warning(self.ui, "AutoTune", "No best result to apply")
+            return False
+
+        self._loading_preset = True
+        try:
+            ngl = params.get("ngl", "auto")
+            is_auto_ngl = str(ngl).lower() == "auto"
+            self.ui.gpu_auto.setChecked(is_auto_ngl)
+            if not is_auto_ngl:
+                self.ui.gpu_layers.setValue(int(ngl))
+            self.ui.ctx_size.setValue(int(params.get("ctx_size", self.ui.ctx_size.value())))
+            self.ui.batch_size.setValue(int(params.get("batch_size", self.ui.batch_size.value())))
+            self.ui.ubatch_size.setValue(int(params.get("ubatch_size", self.ui.ubatch_size.value())))
+            self.ui.cache_type_k.setCurrentText(str(params.get("cache_type_k", self.ui.cache_type_k.currentText())))
+            self.ui.cache_type_v.setCurrentText(str(params.get("cache_type_v", self.ui.cache_type_v.currentText())))
+            self.ui.threads.setValue(int(params.get("threads", self.ui.threads.value())))
+            self.ui.threads_batch.setValue(int(params.get("threads_batch", self.ui.threads_batch.value())))
+            self.ui.parallel_slots.setValue(int(params.get("parallel_slots", self.ui.parallel_slots.value())))
+            self.ui.flash_attn.setChecked(bool(params.get("flash_attn", self.ui.flash_attn.isChecked())))
+            self.ui.fit_off.setChecked(bool(params.get("fit_off", self.ui.fit_off.isChecked())))
+            self.ui.cache_prompt.setChecked(bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked())))
+            self.ui.cpu_moe_layers.setValue(int(params.get("ncmoe", self.ui.cpu_moe_layers.value())))
+            self.ui.ctx_checkpoints.setValue(int(params.get("ctx_checkpoints", self.ui.ctx_checkpoints.value())))
+            self.ui.cache_ram.setValue(int(params.get("cache_ram", self.ui.cache_ram.value())))
+            self.ui.use_mmproj.setChecked(bool(params.get("use_mmproj", self.ui.use_mmproj.isChecked())))
+        finally:
+            self._loading_preset = False
+
+        self.update_cli_preview()
+        self._mark_restart_needed()
+        self.save_settings()
+        self.log_mgr.append(
+            f"AutoTune best applied: {self.autotune_best_result.candidate_id if self.autotune_best_result else ''}"
+        )
+        if not silent:
+            QMessageBox.information(self.ui, "AutoTune", "Best parameters applied to UI")
+        return True
+
+    def save_autotune_best_preset(self):
+        model_path = self._current_model_path()
+        if not model_path or not self.autotune_best_result:
+            QMessageBox.warning(self.ui, "AutoTune", "No best result to save")
+            return
+        if not self.apply_autotune_best(silent=True):
+            return
+        ctx = self.ui.ctx_size.value()
+        metadata = {
+            "source": "autotune",
+            "run_id": self.autotune_best_result.candidate_id,
+            "score": self.autotune_best_result.score,
+            "prompt_tok_s": self.autotune_best_result.prompt_tok_s,
+            "generation_tok_s": self.autotune_best_result.generation_tok_s,
+            "load_time_sec": self.autotune_best_result.load_time_sec,
+            "vram_used_mib": self.autotune_best_result.vram_used_mib,
+            "ram_used_mib": self.autotune_best_result.ram_used_mib,
+            "results_dir": self.autotune_results_dir,
+        }
+        try:
+            self.config.save_perf_preset(model_path, ctx, self.ui, metadata=metadata)
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self.ui, "AutoTune", str(e))
+            return
+        self.log_mgr.append(f"AutoTune preset saved: {Path(model_path).name} | ctx={ctx:,}")
+        QMessageBox.information(self.ui, "AutoTune", "Best AutoTune preset saved")
+
+    def show_autotune_report_path(self):
+        if not self.autotune_results_dir:
+            QMessageBox.information(self.ui, "AutoTune", "No report yet")
+            return
+        QMessageBox.information(
+            self.ui,
+            "AutoTune Report",
+            f"results.json and report.md are saved in:\n{self.autotune_results_dir}",
+        )
+
+    def open_autotune_results_folder(self):
+        if not self.autotune_results_dir or not os.path.isdir(self.autotune_results_dir):
+            QMessageBox.information(self.ui, "AutoTune", "No results folder yet")
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(self.autotune_results_dir)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", self.autotune_results_dir])
+        else:
+            subprocess.Popen(["xdg-open", self.autotune_results_dir])
+
     def stop_work(self):
         if self._restart_pending:
             self._restart_pending = False
@@ -715,6 +995,8 @@ class LlamaGUI:
             self.server.stop_server()
         if self.server.is_bench_running():
             self.server.stop_bench()
+        if self.autotune and self.autotune.isRunning():
+            self.autotune.cancel()
         if self.scanner and self.scanner.isRunning():
             self.scanner.requestInterruption()
         self.update_action_buttons()
@@ -737,7 +1019,8 @@ class LlamaGUI:
         bnch = self.server.is_bench_running()
         scan = self.scanner and self.scanner.isRunning()
         upd = self.updater and self.updater.isRunning()
-        busy = srv or bnch or scan or self._restart_pending
+        tune = self._autotune_running or (self.autotune and self.autotune.isRunning())
+        busy = srv or bnch or scan or tune or self._restart_pending
         show_reload = srv or self._restart_pending
         self.ui.start_btn.setVisible(not show_reload)
         self.ui.reload_btn.setVisible(show_reload)
@@ -750,10 +1033,15 @@ class LlamaGUI:
             and not bnch
             and not scan
             and not upd
+            and not tune
             and not self._restart_pending
             and not self.server.server_stop_requested
         )
         self.ui.test_btn.setEnabled(not busy and not upd)
+        self.ui.autotune_btn.setEnabled(not busy and not upd)
+        self.ui.autotune.start_btn.setEnabled(not busy and not upd)
+        self.ui.autotune.build_plan_btn.setEnabled(not busy and not upd)
+        self.ui.autotune.cancel_btn.setEnabled(bool(tune))
         if not srv and not self._restart_pending:
             self._reset_restart_indicator()
 
@@ -842,6 +1130,9 @@ class LlamaGUI:
         if self.scanner and self.scanner.isRunning():
             self.scanner.requestInterruption()
             self.scanner.wait(1000)
+        if self.autotune and self.autotune.isRunning():
+            self.autotune.cancel()
+            self.autotune.wait(2000)
         if hasattr(self, "tray"):
             self.tray.hide()
         QApplication.instance().quit()

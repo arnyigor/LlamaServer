@@ -190,6 +190,35 @@ class TestPerfPresetsUI(unittest.TestCase):
 
         self._assert_saved_values_loaded()
 
+    def test_left_autotune_button_opens_tab_and_builds_plan(self):
+        self.ui.ctx_size.setValue(16384)
+        self.assertTrue(hasattr(self.ui, "autotune_btn"))
+
+        self.ui.autotune_btn.click()
+
+        self.assertIs(self.ui.tabs.currentWidget(), self.ui.autotune)
+        self.assertIsNotNone(self.gui.autotune_plan)
+        self.assertEqual(self.gui.autotune_plan.ctx_size, 16384)
+        self.assertGreater(self.ui.autotune.table.rowCount(), 0)
+
+    def test_autotune_widget_shows_running_indicator(self):
+        self.ui.ctx_size.setValue(16384)
+        plan = self.gui.build_autotune_plan()
+        self.assertIsNotNone(plan)
+
+        self.ui.autotune.prepare_run(len(plan.candidates), 300)
+        self.ui.autotune.set_running(True)
+        self.ui.autotune.set_progress(1, len(plan.candidates))
+        self.ui.autotune.mark_running(plan.candidates[0])
+
+        self.assertFalse(self.ui.autotune.progress_bar.isHidden())
+        self.assertEqual(self.ui.autotune.progress_bar.value(), 1)
+        self.assertIn("AutoTune running", self.ui.autotune.status_label.text())
+        self.assertIn("ETA", self.ui.autotune.progress_summary.text())
+        self.assertIn(plan.candidates[0].id, self.ui.autotune.current_run_label.text())
+        self.assertIn("START", self.ui.autotune.activity_log.toPlainText())
+        self.assertEqual(self.ui.autotune.start_btn.text(), "AutoTune running...")
+
 
 if __name__ == "__main__":
     unittest.main()
