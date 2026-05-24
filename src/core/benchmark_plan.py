@@ -62,8 +62,7 @@ def _is_moe(model_info: Dict[str, Any]) -> bool:
 
 def _is_mtp_model(model_info: Dict[str, Any]) -> bool:
     text = " ".join(
-        str(model_info.get(k) or "")
-        for k in ("path", "name", "display", "_model_path")
+        str(model_info.get(k) or "") for k in ("path", "name", "display", "_model_path")
     ).lower()
     return "mtp" in text
 
@@ -92,9 +91,9 @@ def _kv_candidates(
         if not quick:
             vals.insert(2, ("q4_0", "q8_0"))
     elif _is_mtp_model(model_info or {}) and key != "low_vram":
-        # MTP speculative decoding in llama.cpp/LM Studio is typically fastest
-        # with f16 target KV and f16 draft KV when enough VRAM is available.
-        vals = [("f16", "f16"), ("q8_0", "q8_0"), ("q4_0", "q4_0")]
+        # MTP план стартует с Q8 KV: он обычно ближе к рабочей VRAM-цели
+        # на 32K+, а f16 оставляем как quality-соседа для проверки.
+        vals = [("q8_0", "q8_0"), ("f16", "f16"), ("q4_0", "q4_0")]
     elif key == "quality_kv":
         vals = [("f16", "f16"), ("q8_0", "q8_0")]
         if not quick:
@@ -136,10 +135,18 @@ def _gpu_layers_for_estimate(settings: Any, model_info: Dict[str, Any]) -> int:
     return _clamp_layer_value(int(getattr(settings, "gpu_layers", 0) or 0), model_info)
 
 
-def _ngl_candidates(settings: Any, model_info: Dict[str, Any], mode: str, target: str) -> List[int]:
+def _ngl_candidates(
+    settings: Any, model_info: Dict[str, Any], mode: str, target: str
+) -> List[int]:
     """Small NGL search space: full offload plus nearby/current fallbacks."""
     full = _full_ngl_for_model(model_info)
-    current = full if getattr(settings, "gpu_auto", True) else _clamp_layer_value(int(getattr(settings, "gpu_layers", 0) or 0), model_info)
+    current = (
+        full
+        if getattr(settings, "gpu_auto", True)
+        else _clamp_layer_value(
+            int(getattr(settings, "gpu_layers", 0) or 0), model_info
+        )
+    )
     vals = [current, full]
 
     # Low VRAM and MoE often benefit from testing a slightly lower offload level;
@@ -159,7 +166,9 @@ def _ngl_candidates(settings: Any, model_info: Dict[str, Any], mode: str, target
     return result
 
 
-def _clamp_ncmoe_value(value: int, model_info: Dict[str, Any], ngl: int | None = None) -> int:
+def _clamp_ncmoe_value(
+    value: int, model_info: Dict[str, Any], ngl: int | None = None
+) -> int:
     if value < 0:
         return -1
     blocks = _block_count(model_info)
@@ -171,19 +180,25 @@ def _clamp_ncmoe_value(value: int, model_info: Dict[str, Any], ngl: int | None =
     return max(0, min(int(value), max_value))
 
 
-def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int, ngl: int | None = None) -> int:
+def _recommended_ncmoe(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int, ngl: int | None = None
+) -> int:
     if not _is_moe(model_info):
         # Для dense-моделей -ncmoe неприменим. Не переносим сюда stale-значение
         # из UI, оставшееся после MoE-модели.
         return -1
-    effective_ngl = _gpu_layers_for_estimate(settings, model_info) if ngl is None else _clamp_layer_value(ngl, model_info)
+    effective_ngl = (
+        _gpu_layers_for_estimate(settings, model_info)
+        if ngl is None
+        else _clamp_layer_value(ngl, model_info)
+    )
     mtp_model = _is_mtp_model(model_info)
     advice = compute_moe_advice(
         model_info,
         ctx_size,
         effective_ngl,
-        "f16" if mtp_model else "q8_0",
-        "f16" if mtp_model else "q8_0",
+        "q8_0",
+        "q8_0",
         bool(getattr(settings, "flash_attn", True)),
         4 if mtp_model else max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
     )
@@ -200,7 +215,11 @@ def _detect_total_vram_gib() -> float:
             encoding="utf-8",
             errors="ignore",
         )
-        values = [float(x.strip()) / 1024.0 for x in (proc.stdout or "").splitlines() if x.strip()]
+        values = [
+            float(x.strip()) / 1024.0
+            for x in (proc.stdout or "").splitlines()
+            if x.strip()
+        ]
         return max(values) if values else 0.0
     except Exception:
         return 0.0
@@ -209,7 +228,9 @@ def _detect_total_vram_gib() -> float:
 def _vram_budget_gib(settings: Any, model_info: Dict[str, Any]) -> float:
     for source in (settings, model_info):
         for key in ("vram_budget_gib", "vram_gib", "gpu_vram_gib"):
-            value = getattr(source, key, None) if source is settings else source.get(key)
+            value = (
+                getattr(source, key, None) if source is settings else source.get(key)
+            )
             try:
                 if value and float(value) > 0:
                     return float(value)
@@ -237,7 +258,9 @@ def _estimate_vram_gib(params: Dict[str, Any], model_info: Dict[str, Any]) -> fl
     return float(estimate.total_gib)
 
 
-def _vram_targeted_ncmoe_values(settings: Any, model_info: Dict[str, Any], base: Dict[str, Any]) -> List[int]:
+def _vram_targeted_ncmoe_values(
+    settings: Any, model_info: Dict[str, Any], base: Dict[str, Any]
+) -> List[int]:
     if not _is_moe(model_info):
         return []
     ngl = int(base.get("ngl") or 0)
@@ -251,7 +274,9 @@ def _vram_targeted_ncmoe_values(settings: Any, model_info: Dict[str, Any], base:
     if current >= 0:
         values.append(_clamp_ncmoe_value(current, model_info, ngl))
 
-    recommended = _recommended_ncmoe(settings, model_info, int(base.get("ctx_size") or 0), ngl)
+    recommended = _recommended_ncmoe(
+        settings, model_info, int(base.get("ctx_size") or 0), ngl
+    )
     if recommended >= 0:
         values.append(recommended)
 
@@ -288,7 +313,9 @@ def _vram_targeted_ncmoe_values(settings: Any, model_info: Dict[str, Any], base:
     return result
 
 
-def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Dict[str, Any]:
+def _base_params(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int
+) -> Dict[str, Any]:
     logical = max(os.cpu_count() or 4, 1)
     threads = int(getattr(settings, "threads", logical) or logical)
     batch = int(getattr(settings, "batch_size", 512) or 512)
@@ -315,7 +342,13 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
     mtp_model = _is_mtp_model(model_info)
     parallel_slots = 4 if mtp_model else 1
     current_ncmoe = int(getattr(settings, "cpu_moe_layers", -1) or -1)
-    base_ncmoe = _clamp_ncmoe_value(current_ncmoe, model_info, _gpu_layers_for_estimate(settings, model_info)) if mtp_model and current_ncmoe >= 0 else -1
+    base_ncmoe = (
+        _clamp_ncmoe_value(
+            current_ncmoe, model_info, _gpu_layers_for_estimate(settings, model_info)
+        )
+        if mtp_model and current_ncmoe >= 0
+        else -1
+    )
 
     return {
         "ngl": _gpu_layers_for_estimate(settings, model_info),
@@ -355,7 +388,11 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
 
 
 def _append_unique(
-    candidates: List[BenchmarkCandidate], seen: set, params: Dict[str, Any], reason: str, stage: str
+    candidates: List[BenchmarkCandidate],
+    seen: set,
+    params: Dict[str, Any],
+    reason: str,
+    stage: str,
 ) -> None:
     norm = tuple(sorted((k, str(v)) for k, v in params.items()))
     if norm in seen:
@@ -365,16 +402,22 @@ def _append_unique(
     candidates.append(BenchmarkCandidate(cid, dict(params), reason, stage))
 
 
-def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, target: str) -> List[BenchmarkCandidate]:
+def _quick_candidates(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int, target: str
+) -> List[BenchmarkCandidate]:
     base = _base_params(settings, model_info, ctx_size)
     candidates: List[BenchmarkCandidate] = []
     seen: set = set()
 
     safe_ubatch = 256 if ctx_size >= 131072 and not _is_moe(model_info) else 512
     if _is_mtp_model(model_info):
-        safe_kv = ("f16", "f16")
+        safe_kv = ("q8_0", "q8_0")
     else:
-        safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
+        safe_kv = (
+            ("q4_0", "q4_0")
+            if ctx_size >= 131072 and not _is_moe(model_info)
+            else ("q8_0", "q8_0")
+        )
     base.update(
         {
             "cache_type_k": safe_kv[0],
@@ -389,7 +432,13 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
         for ncmoe in _vram_targeted_ncmoe_values(settings, model_info, base):
             p = dict(base, ncmoe=ncmoe)
             estimated = _estimate_vram_gib(p, model_info)
-            _append_unique(candidates, seen, p, f"VRAM-target MoE ncmoe {ncmoe} (~{estimated:.1f} GiB)", "moe_vram")
+            _append_unique(
+                candidates,
+                seen,
+                p,
+                f"VRAM-target MoE ncmoe {ncmoe} (~{estimated:.1f} GiB)",
+                "moe_vram",
+            )
 
     for ngl in _ngl_candidates(settings, model_info, "quick", target):
         p = dict(base, ngl=ngl)
@@ -420,7 +469,11 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
 
     expert_count = int(model_info.get("expert_count") or 0)
     block_count = int(model_info.get("block_count") or 0)
-    should_test_moe = _target_key(target) == "moe_optimized" or ctx_size >= 131072 or _is_mtp_model(model_info)
+    should_test_moe = (
+        _target_key(target) == "moe_optimized"
+        or ctx_size >= 131072
+        or _is_mtp_model(model_info)
+    )
     if expert_count > 1 and should_test_moe:
         base_ngl = int(base.get("ngl") or 0)
         recommended = _recommended_ncmoe(settings, model_info, ctx_size, base_ngl)
@@ -435,16 +488,29 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
     return candidates
 
 
-def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, target: str, mode: str) -> List[BenchmarkCandidate]:
+def _normal_or_deep_candidates(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int, target: str, mode: str
+) -> List[BenchmarkCandidate]:
     candidates = _quick_candidates(settings, model_info, ctx_size, target)
     seen = {tuple(sorted((k, str(v)) for k, v in c.params.items())) for c in candidates}
     base = _base_params(settings, model_info, ctx_size)
     safe_ubatch = 256 if ctx_size >= 131072 and not _is_moe(model_info) else 512
     if _is_mtp_model(model_info):
-        safe_kv = ("f16", "f16")
+        safe_kv = ("q8_0", "q8_0")
     else:
-        safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
-    base.update({"cache_type_k": safe_kv[0], "cache_type_v": safe_kv[1], "batch_size": 1024, "ubatch_size": safe_ubatch})
+        safe_kv = (
+            ("q4_0", "q4_0")
+            if ctx_size >= 131072 and not _is_moe(model_info)
+            else ("q8_0", "q8_0")
+        )
+    base.update(
+        {
+            "cache_type_k": safe_kv[0],
+            "cache_type_v": safe_kv[1],
+            "batch_size": 1024,
+            "ubatch_size": safe_ubatch,
+        }
+    )
 
     batch_values: Iterable[int] = (512, 1024, 2048, 4096)
     ubatch_values: Iterable[int] = (128, 256, 512, 1024)
@@ -470,8 +536,20 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
     if _mode_key(mode) == "deep":
         for ctk, ctv in _kv_candidates(target, mode, ctx_size, model_info)[:3]:
             for batch in (2048, 4096):
-                p = dict(base, cache_type_k=ctk, cache_type_v=ctv, batch_size=batch, ubatch_size=min(safe_ubatch, batch))
-                _append_unique(candidates, seen, p, f"deep KV/batch {ctk}/{ctv} b={batch}", "kv_batch")
+                p = dict(
+                    base,
+                    cache_type_k=ctk,
+                    cache_type_v=ctv,
+                    batch_size=batch,
+                    ubatch_size=min(safe_ubatch, batch),
+                )
+                _append_unique(
+                    candidates,
+                    seen,
+                    p,
+                    f"deep KV/batch {ctk}/{ctv} b={batch}",
+                    "kv_batch",
+                )
 
     best_batch = 2048
     for ubatch in ubatch_values:
@@ -484,12 +562,16 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
         if threads <= logical:
             for tb in (0, threads, max(1, logical - 1)):
                 p = dict(base, threads=threads, threads_batch=tb)
-                _append_unique(candidates, seen, p, f"threads {threads}/tb {tb}", "threads")
+                _append_unique(
+                    candidates, seen, p, f"threads {threads}/tb {tb}", "threads"
+                )
 
     if ctx_size >= 65536:
         for checkpoints in (0, 2, 4):
             p = dict(base, ctx_checkpoints=checkpoints)
-            _append_unique(candidates, seen, p, f"ctx-checkpoints {checkpoints}", "memory")
+            _append_unique(
+                candidates, seen, p, f"ctx-checkpoints {checkpoints}", "memory"
+            )
         for cache_ram in (0, 2048, 4096, 8192):
             p = dict(base, cache_ram=cache_ram)
             _append_unique(candidates, seen, p, f"cache-ram {cache_ram}", "memory")
@@ -501,7 +583,11 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
         recommended = _recommended_ncmoe(settings, model_info, ctx_size, base_ngl)
         moe_values = [recommended, 0]
         if block_count > 0:
-            moe_values += [max(1, block_count // 4), max(1, block_count // 2), max(1, block_count * 3 // 4)]
+            moe_values += [
+                max(1, block_count // 4),
+                max(1, block_count // 2),
+                max(1, block_count * 3 // 4),
+            ]
         moe_values.append(-1)
         for ncmoe in moe_values:
             ncmoe = _clamp_ncmoe_value(ncmoe, model_info, base_ngl)
@@ -536,7 +622,9 @@ def build_autotune_plan(
     if mode_key == "quick":
         candidates = _quick_candidates(settings, info, ctx_size, target)
     else:
-        candidates = _normal_or_deep_candidates(settings, info, ctx_size, target, mode_key)
+        candidates = _normal_or_deep_candidates(
+            settings, info, ctx_size, target, mode_key
+        )
 
     candidates = candidates[: max(1, run_limit)]
     return AutoTunePlan(

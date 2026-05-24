@@ -12,7 +12,12 @@ from src.core.benchmark_plan import build_autotune_plan
 from src.core.benchmark_scorer import score_result
 from src.core.cli_builder import build_benchmark_args_from_params
 from src.services.benchmark_runner import BenchmarkRunner, parse_llama_bench_output
-from src.services.report_writer import write_best, write_json_report, write_markdown_report, write_plan
+from src.services.report_writer import (
+    write_best,
+    write_json_report,
+    write_markdown_report,
+    write_plan,
+)
 
 
 @dataclass
@@ -98,10 +103,15 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertEqual(plan.candidates[0].params["ctx_checkpoints"], 0)
         self.assertEqual(plan.candidates[0].params["cache_ram"], 0)
 
-        normalized = [tuple(sorted((k, str(v)) for k, v in c.params.items())) for c in plan.candidates]
+        normalized = [
+            tuple(sorted((k, str(v)) for k, v in c.params.items()))
+            for c in plan.candidates
+        ]
         self.assertEqual(len(normalized), len(set(normalized)))
         for candidate in plan.candidates:
-            self.assertLessEqual(candidate.params["ubatch_size"], candidate.params["batch_size"])
+            self.assertLessEqual(
+                candidate.params["ubatch_size"], candidate.params["batch_size"]
+            )
 
     def test_low_vram_plan_prioritizes_quantized_kv(self):
         settings = AutoTuneSettingsStub(ctx_size=-1)
@@ -115,11 +125,16 @@ class TestAutoTunePlan(unittest.TestCase):
         )
 
         self.assertEqual(plan.ctx_size, 32768)
-        kv_pairs = [(c.params["cache_type_k"], c.params["cache_type_v"]) for c in plan.candidates]
+        kv_pairs = [
+            (c.params["cache_type_k"], c.params["cache_type_v"])
+            for c in plan.candidates
+        ]
         self.assertIn(("q4_0", "q4_0"), kv_pairs)
 
     def test_dense_huge_context_plan_does_not_use_moe_and_starts_memory_safe(self):
-        settings = AutoTuneSettingsStub(ctx_size=131072, cpu_moe_layers=99, ubatch_size=-1)
+        settings = AutoTuneSettingsStub(
+            ctx_size=131072, cpu_moe_layers=99, ubatch_size=-1
+        )
         plan = build_autotune_plan(
             settings,
             "dense.gguf",
@@ -149,8 +164,12 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertFalse(any(c.stage == "moe" for c in plan.candidates))
         self.assertTrue(all(c.params["ncmoe"] == -1 for c in plan.candidates))
 
-    def test_moe_regular_context_does_not_apply_stale_server_params_to_all_candidates(self):
-        settings = AutoTuneSettingsStub(ctx_size=32768, cpu_moe_layers=8, parallel_slots=2)
+    def test_moe_regular_context_does_not_apply_stale_server_params_to_all_candidates(
+        self,
+    ):
+        settings = AutoTuneSettingsStub(
+            ctx_size=32768, cpu_moe_layers=8, parallel_slots=2
+        )
         plan = build_autotune_plan(
             settings,
             "moe.gguf",
@@ -179,7 +198,9 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertFalse(any(c.stage == "moe" for c in plan.candidates))
 
     def test_mtp_moe_plan_uses_real_ngl_speculative_and_ncmoe_candidates(self):
-        settings = AutoTuneSettingsStub(ctx_size=32768, cpu_moe_layers=8, parallel_slots=1)
+        settings = AutoTuneSettingsStub(
+            ctx_size=32768, cpu_moe_layers=8, parallel_slots=1
+        )
         plan = build_autotune_plan(
             settings,
             "G:/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
@@ -202,12 +223,14 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertEqual(plan.candidates[0].params["parallel_slots"], 4)
         self.assertTrue(plan.candidates[0].params["kv_unified"])
         self.assertTrue(plan.candidates[0].params["speculative_mtp"])
-        self.assertEqual(plan.candidates[0].params["cache_type_k"], "f16")
-        self.assertEqual(plan.candidates[0].params["cache_type_v"], "f16")
+        self.assertEqual(plan.candidates[0].params["cache_type_k"], "q8_0")
+        self.assertEqual(plan.candidates[0].params["cache_type_v"], "q8_0")
         moe_candidates = [c for c in plan.candidates if c.stage in {"moe", "moe_vram"}]
         self.assertGreaterEqual(len(moe_candidates), 1)
         self.assertEqual(plan.candidates[0].params["ncmoe"], 8)
-        self.assertTrue(all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
+        self.assertTrue(
+            all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates)
+        )
 
     def test_moe_huge_context_quick_keeps_moe_candidates_limited(self):
         settings = AutoTuneSettingsStub(ctx_size=131072, cpu_moe_layers=8)
@@ -234,7 +257,9 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertTrue(all(c.params["ctx_checkpoints"] == 0 for c in plan.candidates))
         self.assertTrue(all(c.params["cache_ram"] == 0 for c in plan.candidates))
         self.assertTrue(all(c.params["ngl"] <= 30 for c in plan.candidates))
-        self.assertTrue(all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
+        self.assertTrue(
+            all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates)
+        )
 
 
 class TestAutoTuneScoring(unittest.TestCase):
@@ -264,7 +289,9 @@ class TestAutoTuneScoring(unittest.TestCase):
         good = self._result()
         aggressive = self._result()
 
-        good_score = score_result(good, {"cache_type_k": "f16", "cache_type_v": "f16"}, "quality_kv")
+        good_score = score_result(
+            good, {"cache_type_k": "f16", "cache_type_v": "f16"}, "quality_kv"
+        )
         aggressive_score = score_result(
             aggressive,
             {"cache_type_k": "q4_0", "cache_type_v": "q4_0"},
@@ -278,12 +305,28 @@ class TestAutoTuneScoring(unittest.TestCase):
         q4 = self._result()
         f16_score = score_result(
             f16,
-            {"ctx_size": 131072, "cache_type_k": "f16", "cache_type_v": "f16", "ncmoe": -1, "model_type": "dense", "cache_ram": 0, "ctx_checkpoints": 0},
+            {
+                "ctx_size": 131072,
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "ncmoe": -1,
+                "model_type": "dense",
+                "cache_ram": 0,
+                "ctx_checkpoints": 0,
+            },
             "balanced",
         )
         q4_score = score_result(
             q4,
-            {"ctx_size": 131072, "cache_type_k": "q4_0", "cache_type_v": "q4_0", "ncmoe": -1, "model_type": "dense", "cache_ram": 0, "ctx_checkpoints": 0},
+            {
+                "ctx_size": 131072,
+                "cache_type_k": "q4_0",
+                "cache_type_v": "q4_0",
+                "ncmoe": -1,
+                "model_type": "dense",
+                "cache_ram": 0,
+                "ctx_checkpoints": 0,
+            },
             "balanced",
         )
 
@@ -294,12 +337,28 @@ class TestAutoTuneScoring(unittest.TestCase):
         q4 = self._result()
         q8_score = score_result(
             q8,
-            {"ctx_size": 131072, "cache_type_k": "q8_0", "cache_type_v": "q8_0", "ncmoe": -1, "model_type": "moe", "cache_ram": 0, "ctx_checkpoints": 0},
+            {
+                "ctx_size": 131072,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "ncmoe": -1,
+                "model_type": "moe",
+                "cache_ram": 0,
+                "ctx_checkpoints": 0,
+            },
             "balanced",
         )
         q4_score = score_result(
             q4,
-            {"ctx_size": 131072, "cache_type_k": "q4_0", "cache_type_v": "q4_0", "ncmoe": -1, "model_type": "moe", "cache_ram": 0, "ctx_checkpoints": 0},
+            {
+                "ctx_size": 131072,
+                "cache_type_k": "q4_0",
+                "cache_type_v": "q4_0",
+                "ncmoe": -1,
+                "model_type": "moe",
+                "cache_ram": 0,
+                "ctx_checkpoints": 0,
+            },
             "balanced",
         )
 
@@ -335,9 +394,15 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
             def poll(self):
                 return 0
 
-        candidate = BenchmarkCandidate("run_001", {"ctx_size": 8192}, "test", "baseline")
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "src.services.benchmark_runner.subprocess.Popen", return_value=DummyProcess()
+        candidate = BenchmarkCandidate(
+            "run_001", {"ctx_size": 8192}, "test", "baseline"
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "src.services.benchmark_runner.subprocess.Popen",
+                return_value=DummyProcess(),
+            ),
         ):
             runner = BenchmarkRunner("llama-bench.exe", "model.gguf", tmpdir)
             result = runner.run(candidate, 128, 256, 60)
@@ -358,8 +423,12 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
                 return 0
 
         candidate = BenchmarkCandidate("run_002", {"ctx_size": 131072}, "oom", "memory")
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "src.services.benchmark_runner.subprocess.Popen", return_value=DummyProcess()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "src.services.benchmark_runner.subprocess.Popen",
+                return_value=DummyProcess(),
+            ),
         ):
             runner = BenchmarkRunner("llama-bench.exe", "model.gguf", tmpdir)
             result = runner.run(candidate, 128, 256, 60)
@@ -398,7 +467,9 @@ class TestAutoTuneReports(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_path = write_plan(tmpdir, plan)
-            json_path = write_json_report(tmpdir, plan, {"architecture": "gemma", "quant": "Q4"}, [result], result)
+            json_path = write_json_report(
+                tmpdir, plan, {"architecture": "gemma", "quant": "Q4"}, [result], result
+            )
             report_path = write_markdown_report(tmpdir, plan, {}, [result], result)
             best_path = write_best(tmpdir, result, candidate.params)
 
@@ -409,7 +480,9 @@ class TestAutoTuneReports(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["best_run_id"], "run_001")
             self.assertEqual(payload["runs"][0]["params"]["ctx_size"], 8192)
-            self.assertIn("AutoTune Report", Path(report_path).read_text(encoding="utf-8"))
+            self.assertIn(
+                "AutoTune Report", Path(report_path).read_text(encoding="utf-8")
+            )
 
 
 if __name__ == "__main__":
