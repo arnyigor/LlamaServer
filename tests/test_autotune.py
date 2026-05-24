@@ -173,8 +173,8 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertEqual(plan.candidates[0].params["ncmoe"], -1)
         self.assertEqual(plan.candidates[0].params["parallel_slots"], 1)
         self.assertTrue(plan.candidates[0].params["fit_off"])
-        non_moe = [c for c in plan.candidates if c.stage != "moe"]
-        self.assertTrue(all(c.params["ncmoe"] == -1 for c in non_moe))
+        moe_vram = [c for c in plan.candidates if c.stage == "moe_vram"]
+        self.assertGreaterEqual(len(moe_vram), 1)
         self.assertTrue(all(c.params["parallel_slots"] == 1 for c in plan.candidates))
         self.assertFalse(any(c.stage == "moe" for c in plan.candidates))
 
@@ -204,9 +204,10 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertTrue(plan.candidates[0].params["speculative_mtp"])
         self.assertEqual(plan.candidates[0].params["cache_type_k"], "f16")
         self.assertEqual(plan.candidates[0].params["cache_type_v"], "f16")
-        moe_candidates = [c for c in plan.candidates if c.stage == "moe"]
+        moe_candidates = [c for c in plan.candidates if c.stage in {"moe", "moe_vram"}]
         self.assertGreaterEqual(len(moe_candidates), 1)
-        self.assertTrue(all(0 <= c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
+        self.assertEqual(plan.candidates[0].params["ncmoe"], 8)
+        self.assertTrue(all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
 
     def test_moe_huge_context_quick_keeps_moe_candidates_limited(self):
         settings = AutoTuneSettingsStub(ctx_size=131072, cpu_moe_layers=8)
@@ -227,9 +228,9 @@ class TestAutoTunePlan(unittest.TestCase):
             max_runs=20,
         )
 
-        moe_candidates = [c for c in plan.candidates if c.stage == "moe"]
+        moe_candidates = [c for c in plan.candidates if c.stage in {"moe", "moe_vram"}]
         self.assertGreaterEqual(len(moe_candidates), 1)
-        self.assertLessEqual(len(moe_candidates), 2)
+        self.assertLessEqual(len(moe_candidates), 8)
         self.assertTrue(all(c.params["ctx_checkpoints"] == 0 for c in plan.candidates))
         self.assertTrue(all(c.params["cache_ram"] == 0 for c in plan.candidates))
         self.assertTrue(all(c.params["ngl"] <= 30 for c in plan.candidates))

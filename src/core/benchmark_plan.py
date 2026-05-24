@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import Any, Dict, Iterable, List, Tuple
 
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate
 from src.core.moe_advisor import compute_moe_advice
+from src.core.vram_estimator import full_vram_estimate
 
 
 _TIME_BUDGETS = {
@@ -188,6 +190,104 @@ def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int,
     return _clamp_ncmoe_value(int(advice.recommended_ncmoe), model_info, effective_ngl)
 
 
+def _detect_total_vram_gib() -> float:
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        values = [float(x.strip()) / 1024.0 for x in (proc.stdout or "").splitlines() if x.strip()]
+        return max(values) if values else 0.0
+    except Exception:
+        return 0.0
+
+
+def _vram_budget_gib(settings: Any, model_info: Dict[str, Any]) -> float:
+    for source in (settings, model_info):
+        for key in ("vram_budget_gib", "vram_gib", "gpu_vram_gib"):
+            value = getattr(source, key, None) if source is settings else source.get(key)
+            try:
+                if value and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                pass
+    return _detect_total_vram_gib()
+
+
+def _estimate_vram_gib(params: Dict[str, Any], model_info: Dict[str, Any]) -> float:
+    slots = int(params.get("parallel_slots") or 1)
+    # unified KV-cache is closer to one shared context than N independent slots
+    # for planning purposes; otherwise MTP 4-slot plans look impossible.
+    effective_slots = 1 if bool(params.get("kv_unified", False)) else max(1, slots)
+    ncmoe = int(params.get("ncmoe", 0) if int(params.get("ncmoe", -1)) >= 0 else 0)
+    estimate = full_vram_estimate(
+        model_info,
+        int(params.get("ctx_size") or 0),
+        int(params.get("ngl") or 0),
+        str(params.get("cache_type_k") or "f16"),
+        str(params.get("cache_type_v") or "f16"),
+        bool(params.get("flash_attn", True)),
+        effective_slots,
+        ncmoe=ncmoe,
+    )
+    return float(estimate.total_gib)
+
+
+def _vram_targeted_ncmoe_values(settings: Any, model_info: Dict[str, Any], base: Dict[str, Any]) -> List[int]:
+    if not _is_moe(model_info):
+        return []
+    ngl = int(base.get("ngl") or 0)
+    blocks = _block_count(model_info)
+    max_ncmoe = min(ngl, blocks) if blocks > 0 else ngl
+    if max_ncmoe <= 0:
+        return []
+
+    values: List[int] = []
+    current = int(getattr(settings, "cpu_moe_layers", -1) or -1)
+    if current >= 0:
+        values.append(_clamp_ncmoe_value(current, model_info, ngl))
+
+    recommended = _recommended_ncmoe(settings, model_info, int(base.get("ctx_size") or 0), ngl)
+    if recommended >= 0:
+        values.append(recommended)
+
+    budget = _vram_budget_gib(settings, model_info)
+    if budget > 0:
+        target = budget * 0.94
+        hard_limit = budget * 0.98
+        best = None
+        best_key = None
+        # The estimator is intentionally approximate for MoE GGUFs. Avoid
+        # jumping straight to "all experts on CPU" just because a formula says
+        # it fits; search around current/recommended values first.
+        anchor = max([v for v in values if v >= 0] or [0])
+        max_search = min(max_ncmoe, max(anchor + 6, int(max_ncmoe * 0.35)))
+        for ncmoe in range(0, max_search + 1):
+            params = dict(base, ncmoe=ncmoe)
+            estimated = _estimate_vram_gib(params, model_info)
+            # prefer candidates under the hard limit and closest to 94% VRAM;
+            # if estimator is pessimistic, still pick the least-bad nearby value.
+            over_penalty = max(0.0, estimated - hard_limit) * 3.0
+            key = abs(estimated - target) + over_penalty
+            if best_key is None or key < best_key:
+                best_key = key
+                best = ncmoe
+        if best is not None:
+            values.extend([best, max(0, best - 2), min(max_ncmoe, best + 2)])
+
+    values.extend([0, -1])
+    result: List[int] = []
+    for value in values:
+        value = _clamp_ncmoe_value(value, model_info, ngl)
+        if value not in result:
+            result.append(value)
+    return result
+
+
 def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Dict[str, Any]:
     logical = max(os.cpu_count() or 4, 1)
     threads = int(getattr(settings, "threads", logical) or logical)
@@ -214,6 +314,8 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
 
     mtp_model = _is_mtp_model(model_info)
     parallel_slots = 4 if mtp_model else 1
+    current_ncmoe = int(getattr(settings, "cpu_moe_layers", -1) or -1)
+    base_ncmoe = _clamp_ncmoe_value(current_ncmoe, model_info, _gpu_layers_for_estimate(settings, model_info)) if mtp_model and current_ncmoe >= 0 else -1
 
     return {
         "ngl": _gpu_layers_for_estimate(settings, model_info),
@@ -241,7 +343,7 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
         # Базовый прогон всегда без принудительного CPU MoE offload.
         # Иначе stale/current ncmoe из UI портит все KV/batch/threads кандидаты
         # (на gemma4 32K/65K это снижало TG примерно со 120+ до 60-80 tok/s).
-        "ncmoe": -1,
+        "ncmoe": base_ncmoe,
         "ctx_checkpoints": ctx_checkpoints,
         "cache_ram": cache_ram,
         # llama-bench не загружает mmproj. Для server/benchmark parity после
@@ -281,7 +383,13 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
             "ubatch_size": safe_ubatch,
         }
     )
-    _append_unique(candidates, seen, base, "safe baseline", "baseline")
+    _append_unique(candidates, seen, base, "safe VRAM baseline", "baseline")
+
+    if _is_moe(model_info):
+        for ncmoe in _vram_targeted_ncmoe_values(settings, model_info, base):
+            p = dict(base, ncmoe=ncmoe)
+            estimated = _estimate_vram_gib(p, model_info)
+            _append_unique(candidates, seen, p, f"VRAM-target MoE ncmoe {ncmoe} (~{estimated:.1f} GiB)", "moe_vram")
 
     for ngl in _ngl_candidates(settings, model_info, "quick", target):
         p = dict(base, ngl=ngl)
