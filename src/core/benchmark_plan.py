@@ -77,12 +77,18 @@ def _kv_candidates(
     huge_context = int(ctx_size or 0) >= 131072
     dense_model = not _is_moe(model_info or {})
     quick = _mode_key(mode) == "quick"
-    if huge_context and dense_model and key != "quality_kv":
-        # Dense-модели не имеют MoE-offload запаса. На 128K+ выбираем KV,
-        # который с большей вероятностью реально поместится в llama-server.
-        vals = [("q4_0", "q4_0"), ("q8_0", "q8_0")]
-        if not quick:
-            vals.append(("q4_0", "q8_0"))
+    if dense_model and key != "quality_kv":
+        # Для dense-моделей f16/f16 имеет смысл только если ТОЧНО влезает в VRAM
+        # с запасом на контекст. Практически всегда безопаснее q8_0/q8_0,
+        # а для 128K+ — q4_0/q4_0 как рабочая точка.
+        if huge_context:
+            vals = [("q4_0", "q4_0"), ("q8_0", "q8_0")]
+            if not quick:
+                vals.append(("q4_0", "q8_0"))
+        else:
+            vals = [("q8_0", "q8_0"), ("q4_0", "q4_0")]
+            if not quick:
+                vals.insert(1, ("f16", "f16"))
     elif huge_context and key != "quality_kv":
         # llama-bench не принимает -c и не валидирует реальный большой KV-cache.
         # Для 128K+ нельзя давать f16/f16 ранний приоритет: он часто быстрый в
@@ -149,14 +155,20 @@ def _ngl_candidates(
     )
     vals = [current, full]
 
-    # Low VRAM and MoE often benefit from testing a slightly lower offload level;
-    # keep this cheap in Quick and expand only for Normal/Deep.
-    if full > 8:
-        vals.append(max(0, full - 4))
-    if _mode_key(mode) != "quick" and full > 16:
-        vals.extend([max(0, full - 8), max(0, full // 2)])
-    if _target_key(target) == "low_vram" and full > 0:
-        vals.append(0)
+    # Для dense-моделей промежуточный ngl почти всегда хуже полного или 0
+    # из-за CPU↔GPU bottleneck. Тестируем только full и low_vram fallback.
+    is_dense = not _is_moe(model_info)
+    if is_dense:
+        if _target_key(target) == "low_vram" and full > 0:
+            vals.append(0)
+    else:
+        # MoE может выиграть от частичного offload + ncmoe тюнинга
+        if full > 8:
+            vals.append(max(0, full - 4))
+        if _mode_key(mode) != "quick" and full > 16:
+            vals.extend([max(0, full - 8), max(0, full // 2)])
+        if _target_key(target) == "low_vram" and full > 0:
+            vals.append(0)
 
     result: List[int] = []
     for v in vals:
