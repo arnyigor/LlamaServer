@@ -167,7 +167,7 @@ class MainWindowUI(QMainWindow):
         lperf.setSpacing(8)
 
         self.gpu_layers = QSpinBox()
-        self.gpu_layers.setRange(0, 200)
+        self.gpu_layers.setRange(0, 999)
         self.gpu_layers.setValue(33)
         self.gpu_auto = QCheckBox("auto")
         self.gpu_auto.setChecked(True)
@@ -500,7 +500,7 @@ class MainWindowUI(QMainWindow):
         self.stop_btn.setStyleSheet(
             "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
         )
-        self.force_stop_btn = QPushButton("Force Stop", enabled=False)
+        self.force_stop_btn = QPushButton("Force Stop", enabled=True)
         self.force_stop_btn.setToolTip(
             "Immediately kills llama-server process tree if normal stop is stuck"
         )

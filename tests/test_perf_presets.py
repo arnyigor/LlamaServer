@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, BenchmarkResult
 from src.core.config import ConfigManager
 from main import LlamaGUI
 
@@ -190,6 +191,11 @@ class TestPerfPresetsUI(unittest.TestCase):
 
         self._assert_saved_values_loaded()
 
+    def test_force_stop_is_available_even_without_owned_process(self):
+        self.gui.update_action_buttons()
+
+        self.assertTrue(self.ui.force_stop_btn.isEnabled())
+
     def test_left_autotune_button_opens_tab_and_builds_plan(self):
         self.ui.ctx_size.setValue(16384)
         self.assertTrue(hasattr(self.ui, "autotune_btn"))
@@ -218,6 +224,95 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertIn(plan.candidates[0].id, self.ui.autotune.current_run_label.text())
         self.assertIn("START", self.ui.autotune.activity_log.toPlainText())
         self.assertEqual(self.ui.autotune.start_btn.text(), "AutoTune running...")
+
+    def _make_autotune_candidate(self):
+        return BenchmarkCandidate(
+            "run_001",
+            {
+                "ngl": "auto",
+                "ctx_size": 32768,
+                "batch_size": 512,
+                "ubatch_size": 512,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "threads": 14,
+                "threads_batch": 0,
+                "parallel_slots": 1,
+                "flash_attn": True,
+                "fit_off": True,
+                "cache_prompt": False,
+                "ncmoe": -1,
+                "ctx_checkpoints": 0,
+                "cache_ram": 0,
+                "use_mmproj": False,
+            },
+            "safe baseline",
+            "baseline",
+        )
+
+    def _set_autotune_best(self):
+        candidate = self._make_autotune_candidate()
+        self.gui.autotune_plan = AutoTunePlan(
+            model_path=self.model_path,
+            ctx_size=32768,
+            mode="quick",
+            target="balanced",
+            engine="llama-bench",
+            time_budget_sec=900,
+            max_runs=1,
+            repeat_top=1,
+            candidates=[candidate],
+        )
+        self.gui.autotune_best_result = BenchmarkResult(
+            candidate_id="run_001",
+            status="success",
+            score=100.0,
+            prompt_tok_s=1000.0,
+            generation_tok_s=100.0,
+        )
+        self.gui.autotune_results_dir = "benchmarks/test"
+
+    def test_save_autotune_best_preset_roundtrip_loads_server_safe_params(self):
+        self._set_autotune_best()
+        with patch.object(QMessageBox, "information", return_value=None):
+            self.gui.save_autotune_best_preset()
+
+        self._set_different_values()
+        self.ui.parallel_slots.setValue(2)
+        self.ui.fit_off.setChecked(False)
+        self.ui.cache_prompt.setChecked(True)
+        loaded = self.config.load_perf_preset(self.model_path, 32768, self.ui)
+
+        self.assertTrue(loaded)
+        self.assertEqual(self.ui.ctx_size.value(), 32768)
+        self.assertEqual(self.ui.parallel_slots.value(), 1)
+        self.assertTrue(self.ui.fit_off.isChecked())
+        self.assertFalse(self.ui.cache_prompt.isChecked())
+        self.assertEqual(self.ui.cache_type_k.currentText(), "q8_0")
+        self.assertEqual(self.ui.cache_type_v.currentText(), "q8_0")
+        self.assertEqual(self.ui.ctx_checkpoints.value(), 0)
+        self.assertEqual(self.ui.cache_ram.value(), 0)
+
+    def test_manual_save_after_apply_best_roundtrip_loads_exact_autotune_params(self):
+        self._set_autotune_best()
+        with patch.object(QMessageBox, "information", return_value=None):
+            applied = self.gui.apply_autotune_best(silent=True)
+            self.gui.save_preset()
+
+        self.assertTrue(applied)
+        self._set_different_values()
+        self.ui.parallel_slots.setValue(2)
+        self.ui.fit_off.setChecked(False)
+        self.ui.cache_prompt.setChecked(True)
+        loaded = self.config.load_perf_preset(self.model_path, 32768, self.ui)
+
+        self.assertTrue(loaded)
+        self.assertEqual(self.ui.threads.value(), 14)
+        self.assertEqual(self.ui.parallel_slots.value(), 1)
+        self.assertTrue(self.ui.fit_off.isChecked())
+        self.assertFalse(self.ui.cache_prompt.isChecked())
+        self.assertEqual(self.ui.ctx_checkpoints.value(), 0)
+        self.assertEqual(self.ui.cache_ram.value(), 0)
 
 
 if __name__ == "__main__":

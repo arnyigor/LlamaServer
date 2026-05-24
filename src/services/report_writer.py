@@ -57,6 +57,9 @@ def results_payload(
             "engine": plan.engine,
             "time_budget_sec": plan.time_budget_sec,
             "max_runs": plan.max_runs,
+            "early_stop_on_peak": getattr(plan, "early_stop_on_peak", False),
+            "early_stop_min_successes": getattr(plan, "early_stop_min_successes", 3),
+            "early_stop_drop_pct": getattr(plan, "early_stop_drop_pct", 3.0),
         },
         "llama_cpp_build": llama_cpp_build,
         "best_run_id": best.candidate_id if best else None,
@@ -137,17 +140,20 @@ def write_markdown_report(
     lines += [
         "",
         "## Top Results",
-        "| Run | Score | PP tok/s | TG tok/s | VRAM MiB | RAM MiB | Params |",
-        "|---|---:|---:|---:|---:|---:|---|",
+        "| Run | Stage | Score | PP tok/s | TG tok/s | NGL | NC MoE | KV | Batch/UB | Threads/TB | VRAM MiB | RAM MiB |",
+        "|---|---|---:|---:|---:|---:|---:|---|---|---|---:|---:|",
     ]
     for r in top:
-        params = by_id.get(r.candidate_id).params if by_id.get(r.candidate_id) else {}
-        param_text = ", ".join(
-            f"{k}={params.get(k)}" for k in ("ngl", "cache_type_k", "cache_type_v", "batch_size", "ubatch_size", "threads")
-        )
+        candidate = by_id.get(r.candidate_id)
+        params = candidate.params if candidate else {}
+        kv = f"{params.get('cache_type_k')}/{params.get('cache_type_v')}"
+        batch = f"{params.get('batch_size')}/{params.get('ubatch_size')}"
+        threads = f"{params.get('threads')}/{params.get('threads_batch')}"
         lines.append(
-            f"| {r.candidate_id} | {r.score:.3f} | {r.prompt_tok_s:.1f} | {r.generation_tok_s:.1f} | "
-            f"{r.vram_used_mib:.0f} | {r.ram_used_mib:.0f} | {param_text} |"
+            f"| {r.candidate_id} | {candidate.stage if candidate else '-'} | {r.score:.3f} | "
+            f"{r.prompt_tok_s:.1f} | {r.generation_tok_s:.1f} | {params.get('ngl', '-')} | "
+            f"{params.get('ncmoe', '-')} | {kv} | {batch} | {threads} | "
+            f"{r.vram_used_mib:.0f} | {r.ram_used_mib:.0f} |"
         )
 
     lines += [

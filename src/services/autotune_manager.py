@@ -14,7 +14,12 @@ from PySide6.QtCore import QThread, Signal
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, BenchmarkResult
 from src.core.benchmark_scorer import score_result
 from src.services.benchmark_runner import BenchmarkRunner
-from src.services.report_writer import write_best, write_json_report, write_markdown_report, write_plan
+from src.services.report_writer import (
+    write_best,
+    write_json_report,
+    write_markdown_report,
+    write_plan,
+)
 
 
 class AutoTuneManager(QThread):
@@ -83,7 +88,55 @@ class AutoTuneManager(QThread):
         successful = [r for r in self.results if r.status == "success"]
         if not successful:
             return None
-        return max(successful, key=lambda r: (r.score, r.generation_tok_s, r.prompt_tok_s))
+        return max(
+            successful, key=lambda r: (r.score, r.generation_tok_s, r.prompt_tok_s)
+        )
+
+    def _should_early_stop_after_peak(self, latest: BenchmarkResult) -> bool:
+        """Улучшенный early stop с rolling window и проверкой тренда.
+
+        Останавливает benchmark если:
+        1. Последний успешный результат упал ниже порога от пика, ИЛИ
+        2. Большинство последних N успешных результатов ниже порога
+        """
+        if not bool(getattr(self.plan, "early_stop_on_peak", False)):
+            return False
+        if latest.status != "success":
+            return False
+
+        successful = [r for r in self.results if r.status == "success"]
+        min_successes = max(
+            3, int(getattr(self.plan, "early_stop_min_successes", 3) or 3)
+        )
+        if len(successful) < min_successes:
+            return False
+
+        # Rolling window последних успешных
+        window_size = max(2, min(5, len(successful)))
+        window = successful[-window_size:]
+
+        best = max(
+            successful, key=lambda r: (r.generation_tok_s, r.prompt_tok_s, r.score)
+        )
+        if best.candidate_id == latest.candidate_id:
+            return False  # Новый пик — не останавливаем
+
+        drop_pct = max(
+            0.0, float(getattr(self.plan, "early_stop_drop_pct", 3.0) or 3.0)
+        )
+        threshold = best.generation_tok_s * (1.0 - drop_pct / 100.0)
+
+        # 1) Последний упал ниже порога
+        if latest.generation_tok_s < threshold:
+            return True
+
+        # 2) Большинство в rolling window ниже порога
+        below_threshold = sum(1 for r in window if r.generation_tok_s < threshold)
+        majority = window_size // 2 + 1
+        if below_threshold >= majority:
+            return True
+
+        return False
 
     def _write_reports(self) -> None:
         by_id = {c.id: c for c in self.plan.candidates}
@@ -96,17 +149,27 @@ class AutoTuneManager(QThread):
             self.best_result,
             llama_cpp_build=self._llama_cpp_build(),
         )
-        write_markdown_report(self.output_dir, self.plan, self.model_info, self.results, self.best_result)
-        params = by_id.get(self.best_result.candidate_id).params if self.best_result and by_id.get(self.best_result.candidate_id) else {}
+        write_markdown_report(
+            self.output_dir, self.plan, self.model_info, self.results, self.best_result
+        )
+        params = (
+            by_id.get(self.best_result.candidate_id).params
+            if self.best_result and by_id.get(self.best_result.candidate_id)
+            else {}
+        )
         write_best(self.output_dir, self.best_result, params)
 
     def run(self) -> None:
-        self.runner = BenchmarkRunner(self.bench_exe, self.plan.model_path, self.output_dir)
+        self.runner = BenchmarkRunner(
+            self.bench_exe, self.plan.model_path, self.output_dir
+        )
         start_mono = time.monotonic()
         failures = 0
         oom_failures = 0
         total = len(self.plan.candidates)
-        self._emit_log(f"AutoTune started: {total} candidates, output: {self.output_dir}", "info")
+        self._emit_log(
+            f"AutoTune started: {total} candidates, output: {self.output_dir}", "info"
+        )
 
         for index, candidate in enumerate(self.plan.candidates, start=1):
             if self.isInterruptionRequested():
@@ -120,7 +183,9 @@ class AutoTuneManager(QThread):
 
             self.progress.emit(index - 1, total)
             self.run_started.emit(candidate)
-            self._emit_log(f"[{index}/{total}] {candidate.id}: {candidate.reason}", "bench")
+            self._emit_log(
+                f"[{index}/{total}] {candidate.id}: {candidate.reason}", "bench"
+            )
 
             result = self.runner.run(
                 candidate,
@@ -142,6 +207,14 @@ class AutoTuneManager(QThread):
 
             self.best_result = self._rank_best()
             self.progress.emit(index, total)
+
+            if self._should_early_stop_after_peak(result):
+                best = self.best_result
+                message = "AutoTune early stop: latest successful run is slower than the current peak"
+                if best:
+                    message += f"; best={best.candidate_id} TG={best.generation_tok_s:.1f} tok/s"
+                self._emit_log(message, "info")
+                break
 
         if self.isInterruptionRequested():
             self._emit_log("AutoTune cancelled", "warn")

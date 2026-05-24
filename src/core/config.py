@@ -4,6 +4,7 @@
 import json
 import os
 import hashlib
+import shlex
 from dataclasses import dataclass, field, asdict, fields
 from typing import Any, Dict, Optional, Type
 from pathlib import Path
@@ -148,6 +149,211 @@ _PERF_PRESET_FIELDS = (
     "enable_thinking",
 )
 
+_AUTOTUNE_PARAM_TO_SETTING = {
+    "ngl": "gpu_layers",
+    "batch_size": "batch_size",
+    "ubatch_size": "ubatch_size",
+    "cache_type_k": "cache_type_k",
+    "cache_type_v": "cache_type_v",
+    "threads": "threads",
+    "threads_batch": "threads_batch",
+    "parallel_slots": "parallel_slots",
+    "flash_attn": "flash_attn",
+    "fit_off": "fit_off",
+    "cache_prompt": "cache_prompt",
+    "ctx_checkpoints": "ctx_checkpoints",
+    "cache_ram": "cache_ram",
+    "use_mmproj": "use_mmproj",
+}
+
+_MANAGED_EXTRA_FLAGS = {
+    "-m",
+    "--model",
+    "--port",
+    "-ngl",
+    "--n-gpu-layers",
+    "-c",
+    "--ctx-size",
+    "--ctx-checkpoints",
+    "--cache-ram",
+    "--jinja",
+    "--no-cache-prompt",
+    "--flash-attn",
+    "-fa",
+    "--fit",
+    "-rea",
+    "--reasoning",
+    "--temp",
+    "--repeat-penalty",
+    "-ctk",
+    "--cache-type-k",
+    "-ctv",
+    "--cache-type-v",
+    "-b",
+    "--batch-size",
+    "-ub",
+    "--ubatch-size",
+    "-np",
+    "--parallel",
+    "-t",
+    "--threads",
+    "-tb",
+    "--threads-batch",
+    "-ncmoe",
+    "--n-cpu-moe",
+    "-mm",
+    "--mmproj",
+    "--no-mmproj",
+    "--no-mmproj-offload",
+    "--mmap",
+    "--no-mmap",
+    "--mlock",
+    "--verbose",
+    "--log-timestamps",
+    "--no-cont-batching",
+    "--context-shift",
+    "--no-webui",
+}
+
+
+def _sanitize_extra_args(value: Any) -> str:
+    """Убирает из extra_args флаги, которыми управляют UI/AutoTune."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return text
+
+    result = []
+    i = 0
+    while i < len(parts):
+        arg = parts[i]
+        base = arg.split("=", 1)[0]
+        if base in _MANAGED_EXTRA_FLAGS:
+            if (
+                "=" not in arg
+                and i + 1 < len(parts)
+                and not parts[i + 1].startswith("-")
+            ):
+                i += 2
+            else:
+                i += 1
+            continue
+        result.append(arg)
+        i += 1
+    return " ".join(shlex.quote(p) for p in result)
+
+
+def _perf_params_from_settings(settings: AppSettings) -> Dict[str, Any]:
+    return {
+        field_name: getattr(settings, field_name)
+        for field_name in _PERF_PRESET_FIELDS
+        if hasattr(settings, field_name)
+    }
+
+
+def _apply_autotune_params_to_perf_params(
+    params: Dict[str, Any], autotune_params: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if not autotune_params:
+        return params
+
+    merged = dict(params)
+    ngl = autotune_params.get("ngl")
+    if ngl is not None:
+        is_auto = str(ngl).strip().lower() == "auto"
+        merged["gpu_auto"] = is_auto
+        if not is_auto:
+            merged["gpu_layers"] = int(ngl)
+
+    if "ncmoe" in autotune_params:
+        merged["cpu_moe_layers"] = int(autotune_params["ncmoe"])
+
+    if "ctx_size" in autotune_params:
+        merged["ctx_size"] = int(autotune_params["ctx_size"])
+
+    for source_key, setting_key in _AUTOTUNE_PARAM_TO_SETTING.items():
+        if source_key == "ngl":
+            # ngl already needs special gpu_auto/gpu_layers handling above.
+            # Do not copy literal "auto" into gpu_layers.
+            continue
+        if source_key in autotune_params:
+            merged[setting_key] = autotune_params[source_key]
+
+    # AutoTune не тестирует sampling/reasoning/mmproj-extra args. Но managed extra
+    # flags от старых ручных запусков могут переопределить best preset при старте.
+    merged["extra_args"] = _sanitize_extra_args(merged.get("extra_args", ""))
+    return merged
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "disabled", "none", ""}:
+        return False
+    return True
+
+
+def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(params)
+    bool_fields = {
+        "gpu_auto",
+        "flash_attn",
+        "fit_off",
+        "use_mmap",
+        "use_mlock",
+        "verbose",
+        "log_timestamps",
+        "cont_batching",
+        "cache_prompt",
+        "context_shift",
+        "no_webui",
+        "jinja",
+        "use_mmproj",
+        "mmproj_offload",
+    }
+    int_fields = {
+        "gpu_layers",
+        "cpu_moe_layers",
+        "ctx_size",
+        "threads",
+        "threads_batch",
+        "batch_size",
+        "ubatch_size",
+        "parallel_slots",
+        "ctx_checkpoints",
+        "cache_ram",
+    }
+    float_fields = {"temperature", "repeat_penalty"}
+    for key in bool_fields & normalized.keys():
+        normalized[key] = _coerce_bool(normalized[key])
+    for key in int_fields & normalized.keys():
+        try:
+            normalized[key] = int(normalized[key])
+        except (TypeError, ValueError):
+            if key == "gpu_layers" and str(normalized.get(key, "")).strip().lower() == "auto":
+                normalized["gpu_auto"] = True
+                normalized[key] = 99
+            else:
+                normalized.pop(key, None)
+    for key in float_fields & normalized.keys():
+        try:
+            normalized[key] = float(normalized[key])
+        except (TypeError, ValueError):
+            normalized.pop(key, None)
+    if "enable_thinking" in normalized:
+        normalized["enable_thinking"] = _normalize_enable_thinking(
+            normalized["enable_thinking"]
+        )
+    if "extra_args" in normalized:
+        normalized["extra_args"] = _sanitize_extra_args(normalized["extra_args"])
+    return normalized
+
 
 def _normalize_enable_thinking(value: Any) -> str:
     """Нормализует Thinking в одно из значений ComboBox: off/false/true."""
@@ -182,7 +388,7 @@ def _widget_get(widget: Any) -> Any:
 def _widget_set(widget: Any, value: Any) -> None:
     """Универсальная установка значения виджета."""
     if isinstance(widget, QCheckBox):
-        widget.setChecked(bool(value))
+        widget.setChecked(_coerce_bool(value))
     elif isinstance(widget, (QSpinBox,)):
         widget.setValue(int(value))
     elif isinstance(widget, QDoubleSpinBox):
@@ -276,10 +482,18 @@ class ConfigManager:
                 # Приводим к объявленному типу поля, а не к текущему типу значения.
                 # Это важно для миграции старых settings.json, где enable_thinking
                 # мог быть bool: bool("off") == True ломал CLI Preview.
-                field_def = next((f for f in fields(AppSettings) if f.name == field_name), None)
-                field_type = field_def.type if field_def is not None else type(getattr(s, field_name))
+                field_def = next(
+                    (f for f in fields(AppSettings) if f.name == field_name), None
+                )
+                field_type = (
+                    field_def.type
+                    if field_def is not None
+                    else type(getattr(s, field_name))
+                )
+                if field_name == "extra_args":
+                    value = _sanitize_extra_args(value)
                 if field_type is bool:
-                    setattr(s, field_name, bool(value))
+                    setattr(s, field_name, _coerce_bool(value))
                 elif field_type is int:
                     setattr(s, field_name, int(value))
                 elif field_type is float:
@@ -335,6 +549,7 @@ class ConfigManager:
         ctx_size: int,
         ui: Any,
         metadata: Optional[Dict[str, Any]] = None,
+        autotune_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Сохраняет параметры производительности для пары:
@@ -348,11 +563,9 @@ class ConfigManager:
 
         self.read_from_ui(ui)
 
-        params = {
-            field_name: getattr(self.settings, field_name)
-            for field_name in _PERF_PRESET_FIELDS
-            if hasattr(self.settings, field_name)
-        }
+        params = _perf_params_from_settings(self.settings)
+        params = _apply_autotune_params_to_perf_params(params, autotune_params)
+        params = _normalize_perf_param_types(params)
 
         params["ctx_size"] = int(ctx_size)
 
@@ -407,6 +620,7 @@ class ConfigManager:
 
         params = dict(params)
         params["ctx_size"] = int(ctx_size)
+        params = _normalize_perf_param_types(params)
 
         for field_name, value in params.items():
             if not hasattr(self.settings, field_name):

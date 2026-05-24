@@ -88,12 +88,20 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("45", args_manual)
         self.assertNotIn("auto", args_manual)
 
-    def test_bench_gpu_forces_99(self):
+    def test_bench_gpu_auto_forces_99(self):
+        """При gpu_auto=True llama-bench получает -ngl 99 (full offload)."""
+        self.cfg.gpu_auto = True
+        args = build_args(self.cfg, self.model, for_benchmark=True)
+        idx = args.index("-ngl")
+        self.assertEqual(args[idx + 1], "99")
+
+    def test_bench_gpu_manual_preserves_value(self):
+        """При gpu_auto=False llama-bench получает точное значение gpu_layers."""
         self.cfg.gpu_auto = False
         self.cfg.gpu_layers = 10
         args = build_args(self.cfg, self.model, for_benchmark=True)
         idx = args.index("-ngl")
-        self.assertEqual(args[idx + 1], "99")
+        self.assertEqual(args[idx + 1], "10")
 
     def test_mmproj_handling(self):
         self.cfg.mmproj_path = "/models/mmproj.gguf"

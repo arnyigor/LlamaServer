@@ -84,6 +84,9 @@ class AutoTunePlan:
     max_runs: int
     repeat_top: int
     candidates: List[BenchmarkCandidate]
+    early_stop_on_peak: bool = False
+    early_stop_min_successes: int = 3
+    early_stop_drop_pct: float = 3.0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -96,6 +99,9 @@ class AutoTunePlan:
             "time_budget_sec": self.time_budget_sec,
             "max_runs": self.max_runs,
             "repeat_top": self.repeat_top,
+            "early_stop_on_peak": self.early_stop_on_peak,
+            "early_stop_min_successes": self.early_stop_min_successes,
+            "early_stop_drop_pct": self.early_stop_drop_pct,
             "created_at": self.created_at,
             "candidates": [c.to_dict() for c in self.candidates],
         }

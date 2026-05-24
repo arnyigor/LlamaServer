@@ -72,7 +72,9 @@ def _flag_base(arg: str) -> str:
     return arg.split("=", 1)[0] if arg.startswith("-") else arg
 
 
-def _filter_duplicate_extra_args(extra: List[str], existing_args: List[str]) -> List[str]:
+def _filter_duplicate_extra_args(
+    extra: List[str], existing_args: List[str]
+) -> List[str]:
     """Удаляет из extra_args флаги, которыми уже управляют UI/AutoTune.
 
     Это предотвращает CLI вроде `--ctx-checkpoints 0 ... --ctx-checkpoints 0`.
@@ -110,6 +112,7 @@ def _filter_duplicate_extra_args(extra: List[str], existing_args: List[str]) -> 
         "--temp",
         "--repeat-penalty",
         "--flash-attn",
+        "-fa",
         "-mm",
         "--mmproj",
     }
@@ -134,7 +137,11 @@ def _filter_duplicate_extra_args(extra: List[str], existing_args: List[str]) -> 
         arg = extra[i]
         base = _flag_base(arg)
         if base in managed and base in flags_with_values:
-            if "=" not in arg and i + 1 < len(extra) and not extra[i + 1].startswith("-"):
+            if (
+                "=" not in arg
+                and i + 1 < len(extra)
+                and not extra[i + 1].startswith("-")
+            ):
                 i += 2
             else:
                 i += 1
@@ -160,7 +167,7 @@ def build_benchmark_args_from_params(
     args = ["-m", model_path, "-p", str(prompt_tokens), "-n", str(generation_tokens)]
 
     # Важно: llama-bench CLI отличается от llama-server.
-    # В актуальных сборках llama-bench нет -c/-np/-tb/--ctx-checkpoints/--cache-ram/--no-mmproj.
+    # В актуальных сборках llama-bench нет -c/-np/--ctx-checkpoints/--cache-ram/--no-mmproj.
     # Context Size остаётся частью AutoTune-плана/пресета, но в llama-bench проверяется через
     # выбранные prompt/gen размеры; полный server-context тест будет отдельным server-engine этапом.
     ngl = params.get("ngl", "auto")
@@ -184,6 +191,10 @@ def build_benchmark_args_from_params(
     if threads > 0:
         args += ["-t", str(threads)]
 
+    threads_batch = int(params.get("threads_batch") or 0)
+    if threads_batch > 0:
+        args += ["-tb", str(threads_batch)]
+
     ncmoe = int(params.get("ncmoe", -1))
     if ncmoe >= 0:
         args += ["-ncmoe", str(ncmoe)]
@@ -199,19 +210,24 @@ def build_args(
         return None
 
     args = ["-m", model_path]
-    gpu_val = "99" if for_benchmark else "auto" if cfg.gpu_auto else str(cfg.gpu_layers)
+    if for_benchmark:
+        gpu_val = "99" if cfg.gpu_auto else str(cfg.gpu_layers)
+    else:
+        gpu_val = "auto" if cfg.gpu_auto else str(cfg.gpu_layers)
 
     if for_benchmark:
         args += ["-p", str(cfg.bench_prompt), "-n", str(cfg.bench_gen), "-ngl", gpu_val]
-        if cfg.flash_attn:
-            args += ["-fa", "1"]
+        args += ["-fa", "1" if cfg.flash_attn else "0"]
         args += ["-ctk", cfg.cache_type_k, "-ctv", cfg.cache_type_v]
-        args += [
-            "-b",
-            str(cfg.batch_size),
-            "-ub",
-            str(min(cfg.ubatch_size, cfg.batch_size)),
-        ]
+        bs = int(cfg.batch_size if cfg.batch_size and cfg.batch_size > 0 else 512)
+        ub = int(cfg.ubatch_size if cfg.ubatch_size and cfg.ubatch_size > 0 else min(bs, 512))
+        args += ["-b", str(bs), "-ub", str(min(ub, bs))]
+        if cfg.threads > 0:
+            args += ["-t", str(cfg.threads)]
+        if cfg.threads_batch > 0:
+            args += ["-tb", str(cfg.threads_batch)]
+        if cfg.cpu_moe_layers >= 0:
+            args += ["-ncmoe", str(cfg.cpu_moe_layers)]
     else:
         args += [
             "--port",

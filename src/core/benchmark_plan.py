@@ -98,10 +98,41 @@ def _kv_candidates(
     return vals
 
 
+def _full_ngl_for_model(model_info: Dict[str, Any]) -> int:
+    # llama-bench historically used -ngl 99 for "all GPU layers".  For server
+    # parity after AutoTune we keep NGL numeric instead of saving UI "auto":
+    # both llama-bench and llama-server will then receive the same -ngl value.
+    block_count = int(model_info.get("block_count") or 0)
+    return max(99, block_count + 1)
+
+
 def _gpu_layers_for_estimate(settings: Any, model_info: Dict[str, Any]) -> int:
     if getattr(settings, "gpu_auto", True):
-        return int(model_info.get("block_count") or 999)
+        return _full_ngl_for_model(model_info)
     return int(getattr(settings, "gpu_layers", 0) or 0)
+
+
+def _ngl_candidates(settings: Any, model_info: Dict[str, Any], mode: str, target: str) -> List[int]:
+    """Small NGL search space: full offload plus nearby/current fallbacks."""
+    full = _full_ngl_for_model(model_info)
+    current = full if getattr(settings, "gpu_auto", True) else max(0, int(getattr(settings, "gpu_layers", 0) or 0))
+    vals = [current, full]
+
+    # Low VRAM and MoE often benefit from testing a slightly lower offload level;
+    # keep this cheap in Quick and expand only for Normal/Deep.
+    if full > 8:
+        vals.append(max(0, full - 4))
+    if _mode_key(mode) != "quick" and full > 16:
+        vals.extend([max(0, full - 8), max(0, full // 2)])
+    if _target_key(target) == "low_vram" and full > 0:
+        vals.append(0)
+
+    result: List[int] = []
+    for v in vals:
+        v = max(0, int(v))
+        if v not in result:
+            result.append(v)
+    return result
 
 
 def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> int:
@@ -146,7 +177,7 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
             cache_ram = 0
 
     return {
-        "ngl": "auto" if getattr(settings, "gpu_auto", True) else int(getattr(settings, "gpu_layers", 0)),
+        "ngl": _gpu_layers_for_estimate(settings, model_info),
         "ctx_size": int(ctx_size),
         "batch_size": batch,
         "ubatch_size": min(ubatch, batch),
@@ -204,6 +235,10 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
     )
     _append_unique(candidates, seen, base, "safe baseline", "baseline")
 
+    for ngl in _ngl_candidates(settings, model_info, "quick", target):
+        p = dict(base, ngl=ngl)
+        _append_unique(candidates, seen, p, f"GPU layers ngl={ngl}", "ngl")
+
     for ctk, ctv in _kv_candidates(target, "quick", ctx_size, model_info):
         p = dict(base, cache_type_k=ctk, cache_type_v=ctv)
         _append_unique(candidates, seen, p, f"KV {ctk}/{ctv}", "kv")
@@ -256,10 +291,26 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
         batch_values = (512, 1024, 2048, 4096, 8192)
         ubatch_values = (128, 256, 512, 1024, 2048)
 
+    for ngl in _ngl_candidates(settings, model_info, mode, target):
+        p = dict(base, ngl=ngl)
+        _append_unique(candidates, seen, p, f"staged GPU layers ngl={ngl}", "ngl")
+
+    # Staged search instead of full KV x batch Cartesian product.  It reaches the
+    # influential dimensions first and keeps Normal/Deep responsive; if a user
+    # needs exhaustive checks they can still raise Max runs.
     for ctk, ctv in _kv_candidates(target, mode, ctx_size, model_info):
-        for batch in batch_values:
-            p = dict(base, cache_type_k=ctk, cache_type_v=ctv, batch_size=batch, ubatch_size=min(512, batch))
-            _append_unique(candidates, seen, p, f"staged KV/batch {ctk}/{ctv} b={batch}", "kv_batch")
+        p = dict(base, cache_type_k=ctk, cache_type_v=ctv)
+        _append_unique(candidates, seen, p, f"staged KV {ctk}/{ctv}", "kv")
+
+    for batch in batch_values:
+        p = dict(base, batch_size=batch, ubatch_size=min(safe_ubatch, batch))
+        _append_unique(candidates, seen, p, f"staged batch {batch}", "batch")
+
+    if _mode_key(mode) == "deep":
+        for ctk, ctv in _kv_candidates(target, mode, ctx_size, model_info)[:3]:
+            for batch in (2048, 4096):
+                p = dict(base, cache_type_k=ctk, cache_type_v=ctv, batch_size=batch, ubatch_size=min(safe_ubatch, batch))
+                _append_unique(candidates, seen, p, f"deep KV/batch {ctk}/{ctv} b={batch}", "kv_batch")
 
     best_batch = 2048
     for ubatch in ubatch_values:
@@ -307,6 +358,9 @@ def build_autotune_plan(
     time_budget_sec: int | None = None,
     max_runs: int | None = None,
     repeat_top: int = 1,
+    early_stop_on_peak: bool = False,
+    early_stop_min_successes: int = 3,
+    early_stop_drop_pct: float = 3.0,
 ) -> AutoTunePlan:
     """Создаёт ограниченный staged-план AutoTune."""
     info = model_info or {}
@@ -331,4 +385,7 @@ def build_autotune_plan(
         max_runs=run_limit,
         repeat_top=max(1, int(repeat_top or 1)),
         candidates=candidates,
+        early_stop_on_peak=bool(early_stop_on_peak),
+        early_stop_min_successes=max(3, int(early_stop_min_successes or 3)),
+        early_stop_drop_pct=max(0.0, float(early_stop_drop_pct or 0.0)),
     )
