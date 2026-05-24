@@ -471,10 +471,38 @@ class LlamaGUI:
         )
         self.ui.ctx_size.setToolTip(tooltip_ctx)
 
+    def _is_mtp_model_info(self, info):
+        text = " ".join(
+            str(info.get(k) or "")
+            for k in ("path", "name", "display", "architecture")
+        ).lower()
+        return "mtp" in text
+
+    def _apply_mtp_recommended_params(self, info):
+        block_count = int(info.get("block_count") or 0)
+        if block_count > 0:
+            self.ui.gpu_auto.setChecked(False)
+            self.ui.gpu_layers.setValue(block_count)
+        self.ui.cache_type_k.setCurrentText("f16")
+        self.ui.cache_type_v.setCurrentText("f16")
+        self.ui.batch_size.setValue(512)
+        self.ui.ubatch_size.setValue(512)
+        self.ui.parallel_slots.setValue(4)
+        self.ui.kv_unified.setChecked(True)
+        self.ui.speculative_mtp.setChecked(True)
+        self.ui.spec_draft_n_max.setValue(3)
+        self.ui.reasoning_mode.setCurrentText("off")
+        self.ui.enable_thinking.setCurrentText("false")
+        self.ui.jinja.setChecked(False)
+        self.ui.context_shift.setChecked(False)
+
     def apply_recommended_params(self, info):
         rec = info.get("recommended_ctx")
         if rec:
             self.ui.ctx_size.setValue(rec)
+        if self._is_mtp_model_info(info):
+            self._apply_mtp_recommended_params(info)
+            return
         q = (info.get("quant") or "").upper()
         if (
             q.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3"))
@@ -652,6 +680,21 @@ class LlamaGUI:
         self.config.read_from_ui(self.ui)
         # resolve mmproj
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData()) or {}
+        if self.ui.auto_params.isChecked() and self._is_mtp_model_info(info):
+            block_count = int(info.get("block_count") or 0)
+            if self.config.settings.gpu_auto and block_count > 0:
+                self.config.settings.gpu_auto = False
+                self.config.settings.gpu_layers = block_count
+            self.config.settings.cache_type_k = "f16"
+            self.config.settings.cache_type_v = "f16"
+            self.config.settings.parallel_slots = max(4, int(self.config.settings.parallel_slots or 4))
+            self.config.settings.kv_unified = True
+            self.config.settings.speculative_mtp = True
+            self.config.settings.spec_draft_n_max = 3
+            self.config.settings.reasoning_mode = "off"
+            self.config.settings.enable_thinking = "false"
+            self.config.settings.jinja = False
+            self.config.settings.context_shift = False
         self.config.settings.mmproj_path = info.get("mmproj_path", "")
         try:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
