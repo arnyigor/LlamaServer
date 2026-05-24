@@ -232,7 +232,9 @@ def build_args(
         args += ["-fa", "1" if cfg.flash_attn else "0"]
         args += ["-ctk", cfg.cache_type_k, "-ctv", cfg.cache_type_v]
         bs = int(cfg.batch_size if cfg.batch_size and cfg.batch_size > 0 else 512)
-        ub = int(cfg.ubatch_size if cfg.ubatch_size and cfg.ubatch_size > 0 else min(bs, 512))
+        ub = int(
+            cfg.ubatch_size if cfg.ubatch_size and cfg.ubatch_size > 0 else min(bs, 512)
+        )
         args += ["-b", str(bs), "-ub", str(min(ub, bs))]
         if cfg.threads > 0:
             args += ["-t", str(cfg.threads)]
@@ -296,6 +298,9 @@ def build_args(
         if cfg.flash_attn:
             args += ["--flash-attn", "on"]
         if getattr(cfg, "speculative_mtp", False):
+            # Draft KV следует за target KV: если target q8_0, draft тоже q8_0.
+            draft_kv_k = getattr(cfg, "cache_type_k", "f16")
+            draft_kv_v = getattr(cfg, "cache_type_v", "f16")
             args += [
                 "--spec-type",
                 "draft-mtp",
@@ -308,9 +313,9 @@ def build_args(
                 "--spec-draft-ngl",
                 "-1",
                 "--spec-draft-type-k",
-                "f16",
+                str(draft_kv_k),
                 "--spec-draft-type-v",
-                "f16",
+                str(draft_kv_v),
             ]
 
         # mmproj logic expects model_info dict, passed separately if needed

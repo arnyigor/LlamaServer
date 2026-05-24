@@ -473,8 +473,7 @@ class LlamaGUI:
 
     def _is_mtp_model_info(self, info):
         text = " ".join(
-            str(info.get(k) or "")
-            for k in ("path", "name", "display", "architecture")
+            str(info.get(k) or "") for k in ("path", "name", "display", "architecture")
         ).lower()
         return "mtp" in text
 
@@ -685,9 +684,14 @@ class LlamaGUI:
             if self.config.settings.gpu_auto and block_count > 0:
                 self.config.settings.gpu_auto = False
                 self.config.settings.gpu_layers = block_count
-            self.config.settings.cache_type_k = "f16"
-            self.config.settings.cache_type_v = "f16"
-            self.config.settings.parallel_slots = max(4, int(self.config.settings.parallel_slots or 4))
+            # AutoTune уже подобрал KV; не перезаписываем f16 поверх q8_0.
+            # Если preset не загружен — оставляем текущий UI KV.
+            if not getattr(self, "_autotune_preset_loaded", False):
+                self.config.settings.cache_type_k = "f16"
+                self.config.settings.cache_type_v = "f16"
+            self.config.settings.parallel_slots = max(
+                4, int(self.config.settings.parallel_slots or 4)
+            )
             self.config.settings.kv_unified = True
             self.config.settings.speculative_mtp = True
             self.config.settings.spec_draft_n_max = 3
