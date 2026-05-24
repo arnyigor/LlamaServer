@@ -915,7 +915,7 @@ class LlamaGUI:
                 if str(params.get("ngl", "")).strip().lower() == "auto":
                     info = self._current_model_info()
                     block_count = int(info.get("block_count") or 0)
-                    params["ngl"] = max(99, block_count + 1)
+                    params["ngl"] = block_count if block_count > 0 else 99
                 return params
         return {}
 
@@ -961,7 +961,7 @@ class LlamaGUI:
         if str(ngl_raw).strip().lower() == "auto":
             info = self._current_model_info()
             block_count = int(info.get("block_count") or 0)
-            ngl_val = max(99, block_count + 1)
+            ngl_val = block_count if block_count > 0 else 99
             params["ngl"] = ngl_val
         else:
             ngl_val = int(ngl_raw)

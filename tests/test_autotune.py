@@ -90,6 +90,7 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertEqual(plan.candidates[0].stage, "baseline")
         self.assertEqual(plan.candidates[0].params["cache_type_k"], "q8_0")
         self.assertEqual(plan.candidates[0].params["cache_type_v"], "q8_0")
+        self.assertEqual(plan.candidates[0].params["ngl"], 99)
         self.assertEqual(plan.candidates[0].params["ncmoe"], -1)
         self.assertEqual(plan.candidates[0].params["parallel_slots"], 1)
         self.assertTrue(plan.candidates[0].params["fit_off"])
@@ -138,6 +139,7 @@ class TestAutoTunePlan(unittest.TestCase):
 
         self.assertEqual(plan.ctx_size, 131072)
         self.assertEqual(plan.candidates[0].params["model_type"], "dense")
+        self.assertEqual(plan.candidates[0].params["ngl"], 40)
         self.assertEqual(plan.candidates[0].params["cache_type_k"], "q4_0")
         self.assertEqual(plan.candidates[0].params["cache_type_v"], "q4_0")
         self.assertEqual(plan.candidates[0].params["ubatch_size"], 256)
@@ -167,6 +169,7 @@ class TestAutoTunePlan(unittest.TestCase):
         )
 
         self.assertEqual(plan.candidates[0].params["model_type"], "moe")
+        self.assertEqual(plan.candidates[0].params["ngl"], 30)
         self.assertEqual(plan.candidates[0].params["ncmoe"], -1)
         self.assertEqual(plan.candidates[0].params["parallel_slots"], 1)
         self.assertTrue(plan.candidates[0].params["fit_off"])
@@ -199,6 +202,8 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertLessEqual(len(moe_candidates), 2)
         self.assertTrue(all(c.params["ctx_checkpoints"] == 0 for c in plan.candidates))
         self.assertTrue(all(c.params["cache_ram"] == 0 for c in plan.candidates))
+        self.assertTrue(all(c.params["ngl"] <= 30 for c in plan.candidates))
+        self.assertTrue(all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
 
 
 class TestAutoTuneScoring(unittest.TestCase):

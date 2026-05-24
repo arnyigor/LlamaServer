@@ -98,24 +98,34 @@ def _kv_candidates(
     return vals
 
 
+def _block_count(model_info: Dict[str, Any]) -> int:
+    return max(0, int(model_info.get("block_count") or 0))
+
+
 def _full_ngl_for_model(model_info: Dict[str, Any]) -> int:
-    # llama-bench historically used -ngl 99 for "all GPU layers".  For server
-    # parity after AutoTune we keep NGL numeric instead of saving UI "auto":
-    # both llama-bench and llama-server will then receive the same -ngl value.
-    block_count = int(model_info.get("block_count") or 0)
-    return max(99, block_count + 1)
+    # Если GGUF metadata содержит число transformer-блоков, AutoTune должен
+    # показывать и сохранять реальное NGL (например 40), а не llama.cpp sentinel
+    # 99. Sentinel оставляем только как fallback для моделей без block_count.
+    blocks = _block_count(model_info)
+    return blocks if blocks > 0 else 99
+
+
+def _clamp_layer_value(value: int, model_info: Dict[str, Any]) -> int:
+    value = max(0, int(value))
+    blocks = _block_count(model_info)
+    return min(value, blocks) if blocks > 0 else value
 
 
 def _gpu_layers_for_estimate(settings: Any, model_info: Dict[str, Any]) -> int:
     if getattr(settings, "gpu_auto", True):
         return _full_ngl_for_model(model_info)
-    return int(getattr(settings, "gpu_layers", 0) or 0)
+    return _clamp_layer_value(int(getattr(settings, "gpu_layers", 0) or 0), model_info)
 
 
 def _ngl_candidates(settings: Any, model_info: Dict[str, Any], mode: str, target: str) -> List[int]:
     """Small NGL search space: full offload plus nearby/current fallbacks."""
     full = _full_ngl_for_model(model_info)
-    current = full if getattr(settings, "gpu_auto", True) else max(0, int(getattr(settings, "gpu_layers", 0) or 0))
+    current = full if getattr(settings, "gpu_auto", True) else _clamp_layer_value(int(getattr(settings, "gpu_layers", 0) or 0), model_info)
     vals = [current, full]
 
     # Low VRAM and MoE often benefit from testing a slightly lower offload level;
@@ -129,27 +139,40 @@ def _ngl_candidates(settings: Any, model_info: Dict[str, Any], mode: str, target
 
     result: List[int] = []
     for v in vals:
-        v = max(0, int(v))
+        v = _clamp_layer_value(int(v), model_info)
         if v not in result:
             result.append(v)
     return result
 
 
-def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> int:
+def _clamp_ncmoe_value(value: int, model_info: Dict[str, Any], ngl: int | None = None) -> int:
+    if value < 0:
+        return -1
+    blocks = _block_count(model_info)
+    max_value = blocks if blocks > 0 else int(value)
+    if ngl is not None and ngl >= 0:
+        # -ncmoe отвечает за MoE-слои, которые иначе попали бы в GPU-offload.
+        # При частичном NGL нет смысла тестировать ncmoe больше числа GPU layers.
+        max_value = min(max_value, int(ngl))
+    return max(0, min(int(value), max_value))
+
+
+def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int, ngl: int | None = None) -> int:
     if not _is_moe(model_info):
         # Для dense-моделей -ncmoe неприменим. Не переносим сюда stale-значение
         # из UI, оставшееся после MoE-модели.
         return -1
+    effective_ngl = _gpu_layers_for_estimate(settings, model_info) if ngl is None else _clamp_layer_value(ngl, model_info)
     advice = compute_moe_advice(
         model_info,
         ctx_size,
-        _gpu_layers_for_estimate(settings, model_info),
+        effective_ngl,
         "q8_0",
         "q8_0",
         bool(getattr(settings, "flash_attn", True)),
         max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
     )
-    return max(0, int(advice.recommended_ncmoe))
+    return _clamp_ncmoe_value(int(advice.recommended_ncmoe), model_info, effective_ngl)
 
 
 def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Dict[str, Any]:
@@ -168,13 +191,13 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
 
     ctx_checkpoints = int(getattr(settings, "ctx_checkpoints", -1))
     cache_ram = int(getattr(settings, "cache_ram", -2))
-    if ctx_size >= 131072:
-        # Для 128K+ дефолтный prompt cache/checkpoints может сильно замедлять
-        # реальный llama-server, хотя llama-bench этого не видит.
-        if ctx_checkpoints < 0:
-            ctx_checkpoints = 0
-        if cache_ram < 0:
-            cache_ram = 0
+    # llama-bench не измеряет prompt cache/checkpoints. Чтобы применённый после
+    # AutoTune server работал как benchmark, нейтрализуем эти server-only механизмы
+    # во всех AutoTune-пресетах, если пользователь не задал явное значение.
+    if ctx_checkpoints < 0:
+        ctx_checkpoints = 0
+    if cache_ram < 0:
+        cache_ram = 0
 
     return {
         "ngl": _gpu_layers_for_estimate(settings, model_info),
@@ -202,7 +225,10 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
         "ncmoe": -1,
         "ctx_checkpoints": ctx_checkpoints,
         "cache_ram": cache_ram,
-        "use_mmproj": bool(getattr(settings, "use_mmproj", True)),
+        # llama-bench не загружает mmproj. Для server/benchmark parity после
+        # AutoTune отключаем mmproj в применяемом пресете; иначе server может
+        # тратить VRAM/время на projector, который не участвовал в benchmark.
+        "use_mmproj": False,
         "model_type": "moe" if _is_moe(model_info) else "dense",
     }
 
@@ -266,11 +292,13 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
     block_count = int(model_info.get("block_count") or 0)
     should_test_moe = _target_key(target) == "moe_optimized" or ctx_size >= 131072
     if expert_count > 1 and should_test_moe:
-        recommended = _recommended_ncmoe(settings, model_info, ctx_size)
+        base_ngl = int(base.get("ngl") or 0)
+        recommended = _recommended_ncmoe(settings, model_info, ctx_size, base_ngl)
         moe_values = [recommended, 0]
         if block_count > 0 and _target_key(target) == "moe_optimized":
             moe_values += [max(1, block_count // 4), max(1, block_count // 2)]
         for ncmoe in moe_values:
+            ncmoe = _clamp_ncmoe_value(ncmoe, model_info, base_ngl)
             p = dict(base, ncmoe=ncmoe)
             _append_unique(candidates, seen, p, f"MoE ncmoe {ncmoe}", "moe")
 
@@ -336,12 +364,14 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
     expert_count = int(model_info.get("expert_count") or 0)
     block_count = int(model_info.get("block_count") or 0)
     if expert_count > 1:
-        recommended = _recommended_ncmoe(settings, model_info, ctx_size)
+        base_ngl = int(base.get("ngl") or 0)
+        recommended = _recommended_ncmoe(settings, model_info, ctx_size, base_ngl)
         moe_values = [recommended, 0]
         if block_count > 0:
             moe_values += [max(1, block_count // 4), max(1, block_count // 2), max(1, block_count * 3 // 4)]
         moe_values.append(-1)
         for ncmoe in moe_values:
+            ncmoe = _clamp_ncmoe_value(ncmoe, model_info, base_ngl)
             p = dict(base, ncmoe=ncmoe)
             _append_unique(candidates, seen, p, f"MoE ncmoe {ncmoe}", "moe")
 
