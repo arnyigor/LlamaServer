@@ -81,10 +81,9 @@ jobs:
       - name: Run tests
         run: ${{ matrix.venv_python }} -m pytest
 
-      - name: Build executables
+      - name: Build executable
         run: |
-          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServer --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
-          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
+          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
 
       - name: Add default config files and create archive
         shell: bash
