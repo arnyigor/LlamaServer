@@ -83,6 +83,9 @@ class LlamaGUI:
         u.cache_type_v.currentIndexChanged.connect(self._on_param_changed)
         u.flash_attn.stateChanged.connect(self._on_param_changed)
         u.parallel_slots.valueChanged.connect(self._on_param_changed)
+        u.kv_unified.stateChanged.connect(self._on_param_changed)
+        u.speculative_mtp.stateChanged.connect(self._on_param_changed)
+        u.spec_draft_n_max.valueChanged.connect(self._on_param_changed)
         u.cpu_moe_layers.valueChanged.connect(self._on_param_changed)
         u.gpu_auto.stateChanged.connect(self._on_param_changed)
         u.batch_size.valueChanged.connect(self._on_param_changed)
@@ -993,6 +996,15 @@ class LlamaGUI:
             )
             self.ui.parallel_slots.setValue(
                 int(params.get("parallel_slots", self.ui.parallel_slots.value()))
+            )
+            self.ui.kv_unified.setChecked(
+                bool(params.get("kv_unified", self.ui.kv_unified.isChecked()))
+            )
+            self.ui.speculative_mtp.setChecked(
+                bool(params.get("speculative_mtp", self.ui.speculative_mtp.isChecked()))
+            )
+            self.ui.spec_draft_n_max.setValue(
+                int(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value()))
             )
             self.ui.flash_attn.setChecked(
                 bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))

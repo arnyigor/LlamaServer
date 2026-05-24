@@ -57,6 +57,9 @@ class AppSettings:
     batch_size: int = -1
     ubatch_size: int = -1
     parallel_slots: int = -1
+    kv_unified: bool = False
+    speculative_mtp: bool = False
+    spec_draft_n_max: int = 3
     ctx_checkpoints: int = -1
     cache_ram: int = -2
     cont_batching: bool = True
@@ -102,6 +105,9 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "batch_size": "batch_size",
     "ubatch_size": "ubatch_size",
     "parallel_slots": "parallel_slots",
+    "kv_unified": "kv_unified",
+    "speculative_mtp": "speculative_mtp",
+    "spec_draft_n_max": "spec_draft_n_max",
     "ctx_checkpoints": "ctx_checkpoints",
     "cache_ram": "cache_ram",
     "cont_batching": "cont_batching",
@@ -127,6 +133,9 @@ _PERF_PRESET_FIELDS = (
     "batch_size",
     "ubatch_size",
     "parallel_slots",
+    "kv_unified",
+    "speculative_mtp",
+    "spec_draft_n_max",
     "flash_attn",
     "fit_off",
     "reasoning_mode",
@@ -158,6 +167,9 @@ _AUTOTUNE_PARAM_TO_SETTING = {
     "threads": "threads",
     "threads_batch": "threads_batch",
     "parallel_slots": "parallel_slots",
+    "kv_unified": "kv_unified",
+    "speculative_mtp": "speculative_mtp",
+    "spec_draft_n_max": "spec_draft_n_max",
     "flash_attn": "flash_attn",
     "fit_off": "fit_off",
     "cache_prompt": "cache_prompt",
@@ -176,6 +188,18 @@ _MANAGED_EXTRA_FLAGS = {
     "--ctx-size",
     "--ctx-checkpoints",
     "--cache-ram",
+    "--kv-unified",
+    "-kvu",
+    "--spec-type",
+    "--spec-draft-n-max",
+    "--spec-draft-n-min",
+    "--spec-draft-p-min",
+    "--spec-draft-ngl",
+    "-ngld",
+    "--spec-draft-type-k",
+    "-ctkd",
+    "--spec-draft-type-v",
+    "-ctvd",
     "--jinja",
     "--no-cache-prompt",
     "--flash-attn",
@@ -305,6 +329,8 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
         "gpu_auto",
         "flash_attn",
         "fit_off",
+        "kv_unified",
+        "speculative_mtp",
         "use_mmap",
         "use_mlock",
         "verbose",
@@ -326,6 +352,7 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
         "batch_size",
         "ubatch_size",
         "parallel_slots",
+        "spec_draft_n_max",
         "ctx_checkpoints",
         "cache_ram",
     }

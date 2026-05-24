@@ -58,6 +58,14 @@ def _is_moe(model_info: Dict[str, Any]) -> bool:
     return int(model_info.get("expert_count") or 0) > 1
 
 
+def _is_mtp_model(model_info: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str(model_info.get(k) or "")
+        for k in ("path", "name", "display", "_model_path")
+    ).lower()
+    return "mtp" in text
+
+
 def _kv_candidates(
     target: str,
     mode: str,
@@ -81,6 +89,10 @@ def _kv_candidates(
         vals = [("q8_0", "q8_0"), ("q4_0", "q4_0"), ("f16", "f16")]
         if not quick:
             vals.insert(2, ("q4_0", "q8_0"))
+    elif _is_mtp_model(model_info or {}) and key != "low_vram":
+        # MTP speculative decoding in llama.cpp/LM Studio is typically fastest
+        # with f16 target KV and f16 draft KV when enough VRAM is available.
+        vals = [("f16", "f16"), ("q8_0", "q8_0"), ("q4_0", "q4_0")]
     elif key == "quality_kv":
         vals = [("f16", "f16"), ("q8_0", "q8_0")]
         if not quick:
@@ -163,14 +175,15 @@ def _recommended_ncmoe(settings: Any, model_info: Dict[str, Any], ctx_size: int,
         # из UI, оставшееся после MoE-модели.
         return -1
     effective_ngl = _gpu_layers_for_estimate(settings, model_info) if ngl is None else _clamp_layer_value(ngl, model_info)
+    mtp_model = _is_mtp_model(model_info)
     advice = compute_moe_advice(
         model_info,
         ctx_size,
         effective_ngl,
-        "q8_0",
-        "q8_0",
+        "f16" if mtp_model else "q8_0",
+        "f16" if mtp_model else "q8_0",
         bool(getattr(settings, "flash_attn", True)),
-        max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
+        4 if mtp_model else max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
     )
     return _clamp_ncmoe_value(int(advice.recommended_ncmoe), model_info, effective_ngl)
 
@@ -199,6 +212,9 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
     if cache_ram < 0:
         cache_ram = 0
 
+    mtp_model = _is_mtp_model(model_info)
+    parallel_slots = 4 if mtp_model else 1
+
     return {
         "ngl": _gpu_layers_for_estimate(settings, model_info),
         "ctx_size": int(ctx_size),
@@ -212,7 +228,10 @@ def _base_params(settings: Any, model_info: Dict[str, Any], ctx_size: int) -> Di
         # -np=2 из UI, сервер делит контекст по слотам и может стать в 1.5-2 раза
         # медленнее, хотя bench показывал высокий TG. Quick AutoTune подбирает
         # latency preset для одного слота; server throughput-тест будет отдельным engine.
-        "parallel_slots": 1,
+        "parallel_slots": parallel_slots,
+        "kv_unified": mtp_model,
+        "speculative_mtp": mtp_model,
+        "spec_draft_n_max": 3,
         "flash_attn": bool(getattr(settings, "flash_attn", True)),
         # Не даём llama-server делать auto-fit после AutoTune. Иначе он может
         # перекинуть часть тензоров на CPU, что llama-bench не измерял.
@@ -250,7 +269,10 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
     seen: set = set()
 
     safe_ubatch = 256 if ctx_size >= 131072 and not _is_moe(model_info) else 512
-    safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
+    if _is_mtp_model(model_info):
+        safe_kv = ("f16", "f16")
+    else:
+        safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
     base.update(
         {
             "cache_type_k": safe_kv[0],
@@ -290,7 +312,7 @@ def _quick_candidates(settings: Any, model_info: Dict[str, Any], ctx_size: int, 
 
     expert_count = int(model_info.get("expert_count") or 0)
     block_count = int(model_info.get("block_count") or 0)
-    should_test_moe = _target_key(target) == "moe_optimized" or ctx_size >= 131072
+    should_test_moe = _target_key(target) == "moe_optimized" or ctx_size >= 131072 or _is_mtp_model(model_info)
     if expert_count > 1 and should_test_moe:
         base_ngl = int(base.get("ngl") or 0)
         recommended = _recommended_ncmoe(settings, model_info, ctx_size, base_ngl)
@@ -310,7 +332,10 @@ def _normal_or_deep_candidates(settings: Any, model_info: Dict[str, Any], ctx_si
     seen = {tuple(sorted((k, str(v)) for k, v in c.params.items())) for c in candidates}
     base = _base_params(settings, model_info, ctx_size)
     safe_ubatch = 256 if ctx_size >= 131072 and not _is_moe(model_info) else 512
-    safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
+    if _is_mtp_model(model_info):
+        safe_kv = ("f16", "f16")
+    else:
+        safe_kv = ("q4_0", "q4_0") if ctx_size >= 131072 and not _is_moe(model_info) else ("q8_0", "q8_0")
     base.update({"cache_type_k": safe_kv[0], "cache_type_v": safe_kv[1], "batch_size": 1024, "ubatch_size": safe_ubatch})
 
     batch_values: Iterable[int] = (512, 1024, 2048, 4096)
@@ -393,7 +418,8 @@ def build_autotune_plan(
     early_stop_drop_pct: float = 3.0,
 ) -> AutoTunePlan:
     """Создаёт ограниченный staged-план AutoTune."""
-    info = model_info or {}
+    info = dict(model_info or {})
+    info.setdefault("_model_path", model_path)
     mode_key = _mode_key(mode)
     ctx_size = _ctx_from_settings(settings, info)
     budget = int(time_budget_sec or _TIME_BUDGETS.get(mode_key, _TIME_BUDGETS["quick"]))

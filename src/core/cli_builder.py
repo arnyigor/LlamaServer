@@ -109,6 +109,16 @@ def _filter_duplicate_extra_args(
         "--reasoning",
         "--ctx-checkpoints",
         "--cache-ram",
+        "--spec-type",
+        "--spec-draft-n-max",
+        "--spec-draft-n-min",
+        "--spec-draft-p-min",
+        "--spec-draft-ngl",
+        "-ngld",
+        "--spec-draft-type-k",
+        "-ctkd",
+        "--spec-draft-type-v",
+        "-ctvd",
         "--temp",
         "--repeat-penalty",
         "--flash-attn",
@@ -129,6 +139,8 @@ def _filter_duplicate_extra_args(
         "--context-shift",
         "--no-webui",
         "--jinja",
+        "--kv-unified",
+        "-kvu",
     }
     managed = {_flag_base(a) for a in existing_args if str(a).startswith("-")}
     filtered: List[str] = []
@@ -247,6 +259,8 @@ def build_args(
             args += ["-b", str(bs), "-ub", str(min(ub, bs))]
         if cfg.parallel_slots >= 0:
             args += ["-np", str(cfg.parallel_slots)]
+        if getattr(cfg, "kv_unified", False):
+            args.append("--kv-unified")
         args += [
             "-ctk",
             cfg.cache_type_k,
@@ -281,6 +295,23 @@ def build_args(
             args += ["--repeat-penalty", str(cfg.repeat_penalty)]
         if cfg.flash_attn:
             args += ["--flash-attn", "on"]
+        if getattr(cfg, "speculative_mtp", False):
+            args += [
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                str(max(1, int(getattr(cfg, "spec_draft_n_max", 3) or 3))),
+                "--spec-draft-n-min",
+                "0",
+                "--spec-draft-p-min",
+                "0.00",
+                "--spec-draft-ngl",
+                "-1",
+                "--spec-draft-type-k",
+                "f16",
+                "--spec-draft-type-v",
+                "f16",
+            ]
 
         # mmproj logic expects model_info dict, passed separately if needed
         # handled in UI layer or passed via kwargs if necessary.

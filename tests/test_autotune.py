@@ -178,6 +178,36 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertTrue(all(c.params["parallel_slots"] == 1 for c in plan.candidates))
         self.assertFalse(any(c.stage == "moe" for c in plan.candidates))
 
+    def test_mtp_moe_plan_uses_real_ngl_speculative_and_ncmoe_candidates(self):
+        settings = AutoTuneSettingsStub(ctx_size=32768, cpu_moe_layers=8, parallel_slots=1)
+        plan = build_autotune_plan(
+            settings,
+            "G:/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+            {
+                "path": "G:/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+                "architecture": "qwen35moe",
+                "expert_count": 256,
+                "expert_used": 0,
+                "block_count": 41,
+                "head_count": 16,
+                "embedding_length": 2048,
+                "size_gib": 21.28,
+            },
+            mode="quick",
+            target="balanced",
+            max_runs=20,
+        )
+
+        self.assertEqual(plan.candidates[0].params["ngl"], 41)
+        self.assertEqual(plan.candidates[0].params["parallel_slots"], 4)
+        self.assertTrue(plan.candidates[0].params["kv_unified"])
+        self.assertTrue(plan.candidates[0].params["speculative_mtp"])
+        self.assertEqual(plan.candidates[0].params["cache_type_k"], "f16")
+        self.assertEqual(plan.candidates[0].params["cache_type_v"], "f16")
+        moe_candidates = [c for c in plan.candidates if c.stage == "moe"]
+        self.assertGreaterEqual(len(moe_candidates), 1)
+        self.assertTrue(all(0 <= c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates))
+
     def test_moe_huge_context_quick_keeps_moe_candidates_limited(self):
         settings = AutoTuneSettingsStub(ctx_size=131072, cpu_moe_layers=8)
         plan = build_autotune_plan(
