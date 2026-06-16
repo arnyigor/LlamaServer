@@ -1,8 +1,9 @@
 """Управление процессами llama-server и llama-bench."""
 
+import os
 import sys
 
-from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 from src.core.constants import KILL_TIMEOUT_SERVER, KILL_TIMEOUT_BENCHMARK
 
 
@@ -83,8 +84,30 @@ class ServerManager(QObject):
         self.bench_stop_requested = False
         self.bench_finished.emit(code)
 
-    def start_server(self, exe: str, args: list):
+    def _prepare_process_environment(
+        self, proc: QProcess, exe: str, env: dict | None = None
+    ):
+        exe_dir = os.path.dirname(os.path.abspath(exe)) if exe else ""
+        if exe_dir:
+            proc.setWorkingDirectory(exe_dir)
+
+        process_env = QProcessEnvironment.systemEnvironment()
+        path_key = "Path" if sys.platform.startswith("win") else "PATH"
+        alt_path_key = "PATH" if path_key == "Path" else "Path"
+        current_path = process_env.value(path_key) or process_env.value(alt_path_key)
+        if exe_dir and exe_dir not in current_path.split(os.pathsep):
+            process_env.insert(
+                path_key,
+                exe_dir + (os.pathsep + current_path if current_path else ""),
+            )
+        for key, value in (env or {}).items():
+            if key and value is not None and str(value).strip() != "":
+                process_env.insert(str(key), str(value))
+        proc.setProcessEnvironment(process_env)
+
+    def start_server(self, exe: str, args: list, env: dict | None = None):
         self.server_stop_requested = False
+        self._prepare_process_environment(self.server_proc, exe, env)
         self.server_proc.start(exe, args)
         self.state_changed.emit(True)
 
@@ -113,8 +136,9 @@ class ServerManager(QObject):
             self._emit("⚠️ Сервер не завершился штатно, принудительная остановка")
             self.force_stop_server()
 
-    def start_bench(self, exe: str, args: list):
+    def start_bench(self, exe: str, args: list, env: dict | None = None):
         self.bench_stop_requested = False
+        self._prepare_process_environment(self.bench_proc, exe, env)
         self.bench_proc.start(exe, args)
         self.state_changed.emit(True)
 

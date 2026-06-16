@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -58,6 +59,8 @@ class LlamaGUI:
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
+        self._normalize_llamacpp_path_ui()
+        self.auto_detect_bench()
         self._connect_signals()
         self._setup_tray()
         QTimer.singleShot(250, self.auto_scan_models)
@@ -79,6 +82,7 @@ class LlamaGUI:
                 )
             )
         u.gpu_layers.valueChanged.connect(self._on_gpu_layers_changed)
+        u.gpu_layers_all.stateChanged.connect(self._on_param_changed)
         u.cache_type_k.currentIndexChanged.connect(self._on_param_changed)
         u.cache_type_v.currentIndexChanged.connect(self._on_param_changed)
         u.flash_attn.stateChanged.connect(self._on_param_changed)
@@ -86,6 +90,11 @@ class LlamaGUI:
         u.kv_unified.stateChanged.connect(self._on_param_changed)
         u.speculative_mtp.stateChanged.connect(self._on_param_changed)
         u.spec_draft_n_max.valueChanged.connect(self._on_param_changed)
+        u.spec_draft_gpu_layers.textChanged.connect(self._on_param_changed)
+        u.cuda_device.textChanged.connect(self._on_param_changed)
+        u.spec_draft_device.textChanged.connect(self._on_param_changed)
+        u.split_mode.currentIndexChanged.connect(self._on_param_changed)
+        u.main_gpu.valueChanged.connect(self._on_param_changed)
         u.cpu_moe_layers.valueChanged.connect(self._on_param_changed)
         u.gpu_auto.stateChanged.connect(self._on_param_changed)
         u.batch_size.valueChanged.connect(self._on_param_changed)
@@ -94,6 +103,7 @@ class LlamaGUI:
         u.threads_batch.valueChanged.connect(self._on_param_changed)
         u.fit_off.stateChanged.connect(self._on_param_changed)
         u.reasoning_mode.currentIndexChanged.connect(self._on_param_changed)
+        u.host.textChanged.connect(self._on_param_changed)
         u.port.valueChanged.connect(self._on_param_changed)
         u.ctx_checkpoints.valueChanged.connect(self._on_param_changed)
         u.cache_ram.valueChanged.connect(self._on_param_changed)
@@ -103,6 +113,8 @@ class LlamaGUI:
         u.use_mlock.stateChanged.connect(self._on_param_changed)
         u.verbose.stateChanged.connect(self._on_param_changed)
         u.log_timestamps.stateChanged.connect(self._on_param_changed)
+        u.cuda_visible_devices.textChanged.connect(self._on_param_changed)
+        u.cuda_module_loading.textChanged.connect(self._on_param_changed)
         u.cont_batching.stateChanged.connect(self._on_param_changed)
         u.cache_prompt.stateChanged.connect(self._on_param_changed)
         u.context_shift.stateChanged.connect(self._on_param_changed)
@@ -113,6 +125,9 @@ class LlamaGUI:
         u.jinja.stateChanged.connect(self._on_param_changed)
         u.enable_thinking.currentIndexChanged.connect(self._on_param_changed)
         u.update_llama_btn.clicked.connect(self.update_llamacpp)
+        u.cuda_version_combo.currentIndexChanged.connect(
+            self._on_llamacpp_version_changed
+        )
         u.integration_check_btn.clicked.connect(self.check_integration_models)
         u.integration_add_btn.clicked.connect(self.add_model_to_integration)
         u.integration_remove_btn.clicked.connect(self.remove_model_from_integration)
@@ -120,6 +135,8 @@ class LlamaGUI:
         u.opencode_config_path.editingFinished.connect(self._on_config_path_changed)
         u.pi_config_path.editingFinished.connect(self._on_config_path_changed)
         u.exe_path.textChanged.connect(self.auto_detect_bench)
+        u.exe_path.textChanged.connect(self.update_cli_preview)
+        u.copy_model_btn.clicked.connect(self._copy_model_path)
         u._browse_exe_clicked = self.browse_exe
         u._browse_bench_clicked = self.browse_bench
         u._browse_model_dir_clicked = self.browse_model_dir
@@ -184,9 +201,105 @@ class LlamaGUI:
         self.tray.show()
 
     def save_settings(self):
+        self.auto_detect_bench()
         self.config.read_from_ui(self.ui)
         self.config.settings.model_cache = self.ui.models
         self.config.save()
+
+    def _selected_cuda_version(self) -> str:
+        return str(self.ui.cuda_version_combo.currentData() or "12")
+
+    def _llamacpp_cuda_major(self, path: Path) -> str:
+        match = re.search(r"cuda-(\d+)(?:[.-]|$)", path.name.lower())
+        return match.group(1) if match else ""
+
+    def _llamacpp_version_key(self, path: Path):
+        match = re.search(r"cuda-(\d+)\.(\d+)", path.name.lower())
+        if not match:
+            return (0, 0)
+        return (int(match.group(1)), int(match.group(2)))
+
+    def _matching_llamacpp_dirs(self, base: Path, cuda_version: str):
+        if not base.is_dir():
+            return []
+        pattern = re.compile(
+            rf"cuda-{re.escape(str(cuda_version))}(?:\.|-|$)", re.IGNORECASE
+        )
+        try:
+            dirs = [
+                p
+                for p in base.iterdir()
+                if p.is_dir() and pattern.search(p.name) and "x64" in p.name.lower()
+            ]
+        except OSError:
+            return []
+        return sorted(dirs, key=self._llamacpp_version_key, reverse=True)
+
+    def _normalize_llamacpp_path_ui(self):
+        """Миграция старого пути к exe в новый базовый путь, если формат узнаваем."""
+        text = self.ui.exe_path.text().strip().strip('"')
+        if not text:
+            return
+        path = Path(text)
+        if path.name.lower() != "llama-server.exe":
+            return
+        parent = path.parent
+        if self._llamacpp_cuda_major(parent) and parent.parent:
+            self.ui.exe_path.setText(str(parent.parent))
+
+    def _resolve_llamacpp_executable(self, kind: str = "server") -> str:
+        exe_name = f"llama-{kind}.exe"
+        raw = self.ui.exe_path.text().strip().strip('"')
+        if not raw:
+            return ""
+
+        selected_cuda = self._selected_cuda_version()
+        path = Path(raw)
+        candidate_dirs = []
+
+        if path.suffix.lower() == ".exe":
+            parent = path.parent
+            parent_cuda = self._llamacpp_cuda_major(parent)
+            if parent_cuda and parent_cuda != selected_cuda:
+                candidate_dirs.extend(
+                    self._matching_llamacpp_dirs(parent.parent, selected_cuda)
+                )
+            candidate_dirs.append(parent)
+        else:
+            path_cuda = self._llamacpp_cuda_major(path)
+            if path_cuda:
+                if path_cuda == selected_cuda:
+                    candidate_dirs.append(path)
+                candidate_dirs.extend(
+                    self._matching_llamacpp_dirs(path.parent, selected_cuda)
+                )
+                candidate_dirs.append(path)
+            else:
+                candidate_dirs.extend(self._matching_llamacpp_dirs(path, selected_cuda))
+                candidate_dirs.append(path)
+
+        seen = set()
+        for directory in candidate_dirs:
+            key = os.path.normcase(str(directory))
+            if key in seen:
+                continue
+            seen.add(key)
+            exe = directory / exe_name
+            if exe.exists():
+                return str(exe)
+        return ""
+
+    def _on_llamacpp_version_changed(self):
+        self.auto_detect_bench()
+        self.update_cli_preview()
+        self.save_settings()
+        self._mark_restart_needed()
+
+    def _copy_model_path(self):
+        path = self._current_model_path()
+        if path:
+            QApplication.clipboard().setText(path)
+            self.log_mgr.append(f"Model path copied: {path}")
 
     def _current_model_path(self):
         path = self.ui.model_combo.currentData()
@@ -284,23 +397,24 @@ class LlamaGUI:
         return True
 
     def auto_detect_bench(self):
-        srv = self.ui.exe_path.text()
-        if srv and os.path.exists(srv):
-            bench = os.path.join(
-                os.path.dirname(srv), os.path.basename(srv).replace("server", "bench")
-            )
-            if os.path.exists(bench):
-                self.ui.bench_path.setText(bench)
+        bench = self._resolve_llamacpp_executable("bench")
+        if bench:
+            self.ui.bench_path.setText(bench)
+        return bench
 
     def browse_exe(self):
-        f, _ = QFileDialog.getOpenFileName(
-            self.ui, "Select llama-server", "", "Executable (*.exe)"
+        d = QFileDialog.getExistingDirectory(
+            self.ui,
+            "Select llama.cpp base folder",
+            self.ui.exe_path.text().strip() or "",
         )
-        if f:
-            self.ui.exe_path.setText(f)
+        if d:
+            self.ui.exe_path.setText(d)
+            self.auto_detect_bench()
             self.save_settings()
 
     def browse_bench(self):
+        # Kept for backward compatibility; bench is normally auto-detected from base folder.
         f, _ = QFileDialog.getOpenFileName(
             self.ui, "Select llama-bench", "", "Executable (*.exe)"
         )
@@ -379,6 +493,8 @@ class LlamaGUI:
                 self.ui.model_info.setText("Select model")
                 return
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
+        info.setdefault("path", path)
+        info.setdefault("_model_path", path)
         self.ui.models_by_path[path] = info
 
         arch = info.get("architecture") or "?"
@@ -420,6 +536,8 @@ class LlamaGUI:
             parts.append(f"Warning: {info['metadata_error']}")
 
         self.ui.model_info.setText("\n".join(parts))
+        model_name = Path(path).name if path else ""
+        self.ui.model_id_label.setText(f"{model_name}\n{path or ''}")
 
         self._refresh_tooltips(info)
 
@@ -434,9 +552,35 @@ class LlamaGUI:
 
         ctx_size = self.ui.ctx_size.value()
         self._try_load_perf_preset(path, ctx_size)
+        self._sync_mtp_controls_for_model(info)
 
         self.update_cli_preview()
         self._mark_restart_needed()
+
+    def _sync_mtp_controls_for_model(self, info):
+        is_mtp = self._is_mtp_model_info(info)
+        for widget in (
+            self.ui.spec_draft_n_max,
+            self.ui.spec_draft_gpu_layers,
+            self.ui.spec_draft_device,
+        ):
+            widget.setEnabled(is_mtp)
+        self.ui.speculative_mtp.setEnabled(is_mtp)
+        if is_mtp:
+            self.ui.speculative_mtp.setToolTip(
+                "Enable llama.cpp MTP speculative decoding for GGUFs with MTP layers"
+            )
+            return
+
+        if self.ui.speculative_mtp.isChecked():
+            self.ui.speculative_mtp.setChecked(False)
+            self.log_mgr.append(
+                "MTP speculative disabled: selected model does not contain MTP layers",
+                "warn",
+            )
+        self.ui.speculative_mtp.setToolTip(
+            "Disabled: selected GGUF is not an MTP model. Use Extra params only if you know this model supports it."
+        )
 
     def _refresh_tooltips(self, info):
         """Обновление tooltip для ncmoe и ctx при смене модели."""
@@ -444,7 +588,9 @@ class LlamaGUI:
 
         if expert_count:
             gpu_layers_val = (
-                999 if self.ui.gpu_auto.isChecked() else self.ui.gpu_layers.value()
+                999
+                if self.ui.gpu_auto.isChecked() or self.ui.gpu_layers_all.isChecked()
+                else self.ui.gpu_layers.value()
             )
             tooltip = build_ncmoe_tooltip(
                 info=info,
@@ -473,26 +619,41 @@ class LlamaGUI:
 
     def _is_mtp_model_info(self, info):
         text = " ".join(
-            str(info.get(k) or "") for k in ("path", "name", "display", "architecture")
+            str(info.get(k) or "")
+            for k in ("path", "name", "display", "architecture", "_model_path")
         ).lower()
         return "mtp" in text
 
     def _apply_mtp_recommended_params(self, info):
         block_count = int(info.get("block_count") or 0)
+        self.ui.gpu_auto.setChecked(False)
+        self.ui.gpu_layers_all.setChecked(True)
         if block_count > 0:
-            self.ui.gpu_auto.setChecked(False)
             self.ui.gpu_layers.setValue(block_count)
-        self.ui.cache_type_k.setCurrentText("f16")
-        self.ui.cache_type_v.setCurrentText("f16")
+        self.ui.cache_type_k.setCurrentText("q8_0")
+        self.ui.cache_type_v.setCurrentText("q8_0")
         self.ui.batch_size.setValue(512)
-        self.ui.ubatch_size.setValue(512)
-        self.ui.parallel_slots.setValue(4)
-        self.ui.kv_unified.setChecked(True)
+        self.ui.ubatch_size.setValue(256)
+        self.ui.parallel_slots.setValue(1)
+        self.ui.kv_unified.setChecked(False)
         self.ui.speculative_mtp.setChecked(True)
-        self.ui.spec_draft_n_max.setValue(3)
+        self.ui.spec_draft_n_max.setValue(2)
+        self.ui.spec_draft_gpu_layers.setText("all")
+        self.ui.cuda_device.setText("CUDA0")
+        self.ui.spec_draft_device.setText("CUDA0")
+        self.ui.split_mode.setCurrentText("none")
+        self.ui.main_gpu.setValue(0)
+        self.ui.cuda_visible_devices.setText("0")
+        self.ui.cuda_module_loading.setText("LAZY")
+        logical = max(os.cpu_count() or 4, 1)
+        self.ui.threads.setValue(min(8, logical))
+        self.ui.threads_batch.setValue(min(16, logical))
+        self.ui.fit_off.setChecked(False)
         self.ui.reasoning_mode.setCurrentText("off")
         self.ui.enable_thinking.setCurrentText("false")
-        self.ui.jinja.setChecked(False)
+        self.ui.cache_prompt.setChecked(True)
+        self.ui.use_mmproj.setChecked(False)
+        self.ui.jinja.setChecked(True)
         self.ui.context_shift.setChecked(False)
 
     def apply_recommended_params(self, info):
@@ -534,7 +695,9 @@ class LlamaGUI:
             return
 
         gpu_layers_val = (
-            999 if self.ui.gpu_auto.isChecked() else self.ui.gpu_layers.value()
+            999
+            if self.ui.gpu_auto.isChecked() or self.ui.gpu_layers_all.isChecked()
+            else self.ui.gpu_layers.value()
         )
         tooltip = build_ncmoe_tooltip(
             info=info,
@@ -596,7 +759,7 @@ class LlamaGUI:
         try:
             self.config.read_from_ui(self.ui)
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
-            exe = self.ui.exe_path.text() or "llama-server.exe"
+            exe = self._resolve_llamacpp_executable("server") or "llama-server.exe"
             self.ui.cli_preview.setText(f"{exe} {' '.join(args)}" if args else "")
         except Exception:
             self.ui.cli_preview.setText("")
@@ -672,32 +835,63 @@ class LlamaGUI:
                 "Stop benchmark before starting server",
             )
             return None
-        exe = self.ui.exe_path.text()
+        exe = self._resolve_llamacpp_executable("server")
         if not exe or not os.path.exists(exe):
-            QMessageBox.critical(self.ui, "Error", "Specify path to llama-server.exe")
+            QMessageBox.critical(
+                self.ui,
+                "Error",
+                "Select llama.cpp base folder with the requested CUDA build.",
+            )
             return None
         self.config.read_from_ui(self.ui)
         # resolve mmproj
-        info = self.ui.models_by_path.get(self.ui.model_combo.currentData()) or {}
-        if self.ui.auto_params.isChecked() and self._is_mtp_model_info(info):
+        model_path = self.ui.model_combo.currentData()
+        info = self.ui.models_by_path.get(model_path) or {}
+        if model_path:
+            info.setdefault("path", model_path)
+            info.setdefault("_model_path", model_path)
+        is_mtp_model = self._is_mtp_model_info(info)
+        if not is_mtp_model:
+            # Сохранённый MTP-чекбокс/пресет не должен ломать обычные GGUF.
+            # Пользовательские эксперименты всё ещё можно задать вручную в Extra params.
+            self.config.settings.speculative_mtp = False
+        if self.ui.auto_params.isChecked() and is_mtp_model:
             block_count = int(info.get("block_count") or 0)
-            if self.config.settings.gpu_auto and block_count > 0:
-                self.config.settings.gpu_auto = False
+            self.config.settings.gpu_auto = False
+            self.config.settings.gpu_layers_all = True
+            if block_count > 0:
                 self.config.settings.gpu_layers = block_count
-            # AutoTune уже подобрал KV; не перезаписываем f16 поверх q8_0.
-            # Если preset не загружен — оставляем текущий UI KV.
-            if not getattr(self, "_autotune_preset_loaded", False):
-                self.config.settings.cache_type_k = "f16"
-                self.config.settings.cache_type_v = "f16"
-            self.config.settings.parallel_slots = max(
-                4, int(self.config.settings.parallel_slots or 4)
-            )
-            self.config.settings.kv_unified = True
+            self.config.settings.cache_type_k = "q8_0"
+            self.config.settings.cache_type_v = "q8_0"
+            self.config.settings.batch_size = 512
+            self.config.settings.ubatch_size = 256
+            self.config.settings.parallel_slots = 1
+            self.config.settings.kv_unified = False
             self.config.settings.speculative_mtp = True
-            self.config.settings.spec_draft_n_max = 3
+            self.config.settings.spec_draft_n_max = 2
+            self.config.settings.spec_draft_gpu_layers = "all"
+            self.config.settings.cuda_device = (
+                self.config.settings.cuda_device or "CUDA0"
+            )
+            self.config.settings.spec_draft_device = (
+                self.config.settings.spec_draft_device
+                or self.config.settings.cuda_device
+            )
+            self.config.settings.split_mode = self.config.settings.split_mode or "none"
+            if self.config.settings.main_gpu < 0:
+                self.config.settings.main_gpu = 0
+            self.config.settings.cuda_visible_devices = (
+                self.config.settings.cuda_visible_devices or "0"
+            )
+            self.config.settings.cuda_module_loading = (
+                self.config.settings.cuda_module_loading or "LAZY"
+            )
+            self.config.settings.fit_off = False
             self.config.settings.reasoning_mode = "off"
             self.config.settings.enable_thinking = "false"
-            self.config.settings.jinja = False
+            self.config.settings.cache_prompt = True
+            self.config.settings.use_mmproj = False
+            self.config.settings.jinja = True
             self.config.settings.context_shift = False
         self.config.settings.mmproj_path = info.get("mmproj_path", "")
         try:
@@ -707,14 +901,39 @@ class LlamaGUI:
             return None
         if not args:
             return None
-        return exe, args
+        env = self._server_env_from_settings()
+        return exe, args, env
+
+    def _server_env_from_settings(self):
+        env = {}
+        cuda_visible = str(
+            getattr(self.config.settings, "cuda_visible_devices", "") or ""
+        ).strip()
+        cuda_loading = str(
+            getattr(self.config.settings, "cuda_module_loading", "") or ""
+        ).strip()
+        if cuda_visible:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_visible
+        if cuda_loading:
+            env["CUDA_MODULE_LOADING"] = cuda_loading
+        return env
 
     def _launch_server(
-        self, exe: str, args: list[str], action: str = "Starting server"
+        self,
+        exe: str,
+        args: list[str],
+        env: dict | None = None,
+        action: str = "Starting server",
     ):
-        self.log_mgr.append(f"{action}: {exe}\n   Args: {' '.join(args)}")
+        cuda_ver = self._selected_cuda_version()
+        env_text = ""
+        if env:
+            env_text = "\n   Env: " + " ".join(f"{k}={v}" for k, v in env.items())
+        self.log_mgr.append(
+            f"{action} [CUDA {cuda_ver}]: {exe}\n   Args: {' '.join(args)}{env_text}"
+        )
         self._reset_mem_viz()
-        self.server.start_server(exe, args)
+        self.server.start_server(exe, args, env=env)
         self._reset_restart_indicator()
         self.ui.start_btn.setVisible(False)
         self.ui.reload_btn.setVisible(True)
@@ -737,8 +956,8 @@ class LlamaGUI:
         self._restart_pending = False
         self._pending_restart_launch = None
         if launch:
-            exe, args = launch
-            self._launch_server(exe, args, action="Restarting server")
+            exe, args, env = launch
+            self._launch_server(exe, args, env=env, action="Restarting server")
 
     def restart_server(self):
         """Перезапускает llama-server с текущими параметрами UI."""
@@ -762,8 +981,8 @@ class LlamaGUI:
         launch = self._prepare_server_launch()
         if not launch:
             return
-        exe, args = launch
-        self._launch_server(exe, args)
+        exe, args, env = launch
+        self._launch_server(exe, args, env=env)
 
     def run_benchmark(self):
         if self.server.is_server_running():
@@ -771,10 +990,13 @@ class LlamaGUI:
                 self.ui, "Server running", "Stop server before running benchmark"
             )
             return
-        self.auto_detect_bench()
-        bexe = self.ui.bench_path.text()
+        bexe = self.auto_detect_bench()
         if not bexe or not os.path.exists(bexe):
-            QMessageBox.critical(self.ui, "Error", "Specify path to llama-bench.exe")
+            QMessageBox.critical(
+                self.ui,
+                "Error",
+                "llama-bench.exe was not found in the selected CUDA build folder.",
+            )
             return
         self.config.read_from_ui(self.ui)
         try:
@@ -788,11 +1010,16 @@ class LlamaGUI:
             return
         if not args:
             return
+        env = self._server_env_from_settings()
+        env_text = ""
+        if env:
+            env_text = "\n   Env: " + " ".join(f"{k}={v}" for k, v in env.items())
         self.log_mgr.append(
-            f"Running benchmark: {os.path.basename(bexe)}\n   Params: {' '.join(args)}"
+            f"Running benchmark [CUDA {self._selected_cuda_version()}]: {os.path.basename(bexe)}\n"
+            f"   Params: {' '.join(args)}{env_text}"
         )
         self._reset_mem_viz()
-        self.server.start_bench(bexe, args)
+        self.server.start_bench(bexe, args, env=env)
         self.ui.test_btn.setEnabled(False)
         self.ui.test_btn.setText("Testing...")
         self.ui.start_btn.setEnabled(False)
@@ -904,10 +1131,13 @@ class LlamaGUI:
             return
         if self.autotune and self.autotune.isRunning():
             return
-        self.auto_detect_bench()
-        bexe = self.ui.bench_path.text().strip()
+        bexe = self.auto_detect_bench()
         if not bexe or not os.path.exists(bexe):
-            QMessageBox.critical(self.ui, "AutoTune", "Specify path to llama-bench.exe")
+            QMessageBox.critical(
+                self.ui,
+                "AutoTune",
+                "llama-bench.exe was not found in the selected CUDA build folder.",
+            )
             return
         plan = self.autotune_plan or self.build_autotune_plan()
         if not plan:
@@ -1114,7 +1344,7 @@ class LlamaGUI:
         launch = self._prepare_server_launch()
         if not launch:
             return
-        exe, args = launch
+        exe, args, env = launch
         expected_cli = f"{exe} {' '.join(args)}"
         self._pending_server_verify = {
             "started_at": time.monotonic(),
@@ -1127,11 +1357,13 @@ class LlamaGUI:
             "info",
         )
         if self.server.is_server_running():
-            self._pending_restart_launch = (exe, args)
+            self._pending_restart_launch = (exe, args, env)
             self._restart_pending = True
             self.server.stop_server()
         else:
-            self._launch_server(exe, args, action="Starting verified AutoTune server")
+            self._launch_server(
+                exe, args, env=env, action="Starting verified AutoTune server"
+            )
         QTimer.singleShot(1200, self._poll_verified_server)
 
     def _poll_verified_server(self):
@@ -1376,6 +1608,15 @@ class LlamaGUI:
         self.ui.force_stop_btn.setEnabled(True)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
+        self.ui.cuda_version_combo.setEnabled(not busy and not upd)
+        self.ui.exe_path.setEnabled(not busy and not upd)
+        # Lock model & all params while server/bench/autotune is running
+        lock = busy or upd
+        for w in getattr(self.ui, "_runtime_lockable", []):
+            try:
+                w.setEnabled(not lock)
+            except RuntimeError:
+                pass
         self.ui.reload_btn.setEnabled(
             srv
             and not bnch
@@ -1398,20 +1639,23 @@ class LlamaGUI:
             QMessageBox.warning(self.ui, "Updater", "Stop processes before updating.")
             return
         exe = self.ui.exe_path.text().strip()
-        if not exe or not os.path.exists(exe):
+        if not exe:
             QMessageBox.critical(
-                self.ui, "Updater", "Select existing llama-server.exe first."
+                self.ui, "Updater", "Select llama.cpp base folder first."
             )
             return
         self.ui.update_progress.setValue(0)
         self.ui.update_progress.setVisible(True)
-        self.updater = LlamaCppUpdater(exe)
+        cuda_version = self.ui.cuda_version_combo.currentData() or "12"
+        self.updater = LlamaCppUpdater(exe, cuda_version=cuda_version)
         self.updater.progress.connect(self.ui.update_status.setText)
         self.updater.percent.connect(self.ui.update_progress.setValue)
         self.updater.completed.connect(
-            lambda ch, msg: self.ui.update_status.setText(msg)
-            or self.auto_detect_bench()
-            or self.save_settings()
+            lambda ch, msg: (
+                self.ui.update_status.setText(msg),
+                self.auto_detect_bench(),
+                self.save_settings(),
+            )
         )
         self.updater.finished.connect(
             lambda: self.ui.update_progress.setVisible(False)

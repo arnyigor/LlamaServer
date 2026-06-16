@@ -220,9 +220,12 @@ class TestAutoTunePlan(unittest.TestCase):
         )
 
         self.assertEqual(plan.candidates[0].params["ngl"], 41)
-        self.assertEqual(plan.candidates[0].params["parallel_slots"], 4)
-        self.assertTrue(plan.candidates[0].params["kv_unified"])
+        self.assertEqual(plan.candidates[0].params["parallel_slots"], 1)
+        self.assertFalse(plan.candidates[0].params["kv_unified"])
         self.assertTrue(plan.candidates[0].params["speculative_mtp"])
+        self.assertTrue(plan.candidates[0].params["gpu_layers_all"])
+        self.assertEqual(plan.candidates[0].params["spec_draft_n_max"], 2)
+        self.assertEqual(plan.candidates[0].params["spec_draft_gpu_layers"], "all")
         self.assertEqual(plan.candidates[0].params["cache_type_k"], "q8_0")
         self.assertEqual(plan.candidates[0].params["cache_type_v"], "q8_0")
         moe_candidates = [c for c in plan.candidates if c.stage in {"moe", "moe_vram"}]

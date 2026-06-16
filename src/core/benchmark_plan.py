@@ -212,7 +212,7 @@ def _recommended_ncmoe(
         "q8_0",
         "q8_0",
         bool(getattr(settings, "flash_attn", True)),
-        4 if mtp_model else max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
+        1 if mtp_model else max(1, int(getattr(settings, "parallel_slots", 1) or 1)),
     )
     return _clamp_ncmoe_value(int(advice.recommended_ncmoe), model_info, effective_ngl)
 
@@ -352,7 +352,7 @@ def _base_params(
         cache_ram = 0
 
     mtp_model = _is_mtp_model(model_info)
-    parallel_slots = 4 if mtp_model else 1
+    parallel_slots = 1
     current_ncmoe = int(getattr(settings, "cpu_moe_layers", -1) or -1)
     base_ncmoe = (
         _clamp_ncmoe_value(
@@ -376,9 +376,11 @@ def _base_params(
         # медленнее, хотя bench показывал высокий TG. Quick AutoTune подбирает
         # latency preset для одного слота; server throughput-тест будет отдельным engine.
         "parallel_slots": parallel_slots,
-        "kv_unified": mtp_model,
+        "kv_unified": False,
         "speculative_mtp": mtp_model,
-        "spec_draft_n_max": 3,
+        "spec_draft_n_max": 2 if mtp_model else 3,
+        "gpu_layers_all": mtp_model,
+        "spec_draft_gpu_layers": "all",
         "flash_attn": bool(getattr(settings, "flash_attn", True)),
         # Не даём llama-server делать auto-fit после AutoTune. Иначе он может
         # перекинуть часть тензоров на CPU, что llama-bench не измерял.

@@ -77,13 +77,19 @@ class MainWindowUI(QMainWindow):
         lp.setContentsMargins(12, 18, 12, 12)
         lp.setSpacing(8)
 
-        self.exe_path = QLineEdit(placeholderText="Path to llama-server.exe")
-        self.bench_path = QLineEdit(placeholderText="Path to llama-bench.exe (auto)")
+        self.exe_path = QLineEdit(placeholderText="Base folder with llama.cpp builds")
+        self.exe_path.setToolTip(
+            "Select the folder that contains version folders, e.g.\n"
+            "G:/AIModels/llamacpp/\n\n"
+            "Expected subfolders are auto-detected by CUDA version:\n"
+            "llama-win-cuda-12.4-x64 / llama-win-cuda-13.3-x64"
+        )
+        self.bench_path = QLineEdit(placeholderText="Auto-detected llama-bench.exe")
+        self.bench_path.setVisible(False)
         self.model_dir = QLineEdit(placeholderText="Base folder with models")
 
         for line, label, slot in [
-            (self.exe_path, "Exe:", "_browse_exe_clicked"),
-            (self.bench_path, "Bench:", "_browse_bench_clicked"),
+            (self.exe_path, "Llama.cpp:", "_browse_exe_clicked"),
             (self.model_dir, "Models:", "_browse_model_dir_clicked"),
         ]:
             row = QHBoxLayout()
@@ -91,13 +97,23 @@ class MainWindowUI(QMainWindow):
             row.addWidget(line, 1)
             btn = QPushButton("...")
             btn.setFixedWidth(32)
-            btn.clicked.connect(getattr(self, slot))
+            btn.clicked.connect(lambda _checked=False, s=slot: getattr(self, s)())
             row.addWidget(btn)
             lp.addLayout(row)
 
         upd_row = QHBoxLayout()
+        self.cuda_version_combo = QComboBox()
+        self.cuda_version_combo.addItem("CUDA 12", "12")
+        self.cuda_version_combo.addItem("CUDA 13", "13")
+        self.cuda_version_combo.setMaximumWidth(110)
+        self.cuda_version_combo.setToolTip(
+            "CUDA major version for llama.cpp builds.\n"
+            "CUDA 13 also downloads additional cudart DLLs.\n"
+            "Minor version (12.4 / 13.3) is auto-detected from release."
+        )
         self.update_llama_btn = QPushButton("Update llama.cpp")
         self.update_status = QLabel("idle", wordWrap=True)
+        upd_row.addWidget(self.cuda_version_combo)
         upd_row.addWidget(self.update_llama_btn)
         upd_row.addWidget(self.update_status, 1)
         lp.addLayout(upd_row)
@@ -151,7 +167,23 @@ class MainWindowUI(QMainWindow):
         lm.addLayout(mmproj_row)
 
         self.model_info = QLabel("Select model")
+        self.model_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.model_id_label = QLabel("")
+        self.model_id_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.model_id_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.model_id_label.setWordWrap(True)
+        self.copy_model_btn = QPushButton("Copy model path")
+        self.copy_model_btn.setFixedHeight(22)
+        self.copy_model_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        mrow = QHBoxLayout()
+        mrow.addWidget(self.copy_model_btn)
+        mrow.addWidget(self.model_id_label, 1)
         lm.addWidget(self.model_info)
+        lm.addLayout(mrow)
         lay.addWidget(g_model)
 
         self.speed_label = QLabel("Speed: -")
@@ -171,8 +203,17 @@ class MainWindowUI(QMainWindow):
         self.gpu_layers.setValue(33)
         self.gpu_auto = QCheckBox("auto")
         self.gpu_auto.setChecked(True)
-        self.gpu_auto.toggled.connect(self.gpu_layers.setDisabled)
-        self.gpu_layers.setDisabled(True)
+        self.gpu_layers_all = QCheckBox("all")
+
+        def sync_gpu_layer_controls():
+            self.gpu_layers.setDisabled(
+                self.gpu_auto.isChecked() or self.gpu_layers_all.isChecked()
+            )
+            self.gpu_auto.setDisabled(self.gpu_layers_all.isChecked())
+
+        self.gpu_auto.toggled.connect(lambda _checked: sync_gpu_layer_controls())
+        self.gpu_layers_all.toggled.connect(lambda _checked: sync_gpu_layer_controls())
+        sync_gpu_layer_controls()
         self.cpu_moe_layers = QSpinBox()
         self.cpu_moe_layers.setRange(-1, 200)
         self.cpu_moe_layers.setValue(-1)
@@ -182,6 +223,7 @@ class MainWindowUI(QMainWindow):
         r1.addWidget(QLabel("GPU Layers (-ngl):"))
         r1.addWidget(self.gpu_layers)
         r1.addWidget(self.gpu_auto)
+        r1.addWidget(self.gpu_layers_all)
         r1.addSpacing(10)
         r1.addWidget(QLabel("CPU MoE (-ncmoe):"))
         r1.addWidget(self.cpu_moe_layers)
@@ -288,13 +330,16 @@ class MainWindowUI(QMainWindow):
         self.enable_thinking.addItems(["off", "false", "true"])
         self.enable_thinking.setCurrentText("off")
         r7 = QHBoxLayout()
-        r7.addWidget(QLabel("Reasoning (-rea):"))
+        r7.addWidget(QLabel("Reasoning (--reasoning):"))
         r7.addWidget(self.reasoning_mode)
         r7.addSpacing(10)
-        r7.addWidget(QLabel("Thinking (--ctk):"))
+        r7.addWidget(QLabel("Thinking:"))
         r7.addWidget(self.enable_thinking)
         lperf.addLayout(r7)
 
+        self.host = QLineEdit(placeholderText="127.0.0.1")
+        self.host.setText("127.0.0.1")
+        self.host.setMaximumWidth(120)
         self.port = QSpinBox()
         self.port.setRange(1024, 65535)
         self.port.setValue(8080)
@@ -303,6 +348,8 @@ class MainWindowUI(QMainWindow):
         self.parallel_slots.setValue(-1)
         self.parallel_slots.setSpecialValueText("auto")
         r8 = QHBoxLayout()
+        r8.addWidget(QLabel("Host:"))
+        r8.addWidget(self.host)
         r8.addWidget(QLabel("Port:"))
         r8.addWidget(self.port)
         r8.addSpacing(10)
@@ -315,13 +362,38 @@ class MainWindowUI(QMainWindow):
         self.spec_draft_n_max = QSpinBox()
         self.spec_draft_n_max.setRange(1, 8)
         self.spec_draft_n_max.setValue(3)
+        self.spec_draft_gpu_layers = QLineEdit(placeholderText="all")
+        self.spec_draft_gpu_layers.setText("all")
+        self.spec_draft_gpu_layers.setMaximumWidth(60)
         r8b = QHBoxLayout()
         r8b.addWidget(self.kv_unified)
         r8b.addWidget(self.speculative_mtp)
         r8b.addSpacing(10)
-        r8b.addWidget(QLabel("MTP draft max:"))
+        r8b.addWidget(QLabel("MTP n/draft ngl:"))
         r8b.addWidget(self.spec_draft_n_max)
+        r8b.addWidget(self.spec_draft_gpu_layers)
         lperf.addLayout(r8b)
+
+        self.cuda_device = QLineEdit(placeholderText="CUDA0")
+        self.cuda_device.setMaximumWidth(80)
+        self.spec_draft_device = QLineEdit(placeholderText="CUDA0")
+        self.spec_draft_device.setMaximumWidth(80)
+        self.split_mode = QComboBox()
+        self.split_mode.addItems(["", "none", "layer", "row"])
+        self.main_gpu = QSpinBox()
+        self.main_gpu.setRange(-1, 16)
+        self.main_gpu.setSpecialValueText("auto")
+        self.main_gpu.setValue(-1)
+        r8c = QHBoxLayout()
+        r8c.addWidget(QLabel("Device:"))
+        r8c.addWidget(self.cuda_device)
+        r8c.addWidget(QLabel("Draft device:"))
+        r8c.addWidget(self.spec_draft_device)
+        r8c.addWidget(QLabel("Split:"))
+        r8c.addWidget(self.split_mode)
+        r8c.addWidget(QLabel("Main GPU:"))
+        r8c.addWidget(self.main_gpu)
+        lperf.addLayout(r8c)
 
         self.ctx_checkpoints = QSpinBox()
         self.ctx_checkpoints.setRange(-1, 128)
@@ -371,6 +443,18 @@ class MainWindowUI(QMainWindow):
         for w in [self.use_mmap, self.use_mlock, self.verbose, self.log_timestamps]:
             s2.addWidget(w)
         self.adv_panel.add_layout(s2)
+
+        self.cuda_visible_devices = QLineEdit(placeholderText="CUDA_VISIBLE_DEVICES")
+        self.cuda_visible_devices.setMaximumWidth(120)
+        self.cuda_module_loading = QLineEdit(placeholderText="CUDA_MODULE_LOADING")
+        self.cuda_module_loading.setText("LAZY")
+        self.cuda_module_loading.setMaximumWidth(80)
+        s_cuda = QHBoxLayout()
+        s_cuda.addWidget(QLabel("CUDA env:"))
+        s_cuda.addWidget(self.cuda_visible_devices)
+        s_cuda.addWidget(self.cuda_module_loading)
+        s_cuda.addStretch(1)
+        self.adv_panel.add_layout(s_cuda)
 
         self.cont_batching = QCheckBox("cont batching")
         self.cont_batching.setChecked(True)
@@ -527,6 +611,61 @@ class MainWindowUI(QMainWindow):
         lay.addLayout(btn_row)
         lay.addStretch()
 
+        # Collect all widgets that must be locked while server/bench/autotune runs
+        self._runtime_lockable = [
+            self.model_combo,
+            self.auto_params,
+            self.use_mmproj,
+            self.mmproj_offload,
+            self.scan_btn,
+            self.gpu_layers,
+            self.gpu_auto,
+            self.gpu_layers_all,
+            self.cpu_moe_layers,
+            self.ctx_size,
+            self.batch_size,
+            self.ubatch_size,
+            self.threads,
+            self.threads_batch,
+            self.cache_type_k,
+            self.cache_type_v,
+            self.flash_attn,
+            self.fit_off,
+            self.temperature,
+            self.repeat_penalty,
+            self.use_mmap,
+            self.use_mlock,
+            self.verbose,
+            self.log_timestamps,
+            self.parallel_slots,
+            self.kv_unified,
+            self.speculative_mtp,
+            self.spec_draft_n_max,
+            self.spec_draft_gpu_layers,
+            self.spec_draft_device,
+            self.cuda_device,
+            self.split_mode,
+            self.main_gpu,
+            self.ctx_checkpoints,
+            self.cache_ram,
+            self.host,
+            self.port,
+            self.cont_batching,
+            self.cache_prompt,
+            self.context_shift,
+            self.no_webui,
+            self.jinja,
+            self.reasoning_mode,
+            self.enable_thinking,
+            self.extra_args,
+            self.cuda_visible_devices,
+            self.cuda_module_loading,
+            self.bench_prompt,
+            self.bench_gen,
+            self.save_preset_btn,
+        ]
+        self._runtime_lockable.extend(getattr(self, "ctx_quick_buttons", []))
+
         scroll = QScrollArea(
             widgetResizable=True,
             horizontalScrollBarPolicy=Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
@@ -576,8 +715,11 @@ class MainWindowUI(QMainWindow):
 
     def _setup_tooltips(self):
         tips = {
-            self.exe_path: "Path to llama-server.exe",
-            self.bench_path: "Path to llama-bench.exe",
+            self.exe_path: (
+                "Base folder containing llama-win-cuda-* build folders, e.g. "
+                "G:/AIModels/llamacpp/"
+            ),
+            self.bench_path: "Auto-detected llama-bench.exe",
             self.model_dir: "Root folder for .gguf search",
             self.scan_btn: "Scans models folder",
             self.model_combo: "Selected GGUF model",

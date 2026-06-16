@@ -78,25 +78,32 @@ class LlamaCppUpdater(QThread):
     completed = Signal(bool, str)
     API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
-    def __init__(self, server_path):
+    def __init__(self, server_path, cuda_version="12"):
         super().__init__()
         self.server_path = Path(server_path)
+        self.cuda_version = cuda_version
 
     def run(self):
         try:
-            if not self.server_path.exists():
-                raise FileNotFoundError(
-                    f"llama-server.exe not found: {self.server_path}"
-                )
-            target_dir = self.server_path.parent
-            current_build = self.get_current_build()
             release = self.fetch_latest_release()
             latest_build = self.parse_build_number(release.get("tag_name", ""))
             if latest_build is None:
                 raise RuntimeError(
                     f"Cannot parse release tag: {release.get('tag_name')}"
                 )
-            current_text = current_build if current_build is not None else "unknown"
+
+            assets = self.select_assets(release)
+            if not assets:
+                raise RuntimeError(
+                    "No Windows release asset found in the latest release"
+                )
+
+            target_dir = self.resolve_target_dir(assets)
+            server_exe = target_dir / "llama-server.exe"
+            current_build = self.get_current_build(server_exe)
+            current_text = (
+                current_build if current_build is not None else "not installed"
+            )
             self.progress.emit(
                 f"llama.cpp local build: {current_text}, latest: {latest_build}"
             )
@@ -105,16 +112,14 @@ class LlamaCppUpdater(QThread):
                 self.completed.emit(False, f"Already up to date: build {current_build}")
                 return
 
-            # Create backup before downloading new version
-            self.progress.emit("Creating backup...")
-            backup_path = self.backup_binaries(target_dir)
-            self.progress.emit(f"Backup created: {backup_path.name}")
+            if target_dir.exists() and any(target_dir.glob("*.exe")):
+                self.progress.emit("Creating backup...")
+                backup_path = self.backup_binaries(target_dir)
+                self.progress.emit(f"Backup created: {backup_path.name}")
+            else:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                self.progress.emit(f"Installing new llama.cpp into {target_dir}")
 
-            assets = self.select_assets(release)
-            if not assets:
-                raise RuntimeError(
-                    "No Windows release asset found in the latest release"
-                )
             with tempfile.TemporaryDirectory(prefix="llamacpp-update-") as temp_dir:
                 temp_path = Path(temp_dir)
                 extract_dir = temp_path / "extract"
@@ -133,19 +138,31 @@ class LlamaCppUpdater(QThread):
                     )
                 self.progress.emit(f"Installing into {target_dir}")
                 self.copy_tree_contents(install_root, target_dir)
+                # Merge cudart DLLs from other extracted subdirs if any
+                for subdir in extract_dir.iterdir():
+                    if subdir.is_dir() and subdir.resolve() != install_root.resolve():
+                        # Copy any .dll files from sibling dirs (cudart etc.)
+                        for dll in subdir.rglob("*.dll"):
+                            dest = target_dir / dll.name
+                            if not dest.exists():
+                                self.progress.emit(f"Installing DLL: {dll.name}")
+                                shutil.copy2(dll, dest)
             self.percent.emit(100)
             self.completed.emit(True, f"Updated llama.cpp to build {latest_build}")
         except Exception as exc:
             self.completed.emit(False, f"Update failed: {exc}")
 
-    def get_current_build(self):
+    def get_current_build(self, server_path=None):
+        server_path = Path(server_path or self.server_path)
+        if not server_path.exists():
+            return None
         try:
             result = subprocess.run(
-                [str(self.server_path), "--version"],
+                [str(server_path), "--version"],
                 capture_output=True,
                 text=True,
                 timeout=20,
-                cwd=str(self.server_path.parent),
+                cwd=str(server_path.parent),
                 check=False,
             )
         except Exception as exc:
@@ -185,22 +202,92 @@ class LlamaCppUpdater(QThread):
             return num if num >= 1 else None
         return None
 
+    def resolve_target_dir(self, assets):
+        """Возвращает папку установки для выбранного архива.
+
+        Если передан путь к exe или к папке с llama-server.exe — обновляем её.
+        Если передана базовая папка, создаём/обновляем подпапку вида
+        llama-win-cuda-12.4-x64 или llama-win-cuda-13.3-x64.
+        """
+        source = self.server_path
+        if source.suffix.lower() == ".exe":
+            return source.parent
+        if source.is_dir() and (source / "llama-server.exe").exists():
+            return source
+
+        for asset in assets:
+            name = asset.get("name", "")
+            match = re.match(r"^llama-b\d+-bin-win-cuda-(\d+\.\d+)-x64\.zip$", name)
+            if match:
+                return source / f"llama-win-cuda-{match.group(1)}-x64"
+            if re.match(r"^llama-b\d+-bin-win-vulkan-x64\.zip$", name):
+                return source / "llama-win-vulkan-x64"
+            if re.match(r"^llama-b\d+-bin-win-cpu-x64\.zip$", name):
+                return source / "llama-win-cpu-x64"
+        return source / f"llama-win-cuda-{self.cuda_version}-x64"
+
     def select_assets(self, release):
         assets = release.get("assets", [])
-        # Priority order: CUDA 12.4 > any CUDA > Vulkan > AVX2 > generic Windows
-        patterns = [
-            (re.compile(r"^llama-b\d+-bin-win-cuda-12\.4-x64\.zip$"), "CUDA 12.4"),
-            (re.compile(r"^llama-b\d+-bin-win-cuda-.*\.zip$"), "CUDA"),
-            (re.compile(r"^llama-b\d+-bin-win-vulkan-.*\.zip$"), "Vulkan"),
-            (re.compile(r"^llama-b\d+-bin-win-avx2-.*\.zip$"), "AVX2"),
-            (re.compile(r"^llama-b\d+-bin-win-.*\.zip$"), "Windows"),
-        ]
-        for pattern, label in patterns:
+        cv = self.cuda_version  # "12" or "13"
+        result = []
+
+        # 1) Find main binaries for the selected CUDA major version
+        #    Pattern: llama-b{build}-bin-win-cuda-{major}.{minor}-x64.zip
+        bin_pattern = re.compile(
+            rf"^llama-b\d+-bin-win-cuda-{re.escape(cv)}\.\d+-x64\.zip$"
+        )
+        bin_asset = None
+        for asset in assets:
+            if bin_pattern.match(asset.get("name", "")):
+                bin_asset = asset
+                break
+
+        if bin_asset:
+            result.append(bin_asset)
+            self.progress.emit(f"Selected CUDA {cv} build: {bin_asset['name']}")
+        else:
+            # Fallback: try any CUDA asset matching the major version prefix
+            fallback = re.compile(rf"^llama-b\d+-bin-win-cuda-{re.escape(cv)}.*\.zip$")
             for asset in assets:
-                if pattern.match(asset.get("name", "")):
-                    self.progress.emit(f"Selected {label} build: {asset['name']}")
-                    return [asset]
-        return []
+                if fallback.match(asset.get("name", "")):
+                    bin_asset = asset
+                    result.append(asset)
+                    self.progress.emit(
+                        f"Selected CUDA {cv} build (fallback): {asset['name']}"
+                    )
+                    break
+
+        if bin_asset:
+            # 2) Find cudart DLLs for the selected CUDA major version
+            #    Pattern: cudart-llama-bin-win-cuda-{major}.{minor}-x64.zip
+            cudart_pattern = re.compile(
+                rf"^cudart-llama-bin-win-cuda-{re.escape(cv)}\.\d+-x64\.zip$"
+            )
+            for asset in assets:
+                if cudart_pattern.match(asset.get("name", "")):
+                    result.append(asset)
+                    self.progress.emit(
+                        f"Selected CUDA {cv} runtime DLLs: {asset['name']}"
+                    )
+                    break
+            return result
+
+        # 3) If no CUDA build found at all, fallback to Vulkan → CPU
+        if not result:
+            fallback_patterns = [
+                (re.compile(r"^llama-b\d+-bin-win-vulkan-x64\.zip$"), "Vulkan"),
+                (re.compile(r"^llama-b\d+-bin-win-cpu-x64\.zip$"), "CPU x64"),
+            ]
+            for pattern, label in fallback_patterns:
+                for asset in assets:
+                    if pattern.match(asset.get("name", "")):
+                        result.append(asset)
+                        self.progress.emit(
+                            f"CUDA {cv} not available, fallback to {label}: {asset['name']}"
+                        )
+                        return result
+
+        return result
 
     def download(self, url, destination):
         request = urllib.request.Request(url, headers={"User-Agent": "LlamaServerGUI"})

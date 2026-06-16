@@ -72,6 +72,16 @@ def _flag_base(arg: str) -> str:
     return arg.split("=", 1)[0] if arg.startswith("-") else arg
 
 
+def _is_value_token(arg: str) -> bool:
+    if not str(arg).startswith("-"):
+        return True
+    try:
+        float(str(arg))
+        return True
+    except ValueError:
+        return False
+
+
 def _filter_duplicate_extra_args(
     extra: List[str], existing_args: List[str]
 ) -> List[str]:
@@ -84,6 +94,11 @@ def _filter_duplicate_extra_args(
         "-m",
         "--model",
         "--port",
+        "--host",
+        "--device",
+        "--spec-draft-device",
+        "--split-mode",
+        "--main-gpu",
         "-ngl",
         "--n-gpu-layers",
         "-t",
@@ -152,7 +167,7 @@ def _filter_duplicate_extra_args(
             if (
                 "=" not in arg
                 and i + 1 < len(extra)
-                and not extra[i + 1].startswith("-")
+                and _is_value_token(extra[i + 1])
             ):
                 i += 2
             else:
@@ -183,7 +198,8 @@ def build_benchmark_args_from_params(
     # Context Size остаётся частью AutoTune-плана/пресета, но в llama-bench проверяется через
     # выбранные prompt/gen размеры; полный server-context тест будет отдельным server-engine этапом.
     ngl = params.get("ngl", "auto")
-    args += ["-ngl", "99" if str(ngl).lower() == "auto" else str(ngl)]
+    ngl_text = str(ngl).strip().lower()
+    args += ["-ngl", "99" if ngl_text in {"auto", "all"} else str(ngl)]
 
     flash_attn = bool(params.get("flash_attn", True))
     args += ["-fa", "1" if flash_attn else "0"]
@@ -222,10 +238,14 @@ def build_args(
         return None
 
     args = ["-m", model_path]
+    gpu_layers_all = bool(getattr(cfg, "gpu_layers_all", False))
     if for_benchmark:
-        gpu_val = "99" if cfg.gpu_auto else str(cfg.gpu_layers)
+        gpu_val = "99" if cfg.gpu_auto or gpu_layers_all else str(cfg.gpu_layers)
     else:
-        gpu_val = "auto" if cfg.gpu_auto else str(cfg.gpu_layers)
+        if gpu_layers_all:
+            gpu_val = "all"
+        else:
+            gpu_val = "auto" if cfg.gpu_auto else str(cfg.gpu_layers)
 
     if for_benchmark:
         args += ["-p", str(cfg.bench_prompt), "-n", str(cfg.bench_gen), "-ngl", gpu_val]
@@ -243,14 +263,21 @@ def build_args(
         if cfg.cpu_moe_layers >= 0:
             args += ["-ncmoe", str(cfg.cpu_moe_layers)]
     else:
-        args += [
-            "--port",
-            str(cfg.port),
-            "-ngl",
-            gpu_val,
-            "-t",
-            str(cfg.threads),
-        ]
+        args += ["--host", str(getattr(cfg, "host", "127.0.0.1") or "127.0.0.1")]
+        args += ["--port", str(cfg.port)]
+        device = str(getattr(cfg, "cuda_device", "") or "").strip()
+        if device:
+            args += ["--device", device]
+        split_mode = str(getattr(cfg, "split_mode", "") or "").strip()
+        if split_mode:
+            args += ["--split-mode", split_mode]
+        main_gpu_raw = getattr(cfg, "main_gpu", -1)
+        main_gpu = (
+            -1 if main_gpu_raw is None or main_gpu_raw == "" else int(main_gpu_raw)
+        )
+        if main_gpu >= 0:
+            args += ["--main-gpu", str(main_gpu)]
+        args += ["-ngl", gpu_val, "-t", str(cfg.threads)]
         if cfg.ctx_size >= 0:
             args += ["-c", str(cfg.ctx_size)]
         if cfg.threads_batch > 0:
@@ -273,8 +300,6 @@ def build_args(
             args += ["-ncmoe", str(cfg.cpu_moe_layers)]
         if cfg.fit_off:
             args += ["--fit", "off"]
-        if cfg.reasoning_mode != "auto":
-            args += ["-rea", cfg.reasoning_mode]
         thinking = getattr(cfg, "enable_thinking", "off")
         if thinking is True:
             thinking = "true"
@@ -282,11 +307,15 @@ def build_args(
             thinking = "off"
         else:
             thinking = str(thinking).strip().lower()
-        if thinking in {"false", "true"}:
-            args += [
-                "--chat-template-kwargs",
-                f'{{"enable_thinking":{thinking}}}',
-            ]
+        reasoning_mode = (
+            str(getattr(cfg, "reasoning_mode", "auto") or "auto").strip().lower()
+        )
+        if thinking == "false":
+            reasoning_mode = "off"
+        elif thinking == "true" and reasoning_mode == "auto":
+            reasoning_mode = "on"
+        if reasoning_mode != "auto":
+            args += ["--reasoning", reasoning_mode]
         if cfg.ctx_checkpoints >= 0:
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:
@@ -301,6 +330,12 @@ def build_args(
             # Draft KV следует за target KV: если target q8_0, draft тоже q8_0.
             draft_kv_k = getattr(cfg, "cache_type_k", "f16")
             draft_kv_v = getattr(cfg, "cache_type_v", "f16")
+            draft_device = str(getattr(cfg, "spec_draft_device", "") or "").strip()
+            draft_ngl = str(
+                getattr(cfg, "spec_draft_gpu_layers", "all") or "all"
+            ).strip()
+            if draft_device:
+                args += ["--spec-draft-device", draft_device]
             args += [
                 "--spec-type",
                 "draft-mtp",
@@ -311,7 +346,7 @@ def build_args(
                 "--spec-draft-p-min",
                 "0.00",
                 "--spec-draft-ngl",
-                "-1",
+                draft_ngl,
                 "--spec-draft-type-k",
                 str(draft_kv_k),
                 "--spec-draft-type-v",

@@ -40,11 +40,19 @@ class AppSettings:
     repeat_penalty: float = -1.0
     gpu_auto: bool = True
     gpu_layers: int = 33
+    gpu_layers_all: bool = False
     cpu_moe_layers: int = -1
     ctx_size: int = -1
     threads: int = 4
     threads_batch: int = 0
     port: int = 8080
+    host: str = "127.0.0.1"
+    cuda_device: str = ""
+    spec_draft_device: str = ""
+    split_mode: str = ""
+    main_gpu: int = -1
+    cuda_visible_devices: str = ""
+    cuda_module_loading: str = "LAZY"
     flash_attn: bool = True
     fit_off: bool = True
     reasoning_mode: str = "off"
@@ -60,6 +68,7 @@ class AppSettings:
     kv_unified: bool = False
     speculative_mtp: bool = False
     spec_draft_n_max: int = 3
+    spec_draft_gpu_layers: str = "all"
     ctx_checkpoints: int = -1
     cache_ram: int = -2
     cont_batching: bool = True
@@ -69,6 +78,7 @@ class AppSettings:
     jinja: bool = False
     extra_args: str = ""
     enable_thinking: str = "off"
+    cuda_version: str = "12"
 
 
 # Явная таблица маппинга: поле -> атрибут виджета в UI
@@ -86,11 +96,19 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "mmproj_offload": "mmproj_offload",
     "gpu_auto": "gpu_auto",
     "gpu_layers": "gpu_layers",
+    "gpu_layers_all": "gpu_layers_all",
     "cpu_moe_layers": "cpu_moe_layers",
     "ctx_size": "ctx_size",
     "threads": "threads",
     "threads_batch": "threads_batch",
     "port": "port",
+    "host": "host",
+    "cuda_device": "cuda_device",
+    "spec_draft_device": "spec_draft_device",
+    "split_mode": "split_mode",
+    "main_gpu": "main_gpu",
+    "cuda_visible_devices": "cuda_visible_devices",
+    "cuda_module_loading": "cuda_module_loading",
     "temperature": "temperature",
     "repeat_penalty": "repeat_penalty",
     "flash_attn": "flash_attn",
@@ -108,6 +126,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "kv_unified": "kv_unified",
     "speculative_mtp": "speculative_mtp",
     "spec_draft_n_max": "spec_draft_n_max",
+    "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "ctx_checkpoints": "ctx_checkpoints",
     "cache_ram": "cache_ram",
     "cont_batching": "cont_batching",
@@ -117,6 +136,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "jinja": "jinja",
     "extra_args": "extra_args",
     "enable_thinking": "enable_thinking",
+    "cuda_version": "cuda_version_combo",
 }
 
 _PERF_PRESETS_ROOT = "__perf_presets__"
@@ -124,6 +144,7 @@ _PERF_PRESETS_ROOT = "__perf_presets__"
 _PERF_PRESET_FIELDS = (
     "gpu_auto",
     "gpu_layers",
+    "gpu_layers_all",
     "cpu_moe_layers",
     "ctx_size",
     "threads",
@@ -134,8 +155,16 @@ _PERF_PRESET_FIELDS = (
     "ubatch_size",
     "parallel_slots",
     "kv_unified",
+    "host",
+    "cuda_device",
+    "spec_draft_device",
+    "split_mode",
+    "main_gpu",
+    "cuda_visible_devices",
+    "cuda_module_loading",
     "speculative_mtp",
     "spec_draft_n_max",
+    "spec_draft_gpu_layers",
     "flash_attn",
     "fit_off",
     "reasoning_mode",
@@ -160,6 +189,7 @@ _PERF_PRESET_FIELDS = (
 
 _AUTOTUNE_PARAM_TO_SETTING = {
     "ngl": "gpu_layers",
+    "gpu_layers_all": "gpu_layers_all",
     "batch_size": "batch_size",
     "ubatch_size": "ubatch_size",
     "cache_type_k": "cache_type_k",
@@ -170,6 +200,7 @@ _AUTOTUNE_PARAM_TO_SETTING = {
     "kv_unified": "kv_unified",
     "speculative_mtp": "speculative_mtp",
     "spec_draft_n_max": "spec_draft_n_max",
+    "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "flash_attn": "flash_attn",
     "fit_off": "fit_off",
     "cache_prompt": "cache_prompt",
@@ -182,6 +213,7 @@ _MANAGED_EXTRA_FLAGS = {
     "-m",
     "--model",
     "--port",
+    "--host",
     "-ngl",
     "--n-gpu-layers",
     "-c",
@@ -190,16 +222,6 @@ _MANAGED_EXTRA_FLAGS = {
     "--cache-ram",
     "--kv-unified",
     "-kvu",
-    "--spec-type",
-    "--spec-draft-n-max",
-    "--spec-draft-n-min",
-    "--spec-draft-p-min",
-    "--spec-draft-ngl",
-    "-ngld",
-    "--spec-draft-type-k",
-    "-ctkd",
-    "--spec-draft-type-v",
-    "-ctvd",
     "--jinja",
     "--no-cache-prompt",
     "--flash-attn",
@@ -240,6 +262,16 @@ _MANAGED_EXTRA_FLAGS = {
 }
 
 
+def _is_extra_value_token(arg: str) -> bool:
+    if not str(arg).startswith("-"):
+        return True
+    try:
+        float(str(arg))
+        return True
+    except ValueError:
+        return False
+
+
 def _sanitize_extra_args(value: Any) -> str:
     """Убирает из extra_args флаги, которыми управляют UI/AutoTune."""
     text = str(value or "").strip()
@@ -259,7 +291,7 @@ def _sanitize_extra_args(value: Any) -> str:
             if (
                 "=" not in arg
                 and i + 1 < len(parts)
-                and not parts[i + 1].startswith("-")
+                and _is_extra_value_token(parts[i + 1])
             ):
                 i += 2
             else:
@@ -287,9 +319,12 @@ def _apply_autotune_params_to_perf_params(
     merged = dict(params)
     ngl = autotune_params.get("ngl")
     if ngl is not None:
-        is_auto = str(ngl).strip().lower() == "auto"
+        ngl_text = str(ngl).strip().lower()
+        is_auto = ngl_text == "auto"
+        is_all = ngl_text == "all"
         merged["gpu_auto"] = is_auto
-        if not is_auto:
+        merged["gpu_layers_all"] = is_all
+        if not is_auto and not is_all:
             merged["gpu_layers"] = int(ngl)
 
     if "ncmoe" in autotune_params:
@@ -327,6 +362,7 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(params)
     bool_fields = {
         "gpu_auto",
+        "gpu_layers_all",
         "flash_attn",
         "fit_off",
         "kv_unified",
@@ -353,6 +389,7 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
         "ubatch_size",
         "parallel_slots",
         "spec_draft_n_max",
+        "main_gpu",
         "ctx_checkpoints",
         "cache_ram",
     }
@@ -363,7 +400,10 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             normalized[key] = int(normalized[key])
         except (TypeError, ValueError):
-            if key == "gpu_layers" and str(normalized.get(key, "")).strip().lower() == "auto":
+            if (
+                key == "gpu_layers"
+                and str(normalized.get(key, "")).strip().lower() == "auto"
+            ):
                 normalized["gpu_auto"] = True
                 normalized[key] = 99
             else:

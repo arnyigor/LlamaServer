@@ -19,11 +19,19 @@ class MockConfig:
     model_dir: str = "/models"
     gpu_auto: bool = True
     gpu_layers: int = 33
+    gpu_layers_all: bool = False
     cpu_moe_layers: int = -1
     ctx_size: int = -1
     threads: int = 4
     threads_batch: int = 0
     port: int = 8080
+    host: str = "127.0.0.1"
+    cuda_device: str = ""
+    spec_draft_device: str = ""
+    split_mode: str = ""
+    main_gpu: int = -1
+    cuda_visible_devices: str = ""
+    cuda_module_loading: str = "LAZY"
     flash_attn: bool = True
     fit_off: bool = True
     reasoning_mode: str = "off"
@@ -49,6 +57,7 @@ class MockConfig:
     use_mmproj: bool = True
     mmproj_offload: bool = True
     enable_thinking: str = "off"
+    spec_draft_gpu_layers: str = "all"
     mmproj_path: str = ""
     bench_prompt: int = 128
     bench_gen: int = 256
@@ -128,7 +137,7 @@ class TestBuildArgs(unittest.TestCase):
 
         self.cfg.reasoning_mode = "on"
         args = build_args(self.cfg, self.model)
-        self.assertIn("-rea", args)
+        self.assertIn("--reasoning", args)
         self.assertIn("on", args)
 
     def test_enable_thinking_modes(self):
@@ -138,23 +147,57 @@ class TestBuildArgs(unittest.TestCase):
 
         self.cfg.enable_thinking = "false"
         args = build_args(self.cfg, self.model)
-        idx = args.index("--chat-template-kwargs")
-        self.assertEqual(args[idx + 1], '{"enable_thinking":false}')
+        idx = args.index("--reasoning")
+        self.assertEqual(args[idx + 1], "off")
+        self.assertNotIn("--chat-template-kwargs", args)
 
+        self.cfg.reasoning_mode = "auto"
         self.cfg.enable_thinking = "true"
         args = build_args(self.cfg, self.model)
-        idx = args.index("--chat-template-kwargs")
-        self.assertEqual(args[idx + 1], '{"enable_thinking":true}')
+        idx = args.index("--reasoning")
+        self.assertEqual(args[idx + 1], "on")
 
     def test_enable_thinking_legacy_bool(self):
+        self.cfg.reasoning_mode = "auto"
         self.cfg.enable_thinking = True
         args = build_args(self.cfg, self.model)
-        idx = args.index("--chat-template-kwargs")
-        self.assertEqual(args[idx + 1], '{"enable_thinking":true}')
+        idx = args.index("--reasoning")
+        self.assertEqual(args[idx + 1], "on")
 
         self.cfg.enable_thinking = False
         args = build_args(self.cfg, self.model)
         self.assertNotIn("--chat-template-kwargs", args)
+
+    def test_mtp_cuda_args(self):
+        self.cfg.gpu_auto = False
+        self.cfg.gpu_layers_all = True
+        self.cfg.ctx_size = 65536
+        self.cfg.cuda_device = "CUDA0"
+        self.cfg.spec_draft_device = "CUDA0"
+        self.cfg.split_mode = "none"
+        self.cfg.main_gpu = 0
+        self.cfg.cache_type_k = "q8_0"
+        self.cfg.cache_type_v = "q8_0"
+        self.cfg.speculative_mtp = True
+        self.cfg.spec_draft_n_max = 2
+        self.cfg.spec_draft_gpu_layers = "all"
+        self.cfg.use_mmproj = False
+        self.cfg.jinja = True
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertEqual(args[args.index("-ngl") + 1], "all")
+        self.assertIn("--device", args)
+        self.assertIn("CUDA0", args)
+        self.assertEqual(args[args.index("--spec-draft-ngl") + 1], "all")
+        self.assertEqual(args[args.index("--spec-draft-type-k") + 1], "q8_0")
+        self.assertEqual(args[args.index("--spec-draft-type-v") + 1], "q8_0")
+        self.assertIn("--spec-draft-device", args)
+        self.assertIn("--split-mode", args)
+        self.assertIn("none", args)
+        self.assertIn("--main-gpu", args)
+        self.assertIn("--jinja", args)
+        self.assertIn("--no-mmproj", args)
 
     def test_flash_attn_and_fit_off(self):
         self.cfg.flash_attn = False
@@ -183,6 +226,16 @@ class TestBuildArgs(unittest.TestCase):
         self.assertEqual(args.count("--ctx-checkpoints"), 1)
         self.assertEqual(args.count("--cache-ram"), 1)
         self.assertEqual(args.count("--jinja"), 1)
+        self.assertIn("--top-p", args)
+        self.assertIn("0.9", args)
+
+    def test_extra_args_managed_negative_value_is_filtered(self):
+        self.cfg.speculative_mtp = True
+        self.cfg.extra_args = "--spec-draft-ngl -1 --top-p 0.9"
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertNotIn("-1", args)
         self.assertIn("--top-p", args)
         self.assertIn("0.9", args)
 
