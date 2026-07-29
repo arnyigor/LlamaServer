@@ -196,7 +196,16 @@ def build_benchmark_args_from_params(
     if not model_path:
         return None
 
-    args = ["-m", model_path, "-p", str(prompt_tokens), "-n", str(generation_tokens)]
+    args = [
+        "-m",
+        model_path,
+        "-p",
+        str(prompt_tokens),
+        "-n",
+        str(generation_tokens),
+        "-r",
+        "1",
+    ]
 
     # Важно: llama-bench CLI отличается от llama-server.
     # В актуальных сборках llama-bench нет -c/-np/--ctx-checkpoints/--cache-ram/--no-mmproj.
@@ -256,7 +265,16 @@ def build_args(
             gpu_val = "auto" if cfg.gpu_auto else str(cfg.gpu_layers)
 
     if for_benchmark:
-        args += ["-p", str(cfg.bench_prompt), "-n", str(cfg.bench_gen), "-ngl", gpu_val]
+        args += [
+            "-p",
+            str(cfg.bench_prompt),
+            "-n",
+            str(cfg.bench_gen),
+            "-r",
+            "1",
+            "-ngl",
+            gpu_val,
+        ]
         args += ["-fa", "on" if cfg.flash_attn else "off"]
         args += ["-ctk", cfg.cache_type_k, "-ctv", cfg.cache_type_v]
         bs = int(cfg.batch_size if cfg.batch_size and cfg.batch_size > 0 else 512)

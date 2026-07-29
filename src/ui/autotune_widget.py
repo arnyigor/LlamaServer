@@ -129,7 +129,7 @@ class AutoTuneWidget(QWidget):
 
         row2.addWidget(QLabel("Per-run timeout (sec):"))
         self.per_run_timeout = QSpinBox()
-        self.per_run_timeout.setRange(30, 7200)
+        self.per_run_timeout.setRange(120, 7200)
         self.per_run_timeout.setValue(300)
         row2.addWidget(self.per_run_timeout)
         settings.addLayout(row2)
@@ -220,13 +220,10 @@ class AutoTuneWidget(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.table, 1)
 
+        # Internal buffer only. Do not add a second console under Benchmark:
+        # the main Logs panel already receives the same AutoTune events.
         self.activity_log = QTextEdit(readOnly=True)
-        self.activity_log.setMaximumHeight(110)
-        self.activity_log.setPlaceholderText("AutoTune activity will appear here...")
-        self.activity_log.setStyleSheet(
-            "background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;"
-        )
-        layout.addWidget(self.activity_log)
+        self.activity_log.setVisible(False)
 
         self.best_text = QTextEdit(readOnly=True)
         self.best_text.setMaximumHeight(150)
