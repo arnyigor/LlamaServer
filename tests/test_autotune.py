@@ -192,6 +192,9 @@ class TestAutoTunePlan(unittest.TestCase):
         self.assertEqual(plan.candidates[0].params["ncmoe"], -1)
         self.assertEqual(plan.candidates[0].params["parallel_slots"], 1)
         self.assertTrue(plan.candidates[0].params["fit_off"])
+        early_stages = {c.stage for c in plan.candidates[:5]}
+        self.assertTrue({"kv", "batch"} & early_stages)
+        self.assertFalse(all(c.stage == "moe_vram" for c in plan.candidates[1:5]))
         moe_vram = [c for c in plan.candidates if c.stage == "moe_vram"]
         self.assertGreaterEqual(len(moe_vram), 1)
         self.assertTrue(all(c.params["parallel_slots"] == 1 for c in plan.candidates))

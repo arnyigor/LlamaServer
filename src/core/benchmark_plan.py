@@ -445,7 +445,11 @@ def _quick_candidates(
     )
     _append_unique(candidates, seen, base, "safe VRAM baseline", "baseline")
 
-    if _is_moe(model_info):
+    # In Quick/Balanced the first few runs must cover speed-sensitive knobs.
+    # MoE CPU-offload is often a VRAM-saving tradeoff and can slow TG, so do not
+    # spend the whole small run budget on ncmoe variants before testing KV/batch.
+    early_moe_vram = _target_key(target) in {"low_vram", "moe_optimized"} or ctx_size >= 131072
+    if _is_moe(model_info) and early_moe_vram:
         for ncmoe in _vram_targeted_ncmoe_values(settings, model_info, base):
             p = dict(base, ncmoe=ncmoe)
             estimated = _estimate_vram_gib(p, model_info)
@@ -465,7 +469,7 @@ def _quick_candidates(
         p = dict(base, cache_type_k=ctk, cache_type_v=ctv)
         _append_unique(candidates, seen, p, f"KV {ctk}/{ctv}", "kv")
 
-    for batch in (1024, 2048):
+    for batch in (1024, 2048, 4096):
         p = dict(base, batch_size=batch, ubatch_size=min(512, batch))
         _append_unique(candidates, seen, p, f"batch {batch}", "batch")
 
@@ -481,6 +485,18 @@ def _quick_candidates(
         _append_unique(candidates, seen, p, f"threads {threads}", "threads")
         if len([c for c in candidates if c.stage == "threads"]) >= 2:
             break
+
+    if _is_moe(model_info) and not early_moe_vram:
+        for ncmoe in _vram_targeted_ncmoe_values(settings, model_info, base):
+            p = dict(base, ncmoe=ncmoe)
+            estimated = _estimate_vram_gib(p, model_info)
+            _append_unique(
+                candidates,
+                seen,
+                p,
+                f"VRAM-target MoE ncmoe {ncmoe} (~{estimated:.1f} GiB)",
+                "moe_vram",
+            )
 
     # flash-attn off часто просто падает на современных сборках; оставляем для Normal/Deep.
 
