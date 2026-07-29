@@ -1397,7 +1397,6 @@ class LlamaGUI:
             # Нормальная выгрузка освобождает RAM/VRAM — старые allocations
             # больше неактуальны, поэтому полностью очищаем вкладку.
             self._reset_mem_viz(status)
-        self.ui.tabs.setCurrentIndex(1)
 
     def _strip_mtp_args(self, args: list[str]) -> list[str]:
         value_flags = {
