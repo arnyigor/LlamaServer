@@ -31,8 +31,11 @@ from src.services.integration_manager import IntegrationManager
 from src.services.hf_downloader import (
     HfModelDownloader,
     HfRepoScanner,
+    find_partial_downloads,
     format_bytes,
     lmstudio_repo_dir,
+    normalize_hf_repo_id,
+    partial_download_info,
 )
 from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
@@ -79,6 +82,7 @@ class LlamaGUI:
         self._connect_signals()
         self._setup_tray()
         QTimer.singleShot(250, self.auto_scan_models)
+        QTimer.singleShot(350, self._refresh_hf_partial_status)
 
     def _connect_signals(self):
         u = self.ui
@@ -546,11 +550,16 @@ class LlamaGUI:
         self.ui.hf_files.clear()
         files = result.get("files") or []
         projectors = result.get("projectors") or []
+        partial_count = 0
         for file_info in files:
+            partial = self._hf_partial_info(file_info)
+            if partial:
+                partial_count += 1
             self.ui.hf_files.addItem(self._hf_file_display(file_info))
-            self.ui.hf_files.item(self.ui.hf_files.count() - 1).setData(
-                Qt.ItemDataRole.UserRole, file_info
-            )
+            item = self.ui.hf_files.item(self.ui.hf_files.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, file_info)
+            if partial:
+                item.setToolTip(f"Partial file: {partial.get('partial_path')}")
 
         if files:
             self.ui.hf_files.setCurrentRow(0)
@@ -563,9 +572,11 @@ class LlamaGUI:
         projector_text = f", vision: {projector.get('name')}" if projector else ""
         total_size = sum(int(f.get("size") or 0) for f in files)
         total_text = f", shown size: {format_bytes(total_size)}" if total_size else ""
+        partial_text = f", partial/resumable: {partial_count}" if partial_count else ""
         self.ui.hf_status.setText(
             f"Найдено GGUF: {len(files)} из {len(result.get('all_files') or [])}"
-            f"{total_text}, mmproj: {len(projectors)}{projector_text}{target_text}"
+            f"{total_text}, mmproj: {len(projectors)}{projector_text}"
+            f"{partial_text}{target_text}"
         )
         self._update_hf_download_button()
         self.save_settings()
@@ -578,7 +589,44 @@ class LlamaGUI:
             parts.append(quant)
         size = int(file_info.get("size") or 0)
         parts.append(format_bytes(size) if size else "size unknown")
+        partial = self._hf_partial_info(file_info)
+        if partial:
+            parts.append(
+                f"partial {partial.get('partial_size_text')} / "
+                f"{partial.get('expected_size_text')}"
+            )
         return "  |  ".join(parts)
+
+    def _hf_partial_info(self, file_info):
+        if not self.hf_scan_result:
+            return {}
+        model_dir = self.ui.model_dir.text().strip()
+        repo_id = self.hf_scan_result.get("repo_id") or ""
+        filename = file_info.get("rfilename") or file_info.get("name") or ""
+        if not model_dir or not repo_id or not filename:
+            return {}
+        return partial_download_info(
+            Path(model_dir), repo_id, filename, int(file_info.get("size") or 0)
+        )
+
+    def _refresh_hf_partial_status(self):
+        model_dir = self.ui.model_dir.text().strip()
+        repo_text = self.ui.hf_repo.text().strip()
+        if not model_dir or not repo_text:
+            return
+        try:
+            repo_id = normalize_hf_repo_id(repo_text)
+            partials = find_partial_downloads(Path(model_dir), repo_id)
+        except Exception:
+            return
+        if not partials:
+            return
+        total = sum(int(p.get("partial_size") or 0) for p in partials)
+        self.ui.hf_status.setText(
+            f"Найдены незавершённые HF загрузки: {len(partials)}, "
+            f"сохранено {format_bytes(total)}. Нажмите Scan HF, затем Download selected — "
+            "загрузка продолжится с .part."
+        )
 
     def _update_hf_download_button(self):
         is_running = bool(self.hf_downloader and self.hf_downloader.isRunning())

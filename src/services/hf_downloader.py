@@ -463,6 +463,59 @@ def lmstudio_repo_dir(base_model_dir: Path, repo_id: str) -> Path:
     return base_model_dir / author / model
 
 
+def find_partial_downloads(base_model_dir: Path, repo_id: str) -> List[Dict]:
+    """Возвращает локальные .gguf.part для репозитория без обращения к сети."""
+    root = lmstudio_repo_dir(Path(base_model_dir), repo_id)
+    if not root.exists():
+        return []
+    result = []
+    try:
+        parts = sorted(root.rglob("*.gguf.part"), key=lambda p: str(p).lower())
+    except OSError:
+        return []
+    for part in parts:
+        try:
+            rel = part.relative_to(root).as_posix()
+            filename = rel[:-5] if rel.endswith(".part") else rel
+            size = part.stat().st_size
+        except OSError:
+            continue
+        result.append(
+            {
+                "rfilename": filename,
+                "name": PurePosixPath(filename).name,
+                "partial_path": str(part),
+                "partial_size": size,
+                "partial_size_text": format_bytes(size),
+            }
+        )
+    return result
+
+
+def partial_download_info(
+    base_model_dir: Path, repo_id: str, filename: str, expected_size: int = 0
+) -> Dict:
+    """Информация о .part для конкретного файла репозитория."""
+    try:
+        target = safe_repo_file_path(lmstudio_repo_dir(Path(base_model_dir), repo_id), filename)
+    except HfRepoError:
+        return {}
+    part = target.with_suffix(target.suffix + ".part")
+    try:
+        if not part.exists():
+            return {}
+        partial_size = part.stat().st_size
+    except OSError:
+        return {}
+    return {
+        "partial_path": str(part),
+        "partial_size": partial_size,
+        "partial_size_text": format_bytes(partial_size),
+        "expected_size": int(expected_size or 0),
+        "expected_size_text": format_bytes(expected_size) if expected_size else "—",
+    }
+
+
 def safe_repo_file_path(root: Path, filename: str) -> Path:
     rel = PurePosixPath(filename)
     if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
