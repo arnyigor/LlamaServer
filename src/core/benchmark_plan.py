@@ -461,13 +461,17 @@ def _quick_candidates(
                 "moe_vram",
             )
 
-    for ngl in _ngl_candidates(settings, model_info, "quick", target):
-        p = dict(base, ngl=ngl)
-        _append_unique(candidates, seen, p, f"GPU layers ngl={ngl}", "ngl")
-
-    for ctk, ctv in _kv_candidates(target, "quick", ctx_size, model_info):
+    # Speed-first order for small Max runs: test KV and batch before NGL/MoE.
+    # Full NGL for MoE can be slower due VRAM pressure; batch/ubatch usually has
+    # a better chance to reproduce manual server speed improvements.
+    kv_candidates = _kv_candidates(target, "quick", ctx_size, model_info)
+    if _target_key(target) == "balanced":
+        kv_candidates = [kv for kv in kv_candidates if kv != safe_kv]
+    for ctk, ctv in kv_candidates:
         p = dict(base, cache_type_k=ctk, cache_type_v=ctv)
         _append_unique(candidates, seen, p, f"KV {ctk}/{ctv}", "kv")
+        if _target_key(target) == "balanced" and len([c for c in candidates if c.stage == "kv"]) >= 1:
+            break
 
     for batch in (1024, 2048, 4096):
         p = dict(base, batch_size=batch, ubatch_size=min(512, batch))
@@ -485,6 +489,10 @@ def _quick_candidates(
         _append_unique(candidates, seen, p, f"threads {threads}", "threads")
         if len([c for c in candidates if c.stage == "threads"]) >= 2:
             break
+
+    for ngl in _ngl_candidates(settings, model_info, "quick", target):
+        p = dict(base, ngl=ngl)
+        _append_unique(candidates, seen, p, f"GPU layers ngl={ngl}", "ngl")
 
     if _is_moe(model_info) and not early_moe_vram:
         for ncmoe in _vram_targeted_ncmoe_values(settings, model_info, base):

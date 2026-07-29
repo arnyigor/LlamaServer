@@ -90,9 +90,23 @@ class AutoTuneManager(QThread):
         successful = [r for r in self.results if r.status == "success"]
         if not successful:
             return None
-        return max(
+        best = max(
             successful, key=lambda r: (r.score, r.generation_tok_s, r.prompt_tok_s)
         )
+        baseline = next((r for r in successful if r.candidate_id == "run_001"), None)
+        if not baseline or best.candidate_id == baseline.candidate_id:
+            return best
+
+        # Single-repetition llama-bench has noise. Do not replace the current
+        # baseline unless the candidate is clearly better, otherwise AutoTune can
+        # apply a tiny/noisy +1-2% result that feels slower in real server use.
+        score_gain = (best.score - baseline.score) / max(baseline.score, 1.0)
+        tg_gain = (best.generation_tok_s - baseline.generation_tok_s) / max(
+            baseline.generation_tok_s, 1.0
+        )
+        if score_gain < 0.03 and tg_gain < 0.05:
+            return baseline
+        return best
 
     def _should_early_stop_after_peak(self, latest: BenchmarkResult) -> bool:
         """Улучшенный early stop с rolling window и проверкой тренда.
