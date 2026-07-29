@@ -9,7 +9,11 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.cli_builder import build_args, validate_extra_args
+from src.core.cli_builder import (
+    build_args,
+    build_benchmark_args_from_params,
+    validate_extra_args,
+)
 
 
 @dataclass
@@ -114,6 +118,19 @@ class TestBuildArgs(unittest.TestCase):
         args = build_args(self.cfg, self.model, for_benchmark=True)
         idx = args.index("-ngl")
         self.assertEqual(args[idx + 1], "10")
+
+    def test_bench_flash_attn_uses_on_off(self):
+        """Современный llama-bench принимает -fa on/off, а не 1/0."""
+        self.cfg.flash_attn = True
+        args = build_args(self.cfg, self.model, for_benchmark=True)
+        self.assertEqual(args[args.index("-fa") + 1], "on")
+
+        self.cfg.flash_attn = False
+        args = build_args(self.cfg, self.model, for_benchmark=True)
+        self.assertEqual(args[args.index("-fa") + 1], "off")
+
+        args = build_benchmark_args_from_params(self.model, {"flash_attn": True})
+        self.assertEqual(args[args.index("-fa") + 1], "on")
 
     def test_mmproj_handling(self):
         self.cfg.mmproj_path = "/models/mmproj.gguf"

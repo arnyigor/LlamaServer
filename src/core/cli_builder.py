@@ -207,7 +207,9 @@ def build_benchmark_args_from_params(
     args += ["-ngl", "99" if ngl_text in {"auto", "all"} else str(ngl)]
 
     flash_attn = bool(params.get("flash_attn", True))
-    args += ["-fa", "1" if flash_attn else "0"]
+    # Modern llama-bench expects on/off/auto for -fa. Older 1/0 values now
+    # trigger "invalid argument" and break AutoTune before the benchmark starts.
+    args += ["-fa", "on" if flash_attn else "off"]
 
     args += [
         "-ctk",
@@ -254,7 +256,7 @@ def build_args(
 
     if for_benchmark:
         args += ["-p", str(cfg.bench_prompt), "-n", str(cfg.bench_gen), "-ngl", gpu_val]
-        args += ["-fa", "1" if cfg.flash_attn else "0"]
+        args += ["-fa", "on" if cfg.flash_attn else "off"]
         args += ["-ctk", cfg.cache_type_k, "-ctv", cfg.cache_type_v]
         bs = int(cfg.batch_size if cfg.batch_size and cfg.batch_size > 0 else 512)
         ub = int(

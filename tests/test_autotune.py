@@ -61,7 +61,7 @@ class TestAutoTuneCliBuilder(unittest.TestCase):
         args = build_benchmark_args_from_params("model.gguf", params, 128, 256)
 
         self.assertEqual(args[args.index("-ngl") + 1], "99")
-        self.assertEqual(args[args.index("-fa") + 1], "0")
+        self.assertEqual(args[args.index("-fa") + 1], "off")
         self.assertEqual(args[args.index("-ub") + 1], "512")
         self.assertEqual(args[args.index("-ncmoe") + 1], "0")
         # Эти параметры есть у llama-server, но отсутствуют в актуальном llama-bench.
