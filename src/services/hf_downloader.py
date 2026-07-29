@@ -41,6 +41,10 @@ class HfRepoError(RuntimeError):
     """Ошибка при обращении к Hugging Face."""
 
 
+class HfDownloadInterrupted(RuntimeError):
+    """Остановка загрузки пользователем: pause/cancel."""
+
+
 class HfRepoScanner(QThread):
     """Фоновый поток, который получает список GGUF-файлов репозитория."""
 
@@ -86,6 +90,17 @@ class HfModelDownloader(QThread):
         self.repo_id = repo_id
         self.files = files
         self.base_model_dir = Path(base_model_dir)
+        self.delete_partial_on_stop = False
+
+    def pause(self):
+        """Останавливает загрузку, сохраняя .part для последующей докачки."""
+        self.delete_partial_on_stop = False
+        self.requestInterruption()
+
+    def cancel_and_delete(self):
+        """Останавливает загрузку и удаляет частичные .part файлы выбранной загрузки."""
+        self.delete_partial_on_stop = True
+        self.requestInterruption()
 
     def run(self):
         try:
@@ -100,7 +115,8 @@ class HfModelDownloader(QThread):
             started_at = time.monotonic()
             for index, file_info in enumerate(self.files, 1):
                 if self.isInterruptionRequested():
-                    self.completed.emit(False, "Скачивание отменено")
+                    self._cleanup_all_partial_files(target_root)
+                    self.completed.emit(False, self._stop_message())
                     return
                 filename = str(file_info.get("rfilename") or file_info.get("name") or "")
                 if not filename.lower().endswith(".gguf"):
@@ -121,6 +137,8 @@ class HfModelDownloader(QThread):
 
             self.percent.emit(100)
             self.completed.emit(True, f"Готово: {target_root}")
+        except HfDownloadInterrupted as exc:
+            self.completed.emit(False, str(exc))
         except Exception as exc:
             self.completed.emit(False, f"Ошибка скачивания: {exc}")
 
@@ -203,9 +221,10 @@ class HfModelDownloader(QThread):
                 with open(part, mode) as out:
                     while True:
                         if self.isInterruptionRequested():
-                            raise HfRepoError(
-                                f"Скачивание отменено. Частичный файл сохранён: {part}"
-                            )
+                            out.flush()
+                            if self.delete_partial_on_stop:
+                                delete_file_safely(part)
+                            raise HfDownloadInterrupted(self._stop_message(part))
                         chunk = response.read(DOWNLOAD_CHUNK_SIZE)
                         if not chunk:
                             break
@@ -244,12 +263,29 @@ class HfModelDownloader(QThread):
         except urllib.error.URLError as exc:
             raise HfRepoError(f"Сетевая ошибка: {exc.reason}") from exc
         except BaseException:
-            if part.exists() and self.isInterruptionRequested():
-                try:
-                    part.unlink()
-                except OSError:
-                    pass
+            if part.exists() and self.isInterruptionRequested() and self.delete_partial_on_stop:
+                delete_file_safely(part)
             raise
+
+    def _cleanup_all_partial_files(self, target_root: Path):
+        if not self.delete_partial_on_stop:
+            return
+        for file_info in self.files:
+            filename = str(file_info.get("rfilename") or file_info.get("name") or "")
+            if not filename.lower().endswith(".gguf"):
+                continue
+            try:
+                target = safe_repo_file_path(target_root, filename)
+            except HfRepoError:
+                continue
+            delete_file_safely(target.with_suffix(target.suffix + ".part"))
+
+    def _stop_message(self, part: Path | None = None) -> str:
+        if self.delete_partial_on_stop:
+            return "Скачивание отменено. Частичный .part файл удалён."
+        if part:
+            return f"Пауза: частичный файл сохранён для докачки: {part}"
+        return "Пауза: частичный файл сохранён для докачки."
 
     def _overall_percent(
         self,
@@ -459,6 +495,14 @@ def fetch_remote_size(repo_id: str, filename: str) -> int:
             return int(response.headers.get("Content-Length") or 0)
     except Exception:
         return 0
+
+
+def delete_file_safely(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def format_bytes(size: float | int) -> str:

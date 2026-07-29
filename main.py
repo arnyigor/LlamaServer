@@ -90,6 +90,8 @@ class LlamaGUI:
         u.scan_btn.clicked.connect(self.scan_models)
         u.hf_scan_btn.clicked.connect(self.scan_hf_repo)
         u.hf_download_btn.clicked.connect(self.download_hf_selection)
+        u.hf_pause_btn.clicked.connect(self.pause_hf_download)
+        u.hf_cancel_btn.clicked.connect(self.cancel_hf_download)
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
@@ -579,10 +581,10 @@ class LlamaGUI:
         return "  |  ".join(parts)
 
     def _update_hf_download_button(self):
-        can_download = bool(self.ui.hf_files.selectedItems())
-        if self.hf_downloader and self.hf_downloader.isRunning():
-            can_download = True
-        self.ui.hf_download_btn.setEnabled(can_download)
+        is_running = bool(self.hf_downloader and self.hf_downloader.isRunning())
+        self.ui.hf_download_btn.setEnabled(
+            bool(self.ui.hf_files.selectedItems()) and not is_running
+        )
 
     def _set_hf_download_controls_locked(self, locked):
         for widget in (
@@ -593,7 +595,11 @@ class LlamaGUI:
             self.ui.hf_files,
         ):
             widget.setEnabled(not locked)
-        self.ui.hf_download_btn.setEnabled(True if locked else bool(self.ui.hf_files.selectedItems()))
+        self.ui.hf_download_btn.setEnabled(
+            False if locked else bool(self.ui.hf_files.selectedItems())
+        )
+        self.ui.hf_pause_btn.setEnabled(locked)
+        self.ui.hf_cancel_btn.setEnabled(locked)
 
     def _select_hf_projector(self):
         if not self.hf_scan_result:
@@ -616,8 +622,6 @@ class LlamaGUI:
 
     def download_hf_selection(self):
         if self.hf_downloader and self.hf_downloader.isRunning():
-            self.hf_downloader.requestInterruption()
-            self.ui.hf_status.setText("Отмена скачивания...")
             return
 
         if not self.hf_scan_result:
@@ -652,7 +656,7 @@ class LlamaGUI:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self.ui.hf_download_btn.setText("Cancel")
+        self.ui.hf_download_btn.setText("Download selected")
         self._set_hf_download_controls_locked(True)
         self.ui.hf_progress.setRange(0, 100)
         self.ui.hf_progress.setValue(0)
@@ -667,6 +671,20 @@ class LlamaGUI:
         self.hf_downloader.completed.connect(self._on_hf_download_completed)
         self.hf_downloader.finished.connect(self._on_hf_download_finished)
         self.hf_downloader.start()
+
+    def pause_hf_download(self):
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            self.hf_downloader.pause()
+            self.ui.hf_pause_btn.setEnabled(False)
+            self.ui.hf_cancel_btn.setEnabled(False)
+            self.ui.hf_status.setText("Пауза: сохраняю .part для докачки...")
+
+    def cancel_hf_download(self):
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            self.hf_downloader.cancel_and_delete()
+            self.ui.hf_pause_btn.setEnabled(False)
+            self.ui.hf_cancel_btn.setEnabled(False)
+            self.ui.hf_status.setText("Отмена: удаляю частичный .part файл...")
 
     def _on_hf_download_finished(self):
         self.ui.hf_download_btn.setText("Download selected")
