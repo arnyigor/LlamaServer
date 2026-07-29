@@ -764,6 +764,14 @@ class LlamaGUI:
 
     def cancel_hf_download(self):
         if self.hf_downloader and self.hf_downloader.isRunning():
+            reply = QMessageBox.question(
+                self.ui,
+                "Cancel download",
+                "Прервать текущую загрузку и удалить частичный .part файл?\n\n"
+                "Если хотите продолжить позже — нажмите Pause вместо Cancel.",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
             self.hf_downloader.cancel_and_delete()
             self.ui.hf_pause_btn.setEnabled(False)
             self.ui.hf_cancel_btn.setEnabled(False)
