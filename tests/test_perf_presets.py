@@ -196,13 +196,13 @@ class TestPerfPresetsUI(unittest.TestCase):
 
         self.assertTrue(self.ui.force_stop_btn.isEnabled())
 
-    def test_left_autotune_button_opens_tab_and_builds_plan(self):
+    def test_left_autotune_button_opens_benchmark_section_and_builds_plan(self):
         self.ui.ctx_size.setValue(16384)
         self.assertTrue(hasattr(self.ui, "autotune_btn"))
 
         self.ui.autotune_btn.click()
 
-        self.assertIs(self.ui.tabs.currentWidget(), self.ui.autotune)
+        self.assertTrue(self.ui.bench_panel.toggle_btn.isChecked())
         self.assertIsNotNone(self.gui.autotune_plan)
         self.assertEqual(self.gui.autotune_plan.ctx_size, 16384)
         self.assertGreater(self.ui.autotune.table.rowCount(), 0)

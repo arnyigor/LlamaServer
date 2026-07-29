@@ -1932,8 +1932,10 @@ class LlamaGUI:
         return info
 
     def open_autotune_tab(self):
-        """Открывает вкладку AutoTune и строит свежий план из текущих настроек."""
-        self.ui.tabs.setCurrentWidget(self.ui.autotune)
+        """Открывает секцию Benchmark/AutoTune и строит свежий план."""
+        if not self.ui.bench_panel.toggle_btn.isChecked():
+            self.ui.bench_panel.toggle_btn.setChecked(True)
+            self.ui.bench_panel.toggle_visibility()
         self.build_autotune_plan()
 
     def build_autotune_plan(self):
@@ -1960,7 +1962,9 @@ class LlamaGUI:
         self._autotune_best_applied = False
         self.autotune_results_dir = ""
         self.ui.autotune.set_plan(plan)
-        self.ui.tabs.setCurrentWidget(self.ui.autotune)
+        if not self.ui.bench_panel.toggle_btn.isChecked():
+            self.ui.bench_panel.toggle_btn.setChecked(True)
+            self.ui.bench_panel.toggle_visibility()
         self.log_mgr.append(
             f"AutoTune plan built: {len(plan.candidates)} candidates | ctx={plan.ctx_size:,} | {plan.mode}/{plan.target}"
         )

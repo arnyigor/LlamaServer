@@ -370,7 +370,10 @@ def _base_params(
         "cache_type_k": str(getattr(settings, "cache_type_k", "q8_0") or "q8_0"),
         "cache_type_v": str(getattr(settings, "cache_type_v", "q8_0") or "q8_0"),
         "threads": threads,
+        # Current llama-bench builds do not expose -tb/--threads-batch.
+        # Keep this in preset metadata only; cli_builder must not pass it to bench.
         "threads_batch": int(getattr(settings, "threads_batch", 0) or 0),
+        "verbose": bool(getattr(settings, "verbose", False)),
         # llama-bench не тестирует server multi-slot (-np). Если утащить stale
         # -np=2 из UI, сервер делит контекст по слотам и может стать в 1.5-2 раза
         # медленнее, хотя bench показывал высокий TG. Quick AutoTune подбирает

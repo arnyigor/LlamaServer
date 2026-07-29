@@ -15,7 +15,7 @@ from src.core.cli_builder import build_benchmark_args_from_params
 
 
 _OOM_RE = re.compile(r"(out of memory|cuda.*oom|failed to allocate|vk::outofdevicememory|not enough memory)", re.I)
-_INVALID_ARGS_RE = re.compile(r"(unknown argument|invalid argument|error:.*argument|usage:)", re.I)
+_INVALID_ARGS_RE = re.compile(r"(unknown argument|invalid argument|error:.*argument|usage:|invalid value)", re.I)
 _PP_RE = re.compile(r"\bpp\s*\d*[^\n|]*[|:\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:±|\+/-|tok/s|t/s)", re.I)
 _TG_RE = re.compile(r"\btg\s*\d*[^\n|]*[|:\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:±|\+/-|tok/s|t/s)", re.I)
 _SPEED_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens?/s|tok/s|t/s)", re.I)
@@ -29,6 +29,13 @@ def _unit_to_mib(value: float, unit: str) -> float:
     if unit in {"gib", "gb"}:
         return value * 1024.0
     return value
+
+
+def _first_matching_line(text: str, pattern: re.Pattern) -> str:
+    for line in (text or "").splitlines():
+        if pattern.search(line):
+            return line.strip()
+    return ""
 
 
 def parse_llama_bench_output(text: str) -> BenchmarkMetrics:
@@ -115,6 +122,8 @@ class BenchmarkRunner:
             generation_tokens=generation_tokens,
         ) or []
         command = [self.bench_exe] + args
+        if log_callback:
+            log_callback(f"{candidate.id} command: {' '.join(command)}")
         result = BenchmarkResult(
             candidate_id=candidate.id,
             status="running",
@@ -176,7 +185,8 @@ class BenchmarkRunner:
                 result.error = "Out of memory"
             elif _INVALID_ARGS_RE.search(text):
                 result.status = "failed_invalid_args"
-                result.error = "Invalid llama-bench arguments"
+                detail = _first_matching_line(text, _INVALID_ARGS_RE)
+                result.error = f"Invalid llama-bench arguments: {detail}" if detail else "Invalid llama-bench arguments"
             else:
                 result.status = "failed_crash"
                 result.error = f"Exit code {result.exit_code}"
@@ -199,6 +209,14 @@ class BenchmarkRunner:
             )
             if result.error:
                 summary += f"; {result.error}"
+            log_tail = ""
+            if result.status != "success":
+                log_tail = f"; log={log_path}"
+                if text:
+                    tail_lines = [line.strip() for line in text.splitlines() if line.strip()][-3:]
+                    if tail_lines:
+                        log_tail += f"; tail={' | '.join(tail_lines)}"
+            summary += log_tail
             log_callback(summary)
 
         return result

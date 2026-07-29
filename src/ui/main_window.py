@@ -661,6 +661,9 @@ class MainWindowUI(QMainWindow):
         bench_buttons.addWidget(self.test_btn)
         bench_buttons.addWidget(self.autotune_btn)
         self.bench_panel.add_layout(bench_buttons)
+
+        self.autotune = AutoTuneWidget()
+        self.bench_panel.add_widget(self.autotune)
         lay.addWidget(self.bench_panel)
 
         # === 7. Preview CLI ===
@@ -806,10 +809,6 @@ class MainWindowUI(QMainWindow):
         # пустой экран "Модель не выбрана" на сборках llama.cpp без buffer logs.
         self.mem_viz = MemoryVisualizationWidget()
         self.mem_viz.setVisible(False)
-
-        # Вкладка AutoTune
-        self.autotune = AutoTuneWidget()
-        self.tabs.addTab(self.autotune, "AutoTune")
 
         lay.addWidget(self.tabs)
         return panel

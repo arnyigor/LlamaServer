@@ -226,9 +226,10 @@ def build_benchmark_args_from_params(
     if threads > 0:
         args += ["-t", str(threads)]
 
-    threads_batch = int(params.get("threads_batch") or 0)
-    if threads_batch > 0:
-        args += ["-tb", str(threads_batch)]
+    # llama-bench has no -tb/--threads-batch in current builds.
+    # threads_batch remains in AutoTune plan/preset metadata for llama-server only.
+    if bool(params.get("verbose", False)):
+        args.append("-v")
 
     ncmoe = int(params.get("ncmoe", -1))
     if ncmoe >= 0:
@@ -265,8 +266,9 @@ def build_args(
         args += ["-b", str(bs), "-ub", str(min(ub, bs))]
         if cfg.threads > 0:
             args += ["-t", str(cfg.threads)]
-        if cfg.threads_batch > 0:
-            args += ["-tb", str(cfg.threads_batch)]
+        # Current llama-bench builds do not expose -tb/--threads-batch.
+        if getattr(cfg, "verbose", False):
+            args.append("-v")
         if cfg.cpu_moe_layers >= 0:
             args += ["-ncmoe", str(cfg.cpu_moe_layers)]
     else:
