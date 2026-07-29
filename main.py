@@ -45,6 +45,7 @@ from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
 from src.ui.tooltips import build_ncmoe_tooltip, build_ctx_tooltip
+from src.utils.subprocess_utils import no_console_kwargs
 
 
 class LlamaGUI:
@@ -1334,6 +1335,7 @@ class LlamaGUI:
                 text=True,
                 timeout=4,
                 check=False,
+                **no_console_kwargs(),
             )
         except Exception:
             return []
@@ -1374,6 +1376,7 @@ class LlamaGUI:
                 text=True,
                 timeout=3,
                 check=False,
+                **no_console_kwargs(),
             )
         except Exception:
             return None
@@ -1406,6 +1409,7 @@ class LlamaGUI:
                 text=True,
                 timeout=4,
                 check=False,
+                **no_console_kwargs(),
             )
         except Exception:
             return None
@@ -1989,6 +1993,7 @@ class LlamaGUI:
                 timeout=5,
                 encoding="utf-8",
                 errors="ignore",
+                **no_console_kwargs(),
             )
             text = (proc.stdout or "").strip()
             if not text:
@@ -2490,6 +2495,7 @@ class LlamaGUI:
                             ["taskkill", "/PID", str(pid), "/T", "/F"],
                             capture_output=True,
                             timeout=10,
+                            **no_console_kwargs(),
                         )
             self.update_action_buttons()
             return

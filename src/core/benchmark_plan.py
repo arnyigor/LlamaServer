@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate
 from src.core.moe_advisor import compute_moe_advice
 from src.core.vram_estimator import full_vram_estimate
+from src.utils.subprocess_utils import no_console_kwargs
 
 
 _TIME_BUDGETS = {
@@ -226,6 +227,7 @@ def _detect_total_vram_gib() -> float:
             timeout=2,
             encoding="utf-8",
             errors="ignore",
+            **no_console_kwargs(),
         )
         values = [
             float(x.strip()) / 1024.0

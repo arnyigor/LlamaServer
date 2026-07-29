@@ -16,6 +16,7 @@ from typing import List
 from PySide6.QtCore import QThread, Signal
 
 from src.core.gguf_parser import extract_model_info, is_mtp_draft_file, is_projector_file
+from src.utils.subprocess_utils import no_console_kwargs
 
 
 class ModelScanner(QThread):
@@ -168,6 +169,7 @@ class LlamaCppUpdater(QThread):
                 timeout=20,
                 cwd=str(server_path.parent),
                 check=False,
+                **no_console_kwargs(),
             )
         except Exception as exc:
             self.progress.emit(f"Cannot read local version: {exc}")

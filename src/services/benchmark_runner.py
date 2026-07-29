@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 from src.core.benchmark_models import BenchmarkCandidate, BenchmarkMetrics, BenchmarkResult
 from src.core.cli_builder import build_benchmark_args_from_params
+from src.utils.subprocess_utils import no_console_kwargs
 
 
 _OOM_RE = re.compile(r"(out of memory|cuda.*oom|failed to allocate|vk::outofdevicememory|not enough memory)", re.I)
@@ -143,6 +144,7 @@ class BenchmarkRunner:
                 encoding="utf-8",
                 errors="ignore",
                 cwd=os.path.dirname(self.bench_exe) or None,
+                **no_console_kwargs(),
             )
             try:
                 text, _ = self._process.communicate(timeout=max(5, int(timeout_sec)))
