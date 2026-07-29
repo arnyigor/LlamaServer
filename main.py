@@ -2043,6 +2043,8 @@ class LlamaGUI:
         if not plan:
             return
         options = self.ui.autotune.options()
+        plan = self.ui.autotune.apply_table_edits_to_plan(plan)
+        self.autotune_plan = plan
         plan.early_stop_on_peak = bool(options.get("early_stop_on_peak", False))
         if str(options.get("engine", "llama-bench")) == "llama-server":
             QMessageBox.information(

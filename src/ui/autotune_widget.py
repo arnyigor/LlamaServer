@@ -53,6 +53,36 @@ _COLUMNS = [
     "error",
 ]
 
+_PARAM_COLUMNS = {
+    10: "ngl",
+    11: "ncmoe",
+    12: "cache_type_k",
+    13: "cache_type_v",
+    14: "batch_size",
+    15: "ubatch_size",
+    16: "threads",
+    17: "threads_batch",
+    18: "parallel_slots",
+    19: "flash_attn",
+    20: "use_mmproj",
+    21: "ctx_checkpoints",
+    22: "cache_ram",
+}
+
+_INT_PARAM_KEYS = {
+    "ngl",
+    "ncmoe",
+    "batch_size",
+    "ubatch_size",
+    "threads",
+    "threads_batch",
+    "parallel_slots",
+    "ctx_checkpoints",
+    "cache_ram",
+}
+_QUANT_CHOICES = ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]
+_BOOL_CHOICES = ["true", "false"]
+
 
 class AutoTuneWidget(QWidget):
     build_plan_requested = Signal()
@@ -93,6 +123,11 @@ class AutoTuneWidget(QWidget):
         row1.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Quick", "Normal", "Deep"])
+        self.mode_combo.setToolTip(
+            "Quick: small staged plan for fast checks.\n"
+            "Normal: more KV/batch/ubatch/thread candidates.\n"
+            "Deep: wider search, slower but more thorough."
+        )
         row1.addWidget(self.mode_combo)
 
         row1.addWidget(QLabel("Target:"))
@@ -100,11 +135,22 @@ class AutoTuneWidget(QWidget):
         self.target_combo.addItems(
             ["Balanced", "Max Speed", "Low VRAM", "Quality KV", "MoE Optimized"]
         )
+        self.target_combo.setToolTip(
+            "Balanced: speed + stability + memory margin.\n"
+            "Max Speed: prioritizes tok/s.\n"
+            "Low VRAM: favors memory-saving settings.\n"
+            "Quality KV: favors higher-quality KV cache.\n"
+            "MoE Optimized: explores CPU MoE offload more aggressively."
+        )
         row1.addWidget(self.target_combo)
 
         row1.addWidget(QLabel("Engine:"))
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(["llama-bench", "hybrid", "llama-server"])
+        self.engine_combo.setToolTip(
+            "llama-bench: current implemented engine, fastest micro-benchmark.\n"
+            "hybrid/server: planned modes; currently blocked with explanation."
+        )
         row1.addWidget(self.engine_combo)
         settings.addLayout(row1)
 
@@ -182,7 +228,8 @@ class AutoTuneWidget(QWidget):
 
         self.hint_label = QLabel(
             "Uses current selected model, Context Size and Prompt/Gen benchmark sizes. "
-            "AutoTune tests candidate parameters internally; current UI settings are changed only after Apply Best."
+            "After Build Plan you can edit candidate rows before Start: numeric cells are editable, "
+            "KV/FA/mmproj use drop-downs. Edits are applied when AutoTune starts."
         )
         self.hint_label.setWordWrap(True)
         layout.addWidget(self.hint_label)
@@ -315,14 +362,67 @@ class AutoTuneWidget(QWidget):
             self._row_by_id[candidate.id] = row
             self._fill_candidate_row(row, candidate)
 
-    def _set_item(self, row: int, col: int, value: object) -> None:
+    def _set_item(self, row: int, col: int, value: object, editable: bool = False) -> None:
         item = QTableWidgetItem(str(value))
         item.setTextAlignment(
             Qt.AlignmentFlag.AlignCenter
             if col != len(_COLUMNS) - 1
             else Qt.AlignmentFlag.AlignLeft
         )
+        if not editable:
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, col, item)
+
+    def _set_combo_cell(self, row: int, col: int, value: object, choices: list[str]) -> None:
+        combo = QComboBox()
+        combo.addItems(choices)
+        text = str(value).strip().lower()
+        if isinstance(value, bool):
+            text = "true" if value else "false"
+        idx = combo.findText(text)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.setToolTip("Editable AutoTune candidate value")
+        self.table.setCellWidget(row, col, combo)
+
+    def _cell_text(self, row: int, col: int) -> str:
+        widget = self.table.cellWidget(row, col)
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        item = self.table.item(row, col)
+        return item.text().strip() if item else ""
+
+    def _coerce_param_value(self, key: str, value: str, old_value: object) -> object:
+        text = str(value).strip()
+        if key in {"flash_attn", "use_mmproj"}:
+            return text.lower() in {"1", "true", "yes", "on"}
+        if key in _INT_PARAM_KEYS:
+            if text.lower() in {"auto", "all"} and key == "ngl":
+                return text.lower()
+            try:
+                return int(text)
+            except ValueError:
+                return old_value
+        return text
+
+    def apply_table_edits_to_plan(self, plan: AutoTunePlan) -> AutoTunePlan:
+        """Copies edited table cells back into AutoTunePlan candidates."""
+        by_id = {candidate.id: candidate for candidate in plan.candidates}
+        changed = 0
+        for row in range(self.table.rowCount()):
+            cid = self._cell_text(row, 0)
+            candidate = by_id.get(cid)
+            if not candidate:
+                continue
+            for col, key in _PARAM_COLUMNS.items():
+                old_value = candidate.params.get(key, "")
+                new_value = self._coerce_param_value(key, self._cell_text(row, col), old_value)
+                if new_value != old_value:
+                    candidate.params[key] = new_value
+                    changed += 1
+        if changed:
+            self.append_activity(f"Applied {changed} edited plan value(s)")
+        return plan
 
     def _fill_candidate_row(self, row: int, candidate: BenchmarkCandidate) -> None:
         p = candidate.params
@@ -353,7 +453,12 @@ class AutoTuneWidget(QWidget):
             candidate.reason,
         ]
         for col, value in enumerate(values):
-            self._set_item(row, col, value)
+            if col in (12, 13):
+                self._set_combo_cell(row, col, value, _QUANT_CHOICES)
+            elif col in (19, 20):
+                self._set_combo_cell(row, col, value, _BOOL_CHOICES)
+            else:
+                self._set_item(row, col, value, editable=col in _PARAM_COLUMNS)
 
     def mark_running(self, candidate: BenchmarkCandidate) -> None:
         row = self._row_by_id.get(candidate.id)
