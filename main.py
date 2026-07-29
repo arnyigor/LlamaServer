@@ -1318,7 +1318,27 @@ class LlamaGUI:
         except Exception:
             return None
 
+    def _update_process_working_set_memory(self) -> float | None:
+        """Adds process RAM fallback to Memory tab when llama.cpp prints no buffers."""
+        ws = self._server_working_set_mib()
+        if ws is None:
+            return None
+        # Working Set overlaps with parsed RAM buffers, so use it only as a fallback
+        # when llama.cpp did not print detailed RAM/VRAM allocations.
+        parsed_without_fallback = sum(
+            mib
+            for comps in self._mem_data.raw_devices.values()
+            for comp, mib in comps.items()
+            if comp != "process_working_set"
+        )
+        if parsed_without_fallback <= 0:
+            self._mem_data.raw_devices.setdefault("PROCESS", {})[
+                "process_working_set"
+            ] = ws
+        return ws
+
     def _memory_summary_text(self) -> str:
+        ws = self._update_process_working_set_memory()
         agg = self._mem_data.get_aggregated()
         lines = ["📊 Memory after load:"]
         for cat in ("VRAM", "RAM"):
@@ -1338,8 +1358,13 @@ class LlamaGUI:
             if comp_parts:
                 lines.append(f"    {'; '.join(comp_parts)}")
 
-        ws = self._server_working_set_mib()
-        if ws is not None:
+        ram_comps = agg.get("RAM", {})
+        if "process_working_set" in ram_comps and len(ram_comps) == 1 and not agg.get("VRAM"):
+            lines.append(
+                "  Detail: llama.cpp did not print per-buffer RAM/VRAM sizes; "
+                "showing Windows process Working Set as a fallback."
+            )
+        if ws is not None and "process_working_set" not in agg.get("RAM", {}):
             lines.append(f"  Process RAM working set: {fmt_mem(ws)}")
         if len(lines) == 1:
             lines.append(
@@ -1372,6 +1397,8 @@ class LlamaGUI:
             self._mtp_failure_reason = "draft GGUF failed to load"
         for line in text.splitlines():
             parse_line(line, self._mem_data)
+        if self._mem_data.server_ready:
+            self._update_process_working_set_memory()
         self._maybe_log_memory_summary()
         # Принудительно обновляем UI после каждого блока логов
         self.ui.mem_viz.update_from_data(self._mem_data)

@@ -19,6 +19,7 @@ COMPONENT_ORDER = [
     "recurrent_state",
     "compute_pp",
     "compute",
+    "process_working_set",
 ]
 
 COMPONENT_META = {
@@ -28,6 +29,7 @@ COMPONENT_META = {
     "recurrent_state": {"label": "RS State", "color": 99, "char": "▓"},
     "compute_pp": {"label": "Compute PP", "color": 160, "char": "▒"},
     "compute": {"label": "Compute", "color": 71, "char": "░"},
+    "process_working_set": {"label": "Process Working Set", "color": 45, "char": "█"},
 }
 
 KIND_TO_COMPONENT = {

@@ -778,7 +778,9 @@ class MainWindowUI(QMainWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(4, 4, 4, 4)
 
-        # Вкладки: Логи и Визуализация
+        # Вкладки: логи и AutoTune. MemoryVisualizationWidget остаётся скрытым
+        # техническим виджетом для совместимости с существующим парсером логов;
+        # пользовательские данные по памяти выводятся в Logs.
         from PySide6.QtWidgets import QTabWidget
 
         self.tabs = QTabWidget()
@@ -800,9 +802,10 @@ class MainWindowUI(QMainWindow):
         log_layout.addWidget(clr)
         self.tabs.addTab(log_tab, "Logs")
 
-        # Вкладка визуализации памяти
+        # Скрытая визуализация памяти: не добавляем вкладку, чтобы не показывать
+        # пустой экран "Модель не выбрана" на сборках llama.cpp без buffer logs.
         self.mem_viz = MemoryVisualizationWidget()
-        self.tabs.addTab(self.mem_viz, "Memory")
+        self.mem_viz.setVisible(False)
 
         # Вкладка AutoTune
         self.autotune = AutoTuneWidget()
