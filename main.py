@@ -31,6 +31,7 @@ from src.services.integration_manager import IntegrationManager
 from src.services.hf_downloader import (
     HfModelDownloader,
     HfRepoScanner,
+    delete_file_safely,
     find_partial_downloads,
     format_bytes,
     lmstudio_repo_dir,
@@ -628,10 +629,32 @@ class LlamaGUI:
             "загрузка продолжится с .part."
         )
 
+    def _selected_hf_file_info(self):
+        selected = self.ui.hf_files.selectedItems()
+        if not selected:
+            return None
+        return selected[0].data(Qt.ItemDataRole.UserRole)
+
+    def _selected_hf_partial_info(self):
+        file_info = self._selected_hf_file_info()
+        return self._hf_partial_info(file_info) if file_info else {}
+
     def _update_hf_download_button(self):
         is_running = bool(self.hf_downloader and self.hf_downloader.isRunning())
-        self.ui.hf_download_btn.setEnabled(
-            bool(self.ui.hf_files.selectedItems()) and not is_running
+        has_selection = bool(self.ui.hf_files.selectedItems())
+        has_partial = bool(self._selected_hf_partial_info())
+        self.ui.hf_download_btn.setText(
+            "Resume selected" if has_partial and not is_running else "Download selected"
+        )
+        self.ui.hf_download_btn.setEnabled(has_selection and not is_running)
+        self.ui.hf_pause_btn.setEnabled(is_running)
+        self.ui.hf_cancel_btn.setEnabled(is_running or (has_partial and not is_running))
+        self.ui.hf_cancel_btn.setToolTip(
+            "Cancel running download and delete .part"
+            if is_running
+            else "Delete saved .part for selected file"
+            if has_partial
+            else "No partial download selected"
         )
 
     def _set_hf_download_controls_locked(self, locked):
@@ -643,11 +666,14 @@ class LlamaGUI:
             self.ui.hf_files,
         ):
             widget.setEnabled(not locked)
-        self.ui.hf_download_btn.setEnabled(
-            False if locked else bool(self.ui.hf_files.selectedItems())
-        )
-        self.ui.hf_pause_btn.setEnabled(locked)
-        self.ui.hf_cancel_btn.setEnabled(locked)
+        if locked:
+            self.ui.hf_download_btn.setText("Download selected")
+            self.ui.hf_download_btn.setEnabled(False)
+            self.ui.hf_pause_btn.setEnabled(True)
+            self.ui.hf_cancel_btn.setEnabled(True)
+            self.ui.hf_cancel_btn.setToolTip("Cancel running download and delete .part")
+        else:
+            self._update_hf_download_button()
 
     def _select_hf_projector(self):
         if not self.hf_scan_result:
@@ -679,6 +705,7 @@ class LlamaGUI:
         if not selected:
             QMessageBox.warning(self.ui, "Hugging Face", "Выберите GGUF файл для скачивания")
             return
+        selected_partial = self._selected_hf_partial_info()
         model_dir = self.ui.model_dir.text().strip()
         if not model_dir:
             QMessageBox.warning(self.ui, "Hugging Face", "Укажите базовую папку Models")
@@ -696,10 +723,18 @@ class LlamaGUI:
         total_size = sum(int(f.get("size") or 0) for f in files)
         names = "\n".join(f"• {self._hf_file_display(f)}" for f in files)
         size_line = f"\nTotal: {format_bytes(total_size)}" if total_size else ""
+        action_title = "Resume GGUF" if selected_partial else "Download GGUF"
+        action_text = "Продолжить загрузку" if selected_partial else "Скачать"
+        resume_line = (
+            f"\nResume from: {selected_partial.get('partial_size_text')}"
+            if selected_partial
+            else ""
+        )
         reply = QMessageBox.question(
             self.ui,
-            "Download GGUF",
-            f"Скачать в LM Studio-compatible папку:\n{target_root}\n\n{names}{size_line}",
+            action_title,
+            f"{action_text} в LM Studio-compatible папку:\n{target_root}\n\n"
+            f"{names}{size_line}{resume_line}",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -733,9 +768,36 @@ class LlamaGUI:
             self.ui.hf_pause_btn.setEnabled(False)
             self.ui.hf_cancel_btn.setEnabled(False)
             self.ui.hf_status.setText("Отмена: удаляю частичный .part файл...")
+            return
+
+        partial = self._selected_hf_partial_info()
+        if not partial:
+            return
+        reply = QMessageBox.question(
+            self.ui,
+            "Cancel partial download",
+            "Удалить сохранённый .part и начать этот файл заново при следующей загрузке?\n\n"
+            f"{partial.get('partial_path')}\n"
+            f"Saved: {partial.get('partial_size_text')}",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        delete_file_safely(Path(partial.get("partial_path") or ""))
+        item = self.ui.hf_files.currentItem()
+        file_info = self._selected_hf_file_info()
+        if item and file_info:
+            item.setText(self._hf_file_display(file_info))
+            item.setToolTip("")
+        self.ui.hf_status.setText("Частичный .part удалён. Следующая загрузка начнётся заново.")
+        self._update_hf_download_button()
 
     def _on_hf_download_finished(self):
-        self.ui.hf_download_btn.setText("Download selected")
+        item = self.ui.hf_files.currentItem()
+        file_info = self._selected_hf_file_info()
+        if item and file_info:
+            partial = self._hf_partial_info(file_info)
+            item.setText(self._hf_file_display(file_info))
+            item.setToolTip(f"Partial file: {partial.get('partial_path')}" if partial else "")
         self._set_hf_download_controls_locked(False)
         self._update_hf_download_button()
 
