@@ -163,6 +163,7 @@ def read_gguf_metadata(path: Union[str, Path]) -> Dict[str, Any]:
             ".expert_count",
             ".experts_used_count",
             ".attention.head_count",
+            ".attention.head_count_kv",
             ".embedding_length",
         }
     )
@@ -404,6 +405,7 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         "expert_count": 0,
         "expert_used": 0,
         "head_count": 0,
+        "head_count_kv": 0,
         "embedding_length": 0,
     }
     try:
@@ -445,6 +447,7 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
 
         for meta_suffix, info_key in (
             ("attention.head_count", "head_count"),
+            ("attention.head_count_kv", "head_count_kv"),
             ("embedding_length", "embedding_length"),
         ):
             val = metadata.get(f"{arch}.{meta_suffix}") if arch else None

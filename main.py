@@ -1291,6 +1291,77 @@ class LlamaGUI:
             "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
         )
 
+    def _system_ram_snapshot_mib(self):
+        """Returns (used_mib, total_mib, percent) for system RAM without extra deps."""
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    total = stat.ullTotalPhys / (1024**2)
+                    used = (stat.ullTotalPhys - stat.ullAvailPhys) / (1024**2)
+                    pct = (used / total * 100.0) if total else 0.0
+                    return used, total, pct
+            except Exception:
+                return None
+        return None
+
+    def _gpu_total_snapshots(self) -> list[dict]:
+        """Returns total GPU usage from nvidia-smi. Includes all processes."""
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+        gpus = []
+        for line in result.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 6:
+                continue
+            try:
+                used = float(parts[2])
+                total = float(parts[3])
+                gpus.append(
+                    {
+                        "index": parts[0],
+                        "name": parts[1],
+                        "used_mib": used,
+                        "total_mib": total,
+                        "util_pct": float(parts[4]),
+                        "temp_c": float(parts[5]),
+                        "used_pct": (used / total * 100.0) if total else 0.0,
+                    }
+                )
+            except ValueError:
+                continue
+        return gpus
+
     def _server_working_set_mib(self) -> float | None:
         """Возвращает Working Set llama-server процесса на Windows, если доступно."""
         pid = int(self.server.server_proc.processId() or 0)
@@ -1419,12 +1490,30 @@ class LlamaGUI:
             f"{getattr(self.config.settings, 'cache_type_v', 'f16')}, "
             f"flash-attn={'on' if getattr(self.config.settings, 'flash_attn', True) else 'off'}, "
             f"slots={parallel_slots}, gpu-layers={gpu_text}, ncmoe={ncmoe}",
+            f"    Model metadata: layers={info.get('block_count') or '?'}, heads={info.get('head_count') or '?'}, "
+            f"kv-heads={info.get('head_count_kv') or 'same/unknown'}, emb={info.get('embedding_length') or '?'}",
         ]
 
     def _memory_summary_text(self) -> str:
         ws, gpu = self._update_process_memory_fallbacks()
+        system_ram = self._system_ram_snapshot_mib()
+        gpu_snapshots = self._gpu_total_snapshots()
         agg = self._mem_data.get_aggregated()
         lines = ["📊 Memory after load:"]
+        if gpu_snapshots or system_ram:
+            lines.append("  Measured system snapshot:")
+            for gpu_info in gpu_snapshots:
+                lines.append(
+                    f"    GPU{gpu_info['index']} {gpu_info['name']}: "
+                    f"{fmt_mem(gpu_info['used_mib'])} / {fmt_mem(gpu_info['total_mib'])} "
+                    f"({gpu_info['used_pct']:.1f}%), util {gpu_info['util_pct']:.0f}%, "
+                    f"temp {gpu_info['temp_c']:.0f}°C"
+                )
+            if system_ram:
+                used, total, pct = system_ram
+                lines.append(f"    System RAM: {fmt_mem(used)} / {fmt_mem(total)} ({pct:.1f}%)")
+            if gpu_snapshots:
+                lines.append("    Note: GPU total includes desktop and other processes.")
         for cat in ("VRAM", "RAM"):
             total = self._mem_data.total(cat)
             cap = self._mem_data.system_memory.get(cat)

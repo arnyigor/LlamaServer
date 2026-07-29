@@ -42,16 +42,18 @@ def estimate_kv_cache(
     cache_type_v: str = "f16",
     flash_attn: bool = True,
     parallel_slots: int = 1,
+    kv_head_count: int = 0,
 ) -> float:
     """Оценка размера KV-cache в GiB."""
     if not (block_count and head_count and embedding_length):
         return 0.0
 
     head_dim = embedding_length // head_count
+    effective_kv_heads = kv_head_count or head_count
     k_bytes = _KV_TYPE_BYTES.get(cache_type_k.lower(), 2.0)
     v_bytes = _KV_TYPE_BYTES.get(cache_type_v.lower(), 2.0)
 
-    kv_per_token = block_count * head_count * head_dim * (k_bytes + v_bytes)
+    kv_per_token = block_count * effective_kv_heads * head_dim * (k_bytes + v_bytes)
     total_bytes = kv_per_token * ctx_size * parallel_slots
 
     if flash_attn:
@@ -118,6 +120,7 @@ def full_vram_estimate(
     """Полная оценка потребления VRAM."""
     block_count = info.get("block_count", 0)
     head_count = info.get("head_count", 0)
+    kv_head_count = info.get("head_count_kv", 0)
     embedding_len = info.get("embedding_length", 0)
     expert_count = info.get("expert_count", 0)
     expert_used = info.get("expert_used", 0)
@@ -133,6 +136,7 @@ def full_vram_estimate(
         cache_type_v,
         flash_attn,
         parallel_slots,
+        kv_head_count,
     )
 
     model_gib = estimate_model_vram(
