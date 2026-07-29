@@ -263,6 +263,83 @@ def is_projector_file(path: Union[str, Path]) -> bool:
     return "mmproj" in name or "projector" in name
 
 
+def is_mtp_draft_file(path: Union[str, Path]) -> bool:
+    """Проверка, похож ли GGUF на вспомогательный MTP/draft-файл."""
+    file_path = Path(path)
+    name = file_path.name.lower()
+    parent = file_path.parent.name.lower()
+    text = f"{parent}/{name}"
+    if is_projector_file(file_path):
+        return False
+    if any(token in text for token in ("draft", "assistant", "speculator")):
+        return True
+    return parent in {"mtp", "mtp-draft", "draft", "assistant"} and "mtp" in name
+
+
+def detect_mtp_draft_for_model(path: Union[str, Path]) -> str:
+    """Поиск отдельного MTP draft GGUF рядом с основной моделью.
+
+    Актуальные Unsloth Gemma 4 MTP пакеты кладут дополнительный MTP-файл
+    во вложенную папку, а Qwen3.6 MTP может требовать отдельный draft GGUF.
+    """
+    model_path = Path(path)
+    if not model_path.exists():
+        return ""
+
+    roots = [model_path.parent]
+    for base in (model_path.parent, model_path.parent.parent):
+        if not base.exists():
+            continue
+        try:
+            for child in base.iterdir():
+                if not child.is_dir() or child in roots:
+                    continue
+                name = child.name.lower()
+                if any(token in name for token in ("mtp", "draft", "assistant")):
+                    roots.append(child)
+        except OSError:
+            continue
+
+    candidates = []
+    for root in roots:
+        try:
+            for item in root.rglob("*.gguf"):
+                if item == model_path or not item.is_file() or is_projector_file(item):
+                    continue
+                haystack = f"{item.parent.name}/{item.name}".lower()
+                if "mtp" not in haystack:
+                    continue
+                candidates.append(item)
+        except OSError:
+            continue
+
+    if not candidates:
+        return ""
+
+    def score(item: Path) -> tuple:
+        haystack = f"{item.parent.name}/{item.name}".lower()
+        explicit = any(
+            token in haystack for token in ("draft", "assistant", "speculator")
+        )
+        mtp_dir = item.parent.name.lower() in {
+            "mtp",
+            "mtp-draft",
+            "draft",
+            "assistant",
+        }
+        same_parent = item.parent == model_path.parent
+        return (
+            not explicit,
+            not mtp_dir,
+            not same_parent,
+            len(str(item)),
+            item.name.lower(),
+        )
+
+    candidates.sort(key=score)
+    return str(candidates[0])
+
+
 def recommend_context(info: Dict[str, Any]) -> int:
     """Рекомендация размера контекста на основе параметров модели.
 
@@ -318,6 +395,10 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         "context_length": 0,
         "quant": quant_from_filename(file_path),
         "mmproj_path": detect_mmproj_for_model(file_path),
+        "mtp_draft_path": detect_mtp_draft_for_model(file_path),
+        "is_qat": "qat" in file_path.name.lower() or "qat" in str(file_path.parent).lower(),
+        "is_mtp_draft": is_mtp_draft_file(file_path),
+        "mtp_capable": False,
         "metadata_error": "",
         "block_count": 0,
         "expert_count": 0,
@@ -329,6 +410,8 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         metadata = read_gguf_metadata(file_path)
         arch = metadata.get("general.architecture", "")
         info["architecture"] = arch
+        if any("mtp" in str(key).lower() for key in metadata.keys()):
+            info["mtp_capable"] = True
         file_type = metadata.get("general.file_type")
         if isinstance(file_type, int) and file_type in GGUF_FILE_TYPES:
             info["quant"] = GGUF_FILE_TYPES[file_type]
@@ -372,6 +455,11 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
         info["metadata_error"] = f"GGUF parse error: {exc}"
     except Exception as exc:
         info["metadata_error"] = f"Unexpected error: {exc}"
+    info["mtp_capable"] = bool(
+        info.get("mtp_capable")
+        or "mtp" in file_path.name.lower()
+        or "mtp" in str(file_path.parent).lower()
+    )
     info["recommended_ctx"] = recommend_context(info)
     return info
 

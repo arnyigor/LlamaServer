@@ -67,6 +67,7 @@ class AppSettings:
     parallel_slots: int = -1
     kv_unified: bool = False
     speculative_mtp: bool = False
+    spec_draft_model_path: str = ""
     spec_draft_n_max: int = 3
     spec_draft_gpu_layers: str = "all"
     ctx_checkpoints: int = -1
@@ -79,6 +80,9 @@ class AppSettings:
     extra_args: str = ""
     enable_thinking: str = "off"
     cuda_version: str = "12"
+    hf_repo: str = ""
+    hf_quant_filter: str = "Q3-BF16"
+    hf_include_mmproj: bool = True
 
 
 # Явная таблица маппинга: поле -> атрибут виджета в UI
@@ -125,6 +129,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "parallel_slots": "parallel_slots",
     "kv_unified": "kv_unified",
     "speculative_mtp": "speculative_mtp",
+    "spec_draft_model_path": "spec_draft_model_path",
     "spec_draft_n_max": "spec_draft_n_max",
     "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "ctx_checkpoints": "ctx_checkpoints",
@@ -137,6 +142,9 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "extra_args": "extra_args",
     "enable_thinking": "enable_thinking",
     "cuda_version": "cuda_version_combo",
+    "hf_repo": "hf_repo",
+    "hf_quant_filter": "hf_quant_filter",
+    "hf_include_mmproj": "hf_include_mmproj",
 }
 
 _PERF_PRESETS_ROOT = "__perf_presets__"
@@ -163,6 +171,7 @@ _PERF_PRESET_FIELDS = (
     "cuda_visible_devices",
     "cuda_module_loading",
     "speculative_mtp",
+    "spec_draft_model_path",
     "spec_draft_n_max",
     "spec_draft_gpu_layers",
     "flash_attn",
@@ -199,6 +208,7 @@ _AUTOTUNE_PARAM_TO_SETTING = {
     "parallel_slots": "parallel_slots",
     "kv_unified": "kv_unified",
     "speculative_mtp": "speculative_mtp",
+    "spec_draft_model_path": "spec_draft_model_path",
     "spec_draft_n_max": "spec_draft_n_max",
     "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "flash_attn": "flash_attn",
@@ -222,6 +232,17 @@ _MANAGED_EXTRA_FLAGS = {
     "--cache-ram",
     "--kv-unified",
     "-kvu",
+    "--chat-template-kwargs",
+    "--spec-type",
+    "--spec-draft-n-max",
+    "--spec-draft-n-min",
+    "--spec-draft-p-min",
+    "--spec-draft-ngl",
+    "--spec-draft-device",
+    "--spec-draft-type-k",
+    "--spec-draft-type-v",
+    "-md",
+    "--model-draft",
     "--jinja",
     "--no-cache-prompt",
     "--flash-attn",

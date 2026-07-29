@@ -18,6 +18,8 @@ from src.core.gguf_parser import (
     extract_model_info,
     recommend_context,
     quant_from_filename,
+    detect_mtp_draft_for_model,
+    is_mtp_draft_file,
     is_projector_file,
 )
 from src.utils.file_utils import (
@@ -77,6 +79,20 @@ class TestGGUFParser(unittest.TestCase):
         self.assertTrue(is_projector_file("mmproj-model.gguf"))
         self.assertTrue(is_projector_file("model-projector.gguf"))
         self.assertFalse(is_projector_file("model-Q4_K_M.gguf"))
+
+    def test_mtp_draft_detection(self):
+        """Поиск отдельного MTP draft GGUF в пакете модели."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model = root / "gemma-4-26B-Q4_K_M.gguf"
+            model.write_bytes(b"fake")
+            draft_dir = root / "MTP"
+            draft_dir.mkdir()
+            draft = draft_dir / "gemma-4-26B-MTP-draft-Q8_0.gguf"
+            draft.write_bytes(b"fake")
+
+            self.assertTrue(is_mtp_draft_file(draft))
+            self.assertEqual(detect_mtp_draft_for_model(model), str(draft))
 
     def test_recommend_context(self):
         """Рекомендация размера контекста."""

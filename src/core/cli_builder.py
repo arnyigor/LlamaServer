@@ -19,6 +19,8 @@ def validate_extra_args(args: List[str], model_dir: str) -> List[str]:
         "--lora-scaled",
         "--mmproj",
         "--chat-template-file",
+        "-md",
+        "--model-draft",
     }
 
     while i < len(args):
@@ -97,6 +99,9 @@ def _filter_duplicate_extra_args(
         "--host",
         "--device",
         "--spec-draft-device",
+        "-md",
+        "--model-draft",
+        "--chat-template-kwargs",
         "--split-mode",
         "--main-gpu",
         "-ngl",
@@ -315,6 +320,8 @@ def build_args(
         elif thinking == "true" and reasoning_mode == "auto":
             reasoning_mode = "on"
         if reasoning_mode != "auto":
+            # Latest llama.cpp uses --reasoning on/off for thinking templates;
+            # --chat-template-kwargs enable_thinking is now deprecated.
             args += ["--reasoning", reasoning_mode]
         if cfg.ctx_checkpoints >= 0:
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
@@ -327,30 +334,17 @@ def build_args(
         if cfg.flash_attn:
             args += ["--flash-attn", "on"]
         if getattr(cfg, "speculative_mtp", False):
-            # Draft KV следует за target KV: если target q8_0, draft тоже q8_0.
-            draft_kv_k = getattr(cfg, "cache_type_k", "f16")
-            draft_kv_v = getattr(cfg, "cache_type_v", "f16")
-            draft_device = str(getattr(cfg, "spec_draft_device", "") or "").strip()
-            draft_ngl = str(
-                getattr(cfg, "spec_draft_gpu_layers", "all") or "all"
-            ).strip()
-            if draft_device:
-                args += ["--spec-draft-device", draft_device]
+            # Keep MTP CLI minimal and close to llama.cpp/Unsloth examples.
+            # Extra draft KV/device/ngl flags can trigger incompatibilities with
+            # Gemma4Assistant draft GGUFs in current llama.cpp builds.
+            draft_model = str(getattr(cfg, "spec_draft_model_path", "") or "").strip()
+            if draft_model:
+                args += ["--model-draft", draft_model]
             args += [
                 "--spec-type",
                 "draft-mtp",
                 "--spec-draft-n-max",
-                str(max(1, int(getattr(cfg, "spec_draft_n_max", 3) or 3))),
-                "--spec-draft-n-min",
-                "0",
-                "--spec-draft-p-min",
-                "0.00",
-                "--spec-draft-ngl",
-                draft_ngl,
-                "--spec-draft-type-k",
-                str(draft_kv_k),
-                "--spec-draft-type-v",
-                str(draft_kv_v),
+                str(max(1, int(getattr(cfg, "spec_draft_n_max", 2) or 2))),
             ]
 
         # mmproj logic expects model_info dict, passed separately if needed
@@ -391,7 +385,20 @@ def build_args(
             errs = validate_extra_args(extra, cfg.model_dir)
             if errs:
                 raise ValueError("; ".join(errs))
-            args.extend(_filter_duplicate_extra_args(extra, args))
+            managed_args = args
+            if getattr(cfg, "speculative_mtp", False):
+                managed_args = args + [
+                    "--model-draft",
+                    "--spec-type",
+                    "--spec-draft-n-max",
+                    "--spec-draft-n-min",
+                    "--spec-draft-p-min",
+                    "--spec-draft-ngl",
+                    "--spec-draft-device",
+                    "--spec-draft-type-k",
+                    "--spec-draft-type-v",
+                ]
+            args.extend(_filter_duplicate_extra_args(extra, managed_args))
         except ValueError as e:
             raise ValueError(f"Ошибка доп. параметров: {e}")
     return args

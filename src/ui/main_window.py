@@ -1,6 +1,7 @@
 """Главное окно и панели интерфейса."""
 
 import os
+import sys
 from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
     QSplitter,
 )
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 
 from src.ui.widgets import CollapsiblePanel
 from src.ui.mem_viz_widget import MemoryVisualizationWidget
@@ -34,9 +35,10 @@ from src.ui.autotune_widget import AutoTuneWidget
 class MainWindowUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LLama.cpp GUI Manager")
-        self.setGeometry(100, 100, 1550, 720)
-        self.setMinimumSize(1300, 560)
+        self.setWindowTitle("Llama Server Studio")
+        self.setGeometry(100, 100, 1280, 720)
+        self.setMinimumSize(1050, 560)
+        self._apply_app_icon()
 
         self.models = []
         self.models_by_path = {}
@@ -47,6 +49,12 @@ class MainWindowUI(QMainWindow):
         self._setup_ui()
         self._setup_tooltips()
         self._load_ui_state()
+
+    def _apply_app_icon(self):
+        root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        icon_path = root / "assets" / "llama_server_icon.svg"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
     def _setup_ui(self):
         central = QWidget()
@@ -186,6 +194,54 @@ class MainWindowUI(QMainWindow):
         lm.addLayout(mrow)
         lay.addWidget(g_model)
 
+        # === 2b. Hugging Face загрузка ===
+        self.hf_panel = CollapsiblePanel("Download GGUF from Hugging Face")
+        hf = self.hf_panel.content_layout
+
+        self.hf_repo = QLineEdit(
+            placeholderText="repo or URL, e.g. unsloth/Qwen3.6-27B-MTP-GGUF"
+        )
+        self.hf_repo.setToolTip(
+            "Paste Hugging Face repo id or model URL. Files are saved as:\n"
+            "<Models>/<author>/<model>/<file>.gguf, compatible with LM Studio."
+        )
+        hf.addWidget(self.hf_repo)
+
+        hf_filter_row = QHBoxLayout()
+        self.hf_quant_filter = QLineEdit(placeholderText="filter: Q4_K_M or Q3-BF16")
+        self.hf_quant_filter.setToolTip(
+            "Optional filter. Examples: Q4_K_M, IQ4, Q3-BF16.\n"
+            "Q3-BF16 means show quants from Q3 up to BF16."
+        )
+        self.hf_scan_btn = QPushButton("Scan HF")
+        hf_filter_row.addWidget(self.hf_quant_filter, 1)
+        hf_filter_row.addWidget(self.hf_scan_btn)
+        hf.addLayout(hf_filter_row)
+
+        hf_opts_row = QHBoxLayout()
+        self.hf_include_mmproj = QCheckBox("also vision/mmproj")
+        self.hf_include_mmproj.setChecked(True)
+        self.hf_download_btn = QPushButton("Download selected")
+        self.hf_download_btn.setEnabled(False)
+        hf_opts_row.addWidget(self.hf_include_mmproj)
+        hf_opts_row.addWidget(self.hf_download_btn)
+        hf_opts_row.addStretch(1)
+        hf.addLayout(hf_opts_row)
+
+        self.hf_files = QListWidget()
+        self.hf_files.setMaximumHeight(120)
+        self.hf_files.setToolTip(
+            "Select one main GGUF. Vision projector is paired automatically if found."
+        )
+        hf.addWidget(self.hf_files)
+
+        self.hf_status = QLabel("Paste repo and scan")
+        self.hf_status.setWordWrap(True)
+        self.hf_progress = QProgressBar(visible=False, minimum=0, maximum=100)
+        hf.addWidget(self.hf_status)
+        hf.addWidget(self.hf_progress)
+        lay.addWidget(self.hf_panel)
+
         self.speed_label = QLabel("Speed: -")
         self.speed_label.setStyleSheet(
             "color: #4ec9b0; font-family: Consolas; font-weight: bold;"
@@ -193,9 +249,9 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(self.speed_label)
 
         # === 3. Производительность ===
-        g_perf = QGroupBox("Performance and Memory")
-        lperf = QVBoxLayout(g_perf)
-        lperf.setContentsMargins(12, 18, 12, 12)
+        g_perf = CollapsiblePanel("Advanced: Performance and Memory")
+        lperf = g_perf.content_layout
+        lperf.setContentsMargins(8, 6, 8, 6)
         lperf.setSpacing(8)
 
         self.gpu_layers = QSpinBox()
@@ -373,6 +429,23 @@ class MainWindowUI(QMainWindow):
         r8b.addWidget(self.spec_draft_n_max)
         r8b.addWidget(self.spec_draft_gpu_layers)
         lperf.addLayout(r8b)
+
+        r8b2 = QHBoxLayout()
+        r8b2.addWidget(QLabel("MTP draft GGUF:"))
+        self.spec_draft_model_path = QLineEdit(
+            placeholderText="Auto-detected, or browse for separate MTP GGUF"
+        )
+        self.spec_draft_model_path.setToolTip(
+            "Optional separate MTP/draft GGUF. Gemma 4 packages often include it in an MTP folder; Qwen3.6 may require a separate file."
+        )
+        self.spec_draft_model_btn = QPushButton("...")
+        self.spec_draft_model_btn.setFixedWidth(32)
+        self.spec_draft_model_btn.clicked.connect(
+            lambda _checked=False: self._browse_mtp_draft_clicked()
+        )
+        r8b2.addWidget(self.spec_draft_model_path, 1)
+        r8b2.addWidget(self.spec_draft_model_btn)
+        lperf.addLayout(r8b2)
 
         self.cuda_device = QLineEdit(placeholderText="CUDA0")
         self.cuda_device.setMaximumWidth(80)
@@ -642,6 +715,8 @@ class MainWindowUI(QMainWindow):
             self.speculative_mtp,
             self.spec_draft_n_max,
             self.spec_draft_gpu_layers,
+            self.spec_draft_model_path,
+            self.spec_draft_model_btn,
             self.spec_draft_device,
             self.cuda_device,
             self.split_mode,
@@ -726,6 +801,8 @@ class MainWindowUI(QMainWindow):
             self.auto_params: "Automatically sets parameters",
             self.start_btn: "Starts llama-server",
             self.autotune_btn: "Opens AutoTune and builds a plan from current settings",
+            self.speculative_mtp: "Enable MTP speculative decoding when the selected model/package supports it",
+            self.spec_draft_model_path: "Separate MTP/draft GGUF path, auto-detected when possible",
             self.reload_btn: "Restarts llama-server with current parameters",
             self.stop_btn: "Stops server",
             self.force_stop_btn: "Force kills llama-server immediately",

@@ -57,6 +57,9 @@ class MockConfig:
     use_mmproj: bool = True
     mmproj_offload: bool = True
     enable_thinking: str = "off"
+    speculative_mtp: bool = False
+    spec_draft_model_path: str = ""
+    spec_draft_n_max: int = 3
     spec_draft_gpu_layers: str = "all"
     mmproj_path: str = ""
     bench_prompt: int = 128
@@ -139,6 +142,7 @@ class TestBuildArgs(unittest.TestCase):
         args = build_args(self.cfg, self.model)
         self.assertIn("--reasoning", args)
         self.assertIn("on", args)
+        self.assertNotIn("--chat-template-kwargs", args)
 
     def test_enable_thinking_modes(self):
         self.cfg.enable_thinking = "off"
@@ -156,6 +160,7 @@ class TestBuildArgs(unittest.TestCase):
         args = build_args(self.cfg, self.model)
         idx = args.index("--reasoning")
         self.assertEqual(args[idx + 1], "on")
+        self.assertNotIn("--chat-template-kwargs", args)
 
     def test_enable_thinking_legacy_bool(self):
         self.cfg.reasoning_mode = "auto"
@@ -179,6 +184,7 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.cache_type_k = "q8_0"
         self.cfg.cache_type_v = "q8_0"
         self.cfg.speculative_mtp = True
+        self.cfg.spec_draft_model_path = "/models/test-mtp-draft.gguf"
         self.cfg.spec_draft_n_max = 2
         self.cfg.spec_draft_gpu_layers = "all"
         self.cfg.use_mmproj = False
@@ -189,10 +195,11 @@ class TestBuildArgs(unittest.TestCase):
         self.assertEqual(args[args.index("-ngl") + 1], "all")
         self.assertIn("--device", args)
         self.assertIn("CUDA0", args)
-        self.assertEqual(args[args.index("--spec-draft-ngl") + 1], "all")
-        self.assertEqual(args[args.index("--spec-draft-type-k") + 1], "q8_0")
-        self.assertEqual(args[args.index("--spec-draft-type-v") + 1], "q8_0")
-        self.assertIn("--spec-draft-device", args)
+        self.assertNotIn("--spec-draft-ngl", args)
+        self.assertNotIn("--spec-draft-type-k", args)
+        self.assertNotIn("--spec-draft-type-v", args)
+        self.assertNotIn("--spec-draft-device", args)
+        self.assertEqual(args[args.index("--model-draft") + 1], "/models/test-mtp-draft.gguf")
         self.assertIn("--split-mode", args)
         self.assertIn("none", args)
         self.assertIn("--main-gpu", args)

@@ -15,7 +15,7 @@ from typing import List
 
 from PySide6.QtCore import QThread, Signal
 
-from src.core.gguf_parser import extract_model_info, is_projector_file
+from src.core.gguf_parser import extract_model_info, is_mtp_draft_file, is_projector_file
 
 
 class ModelScanner(QThread):
@@ -39,7 +39,11 @@ class ModelScanner(QThread):
             return
 
         try:
-            all_files = [f for f in base.rglob("*.gguf") if not is_projector_file(f)]
+            all_files = [
+                f
+                for f in base.rglob("*.gguf")
+                if not is_projector_file(f) and not is_mtp_draft_file(f)
+            ]
             total = len(all_files)
 
             for i, gguf_file in enumerate(all_files, 1):

@@ -122,6 +122,8 @@ CUDA_FREE_RE = re.compile(
 STOP_MARKERS = [
     "main: server is listening",
     "llama server listening",
+    "llama_server: model loaded",
+    "llama_server: listening on",
     "llama_print_timings",
     "llama_perf_context_print",
 ]

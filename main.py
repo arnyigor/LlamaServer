@@ -10,7 +10,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -23,10 +24,16 @@ from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
-from src.core.mem_viz_parser import MemoryData, parse_line
+from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
 from src.core.server_manager import ServerManager
 from src.services.autotune_manager import AutoTuneManager
 from src.services.integration_manager import IntegrationManager
+from src.services.hf_downloader import (
+    HfModelDownloader,
+    HfRepoScanner,
+    format_bytes,
+    lmstudio_repo_dir,
+)
 from src.services.threads import ModelScanner, LlamaCppUpdater
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
@@ -40,6 +47,9 @@ class LlamaGUI:
         self.server = ServerManager()
         self.scanner = None
         self.updater = None
+        self.hf_scanner = None
+        self.hf_downloader = None
+        self.hf_scan_result = None
         self.autotune = None
         self.autotune_plan = None
         self.autotune_results_dir = ""
@@ -50,6 +60,11 @@ class LlamaGUI:
         self._pending_restart_launch = None
         self._restart_needed = False
         self._pending_server_verify = None
+        self._last_server_launch = None
+        self._mtp_draft_error_seen = False
+        self._mtp_failure_reason = ""
+        self._mtp_fallback_attempted = False
+        self._memory_summary_logged = False
 
         self.log_mgr = LogManager(self.ui.logs)
         self.log_mgr.speed_updated.connect(self.ui.speed_label.setText)
@@ -73,6 +88,9 @@ class LlamaGUI:
         u.force_stop_btn.clicked.connect(self.force_stop_server)
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
+        u.hf_scan_btn.clicked.connect(self.scan_hf_repo)
+        u.hf_download_btn.clicked.connect(self.download_hf_selection)
+        u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
         for btn in getattr(u, "ctx_quick_buttons", []):
@@ -91,6 +109,7 @@ class LlamaGUI:
         u.speculative_mtp.stateChanged.connect(self._on_param_changed)
         u.spec_draft_n_max.valueChanged.connect(self._on_param_changed)
         u.spec_draft_gpu_layers.textChanged.connect(self._on_param_changed)
+        u.spec_draft_model_path.textChanged.connect(self._on_param_changed)
         u.cuda_device.textChanged.connect(self._on_param_changed)
         u.spec_draft_device.textChanged.connect(self._on_param_changed)
         u.split_mode.currentIndexChanged.connect(self._on_param_changed)
@@ -142,6 +161,7 @@ class LlamaGUI:
         u._browse_model_dir_clicked = self.browse_model_dir
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
+        u._browse_mtp_draft_clicked = self.browse_mtp_draft_model
         u.save_preset_btn.clicked.connect(self.save_preset)
         u.autotune_btn.clicked.connect(self.open_autotune_tab)
         u.autotune.build_plan_requested.connect(self.build_autotune_plan)
@@ -186,6 +206,8 @@ class LlamaGUI:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(self.ui)
+        if not self.ui.windowIcon().isNull():
+            self.tray.setIcon(self.ui.windowIcon())
         self.tray.setToolTip("LlamaServer GUI")
         menu = QMenu()
         menu.addAction("Show", self.ui.showNormal)
@@ -429,6 +451,22 @@ class LlamaGUI:
             self.save_settings()
             self.scan_models()
 
+    def browse_mtp_draft_model(self):
+        start_dir = self.ui.model_dir.text().strip() or ""
+        current = self.ui.spec_draft_model_path.text().strip()
+        if current:
+            start_dir = str(Path(current).parent)
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui,
+            "Select separate MTP/draft GGUF",
+            start_dir,
+            "GGUF (*.gguf);;All files (*.*)",
+        )
+        if f:
+            self.ui.spec_draft_model_path.setText(f)
+            self.ui.speculative_mtp.setChecked(True)
+            self.save_settings()
+
     def auto_scan_models(self):
         if self.ui.models:
             self.ui.scan_status.setText(
@@ -463,6 +501,185 @@ class LlamaGUI:
             or self.ui.scan_progress.setVisible(False)
         )
         self.scanner.start()
+
+    def scan_hf_repo(self):
+        if self.hf_scanner and self.hf_scanner.isRunning():
+            self.hf_scanner.requestInterruption()
+            self.ui.hf_status.setText("Отмена запроса Hugging Face...")
+            return
+
+        repo = self.ui.hf_repo.text().strip()
+        if not repo:
+            QMessageBox.warning(self.ui, "Hugging Face", "Вставьте repo id или URL модели")
+            return
+
+        self.save_settings()
+        self.ui.hf_files.clear()
+        self.ui.hf_progress.setValue(0)
+        self.ui.hf_download_btn.setEnabled(False)
+        self.ui.hf_progress.setVisible(True)
+        self.ui.hf_progress.setRange(0, 0)
+        self.ui.hf_status.setText("Сканирование Hugging Face...")
+        self.ui.hf_scan_btn.setText("Cancel")
+
+        self.hf_scanner = HfRepoScanner(repo, self.ui.hf_quant_filter.text().strip())
+        self.hf_scanner.progress.connect(self.ui.hf_status.setText)
+        self.hf_scanner.completed.connect(self._on_hf_scan_completed)
+        self.hf_scanner.error.connect(self._on_hf_scan_error)
+        self.hf_scanner.finished.connect(self._on_hf_scan_finished)
+        self.hf_scanner.start()
+
+    def _on_hf_scan_finished(self):
+        self.ui.hf_scan_btn.setText("Scan HF")
+        self.ui.hf_progress.setVisible(False)
+        self.ui.hf_progress.setRange(0, 100)
+
+    def _on_hf_scan_error(self, message):
+        self.hf_scan_result = None
+        self.ui.hf_status.setText(message)
+        self.log_mgr.append(f"Hugging Face scan failed: {message}", "error")
+
+    def _on_hf_scan_completed(self, result):
+        self.hf_scan_result = result
+        self.ui.hf_files.clear()
+        files = result.get("files") or []
+        projectors = result.get("projectors") or []
+        for file_info in files:
+            self.ui.hf_files.addItem(self._hf_file_display(file_info))
+            self.ui.hf_files.item(self.ui.hf_files.count() - 1).setData(
+                Qt.ItemDataRole.UserRole, file_info
+            )
+
+        if files:
+            self.ui.hf_files.setCurrentRow(0)
+
+        target_text = ""
+        model_dir = self.ui.model_dir.text().strip()
+        if model_dir:
+            target_text = f" → {lmstudio_repo_dir(Path(model_dir), result.get('repo_id', ''))}"
+        projector = self._select_hf_projector()
+        projector_text = f", vision: {projector.get('name')}" if projector else ""
+        total_size = sum(int(f.get("size") or 0) for f in files)
+        total_text = f", shown size: {format_bytes(total_size)}" if total_size else ""
+        self.ui.hf_status.setText(
+            f"Найдено GGUF: {len(files)} из {len(result.get('all_files') or [])}"
+            f"{total_text}, mmproj: {len(projectors)}{projector_text}{target_text}"
+        )
+        self._update_hf_download_button()
+        self.save_settings()
+
+    def _hf_file_display(self, file_info):
+        name = file_info.get("name") or file_info.get("rfilename") or ""
+        parts = [str(name)]
+        quant = str(file_info.get("quant") or "").strip()
+        if quant:
+            parts.append(quant)
+        size = int(file_info.get("size") or 0)
+        parts.append(format_bytes(size) if size else "size unknown")
+        return "  |  ".join(parts)
+
+    def _update_hf_download_button(self):
+        can_download = bool(self.ui.hf_files.selectedItems())
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            can_download = True
+        self.ui.hf_download_btn.setEnabled(can_download)
+
+    def _set_hf_download_controls_locked(self, locked):
+        for widget in (
+            self.ui.hf_repo,
+            self.ui.hf_quant_filter,
+            self.ui.hf_scan_btn,
+            self.ui.hf_include_mmproj,
+            self.ui.hf_files,
+        ):
+            widget.setEnabled(not locked)
+        self.ui.hf_download_btn.setEnabled(True if locked else bool(self.ui.hf_files.selectedItems()))
+
+    def _select_hf_projector(self):
+        if not self.hf_scan_result:
+            return None
+        projectors = list(self.hf_scan_result.get("projectors") or [])
+        if not projectors:
+            return None
+        filter_text = self.ui.hf_quant_filter.text().upper()
+        preferred = []
+        for key in ("BF16", "F16", "F32"):
+            if key in filter_text:
+                preferred.append(key)
+        preferred.extend(["BF16", "F16", "F32"])
+        for key in preferred:
+            for item in projectors:
+                if key in str(item.get("name") or "").upper():
+                    return item
+        projectors.sort(key=lambda item: (int(item.get("size") or 0), str(item.get("name") or "").lower()))
+        return projectors[0]
+
+    def download_hf_selection(self):
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            self.hf_downloader.requestInterruption()
+            self.ui.hf_status.setText("Отмена скачивания...")
+            return
+
+        if not self.hf_scan_result:
+            QMessageBox.warning(self.ui, "Hugging Face", "Сначала просканируйте репозиторий")
+            return
+        selected = self.ui.hf_files.selectedItems()
+        if not selected:
+            QMessageBox.warning(self.ui, "Hugging Face", "Выберите GGUF файл для скачивания")
+            return
+        model_dir = self.ui.model_dir.text().strip()
+        if not model_dir:
+            QMessageBox.warning(self.ui, "Hugging Face", "Укажите базовую папку Models")
+            return
+
+        main_file = selected[0].data(Qt.ItemDataRole.UserRole)
+        files = [main_file]
+        if self.ui.hf_include_mmproj.isChecked():
+            projector = self._select_hf_projector()
+            if projector and projector.get("rfilename") != main_file.get("rfilename"):
+                files.append(projector)
+
+        repo_id = self.hf_scan_result.get("repo_id") or ""
+        target_root = lmstudio_repo_dir(Path(model_dir), repo_id)
+        total_size = sum(int(f.get("size") or 0) for f in files)
+        names = "\n".join(f"• {self._hf_file_display(f)}" for f in files)
+        size_line = f"\nTotal: {format_bytes(total_size)}" if total_size else ""
+        reply = QMessageBox.question(
+            self.ui,
+            "Download GGUF",
+            f"Скачать в LM Studio-compatible папку:\n{target_root}\n\n{names}{size_line}",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.ui.hf_download_btn.setText("Cancel")
+        self._set_hf_download_controls_locked(True)
+        self.ui.hf_progress.setRange(0, 100)
+        self.ui.hf_progress.setValue(0)
+        self.ui.hf_progress.setVisible(True)
+        self.ui.hf_status.setText(
+            f"Начало скачивания: {len(files)} файл(а), total {format_bytes(total_size)}"
+        )
+
+        self.hf_downloader = HfModelDownloader(repo_id, files, model_dir)
+        self.hf_downloader.progress.connect(self.ui.hf_status.setText)
+        self.hf_downloader.percent.connect(self.ui.hf_progress.setValue)
+        self.hf_downloader.completed.connect(self._on_hf_download_completed)
+        self.hf_downloader.finished.connect(self._on_hf_download_finished)
+        self.hf_downloader.start()
+
+    def _on_hf_download_finished(self):
+        self.ui.hf_download_btn.setText("Download selected")
+        self._set_hf_download_controls_locked(False)
+        self._update_hf_download_button()
+
+    def _on_hf_download_completed(self, ok, message):
+        if ok:
+            self.ui.hf_progress.setValue(100)
+        self.ui.hf_status.setText(message)
+        self.log_mgr.append(message, "info" if ok else "error")
+        if ok:
+            self.scan_models(silent=True)
 
     def on_models_found(self, models):
         self.ui.models = models
@@ -508,7 +725,13 @@ class LlamaGUI:
         ctx = info.get("context_length", 0)
         rec_ctx = info.get("recommended_ctx", 0)
 
-        parts = [f"Architecture: {arch} | {quant} | {size:.2f} GiB"]
+        tags = []
+        if info.get("is_qat"):
+            tags.append("QAT")
+        if info.get("mtp_capable"):
+            tags.append("MTP")
+        tag_text = f" | {'/'.join(tags)}" if tags else ""
+        parts = [f"Architecture: {arch} | {quant} | {size:.2f} GiB{tag_text}"]
 
         layer_str = f"Layers: {block_count}" if block_count else "Layers: ?"
         if head_count:
@@ -527,10 +750,11 @@ class LlamaGUI:
             parts.append(f"Context: {ctx:,} | Rec: {rec_ctx:,}")
 
         if info.get("mmproj_path"):
-            from pathlib import Path
-
             mmproj_name = Path(info["mmproj_path"]).name
             parts.append(f"mmproj: {mmproj_name}")
+
+        if info.get("mtp_draft_path"):
+            parts.append(f"MTP draft: {Path(info['mtp_draft_path']).name}")
 
         if info.get("metadata_error"):
             parts.append(f"Warning: {info['metadata_error']}")
@@ -559,16 +783,28 @@ class LlamaGUI:
 
     def _sync_mtp_controls_for_model(self, info):
         is_mtp = self._is_mtp_model_info(info)
+        draft_path = str(info.get("mtp_draft_path") or "").strip()
         for widget in (
             self.ui.spec_draft_n_max,
             self.ui.spec_draft_gpu_layers,
+            self.ui.spec_draft_model_path,
+            self.ui.spec_draft_model_btn,
             self.ui.spec_draft_device,
         ):
             widget.setEnabled(is_mtp)
         self.ui.speculative_mtp.setEnabled(is_mtp)
         if is_mtp:
+            current_draft = self.ui.spec_draft_model_path.text().strip()
+            if self._uses_embedded_mtp_mode(info):
+                if current_draft == draft_path or "mtp-gemma" in current_draft.lower():
+                    self.ui.spec_draft_model_path.clear()
+                self.ui.spec_draft_model_path.setPlaceholderText(
+                    "Auto: embedded/package MTP mode, no --model-draft"
+                )
+            elif draft_path and (not current_draft or not os.path.exists(current_draft)):
+                self.ui.spec_draft_model_path.setText(draft_path)
             self.ui.speculative_mtp.setToolTip(
-                "Enable llama.cpp MTP speculative decoding for GGUFs with MTP layers"
+                "Enable llama.cpp MTP speculative decoding automatically. Gemma 4 regular GGUF uses package/embedded mode; QAT/manual modes can use a separate draft GGUF."
             )
             return
 
@@ -578,8 +814,12 @@ class LlamaGUI:
                 "MTP speculative disabled: selected model does not contain MTP layers",
                 "warn",
             )
+        self.ui.spec_draft_model_path.clear()
+        self.ui.spec_draft_model_path.setPlaceholderText(
+            "Auto-detected, or browse for separate MTP GGUF"
+        )
         self.ui.speculative_mtp.setToolTip(
-            "Disabled: selected GGUF is not an MTP model. Use Extra params only if you know this model supports it."
+            "Disabled: selected GGUF/package has no detected MTP draft support. Use Extra params only if you know this model supports it."
         )
 
     def _refresh_tooltips(self, info):
@@ -618,11 +858,40 @@ class LlamaGUI:
         self.ui.ctx_size.setToolTip(tooltip_ctx)
 
     def _is_mtp_model_info(self, info):
+        if info.get("mtp_capable") or info.get("mtp_draft_path"):
+            return True
         text = " ".join(
             str(info.get(k) or "")
             for k in ("path", "name", "display", "architecture", "_model_path")
         ).lower()
         return "mtp" in text
+
+    def _uses_embedded_mtp_mode(self, info):
+        """True when llama.cpp should use --spec-type draft-mtp without --model-draft."""
+        arch = str(info.get("architecture") or "").lower()
+        name_text = " ".join(
+            str(info.get(k) or "") for k in ("path", "name", "display", "_model_path")
+        ).lower()
+        return (
+            arch.startswith("gemma4")
+            and bool(info.get("mtp_capable"))
+            and not info.get("is_qat")
+            and "qat" not in name_text
+        )
+
+    def _auto_mtp_supported(self, info):
+        """Авто-включение MTP, если есть встроенные MTP layers или draft GGUF.
+
+        Для локальных Gemma 4 GGUF рядом может лежать mtp-*.gguf. Тогда нужно
+        запускать llama.cpp с --model-draft. Если конкретная сборка llama.cpp
+        или файл несовместимы, приложение сделает fallback без MTP.
+        """
+        return bool(info.get("mtp_capable") or info.get("mtp_draft_path"))
+
+    def _auto_mtp_draft_path(self, info):
+        if not self._auto_mtp_supported(info) or self._uses_embedded_mtp_mode(info):
+            return ""
+        return str(info.get("mtp_draft_path") or "").strip()
 
     def _apply_mtp_recommended_params(self, info):
         block_count = int(info.get("block_count") or 0)
@@ -637,6 +906,11 @@ class LlamaGUI:
         self.ui.parallel_slots.setValue(1)
         self.ui.kv_unified.setChecked(False)
         self.ui.speculative_mtp.setChecked(True)
+        draft_path = self._auto_mtp_draft_path(info)
+        if draft_path:
+            self.ui.spec_draft_model_path.setText(draft_path)
+        elif self._uses_embedded_mtp_mode(info):
+            self.ui.spec_draft_model_path.clear()
         self.ui.spec_draft_n_max.setValue(2)
         self.ui.spec_draft_gpu_layers.setText("all")
         self.ui.cuda_device.setText("CUDA0")
@@ -648,7 +922,7 @@ class LlamaGUI:
         logical = max(os.cpu_count() or 4, 1)
         self.ui.threads.setValue(min(8, logical))
         self.ui.threads_batch.setValue(min(16, logical))
-        self.ui.fit_off.setChecked(False)
+        self.ui.fit_off.setChecked(True)
         self.ui.reasoning_mode.setCurrentText("off")
         self.ui.enable_thinking.setCurrentText("false")
         self.ui.cache_prompt.setChecked(True)
@@ -660,9 +934,19 @@ class LlamaGUI:
         rec = info.get("recommended_ctx")
         if rec:
             self.ui.ctx_size.setValue(rec)
-        if self._is_mtp_model_info(info):
+        if self._auto_mtp_supported(info):
             self._apply_mtp_recommended_params(info)
             return
+        if self._is_mtp_model_info(info):
+            self.ui.speculative_mtp.setChecked(False)
+            self.ui.spec_draft_model_path.clear()
+            self.log_mgr.append(
+                "MTP auto: not enabled. No embedded MTP metadata and no nearby MTP draft GGUF was found.",
+                "warn",
+            )
+        if str(info.get("architecture") or "").lower().startswith("gemma4") or info.get("is_qat"):
+            self.ui.flash_attn.setChecked(True)
+            self.ui.jinja.setChecked(True)
         q = (info.get("quant") or "").upper()
         if (
             q.startswith(("Q2", "Q3", "IQ1", "IQ2", "IQ3"))
@@ -784,10 +1068,89 @@ class LlamaGUI:
             "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
         )
 
+    def _server_working_set_mib(self) -> float | None:
+        """Возвращает Working Set llama-server процесса на Windows, если доступно."""
+        pid = int(self.server.server_proc.processId() or 0)
+        if not pid or not sys.platform.startswith("win"):
+            return None
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            return None
+        line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+        if not line or "INFO:" in line:
+            return None
+        try:
+            import csv
+
+            row = next(csv.reader([line]))
+            mem_text = row[4]
+            digits = "".join(ch for ch in mem_text if ch.isdigit())
+            return int(digits) / 1024.0 if digits else None
+        except Exception:
+            return None
+
+    def _memory_summary_text(self) -> str:
+        agg = self._mem_data.get_aggregated()
+        lines = ["📊 Memory after load:"]
+        for cat in ("VRAM", "RAM"):
+            total = self._mem_data.total(cat)
+            cap = self._mem_data.system_memory.get(cat)
+            if total <= 0 and not cap:
+                continue
+            cap_text = f" / {fmt_mem(cap)}" if cap else ""
+            util = self._mem_data.utilization(cat)
+            util_text = f" ({util:.1f}%)" if util is not None else ""
+            lines.append(f"  {cat}: {fmt_mem(total)}{cap_text}{util_text}")
+            comps = agg.get(cat, {})
+            comp_parts = []
+            for comp, mib in sorted(comps.items(), key=lambda item: item[1], reverse=True):
+                label = COMPONENT_META.get(comp, {}).get("label", comp)
+                comp_parts.append(f"{label} {fmt_mem(mib, short=True)}")
+            if comp_parts:
+                lines.append(f"    {'; '.join(comp_parts)}")
+
+        ws = self._server_working_set_mib()
+        if ws is not None:
+            lines.append(f"  Process RAM working set: {fmt_mem(ws)}")
+        if len(lines) == 1:
+            lines.append(
+                "  llama.cpp did not print buffer sizes. Increase log verbosity (-lv) "
+                "or use the Memory tab for parsed allocations."
+            )
+        return "\n".join(lines)
+
+    def _maybe_log_memory_summary(self):
+        if self._memory_summary_logged or not self._mem_data.server_ready:
+            return
+        self._memory_summary_logged = True
+        self.log_mgr.append(self._memory_summary_text())
+
     def _on_log_for_mem_viz(self, text: str, level: str):
         """Обработка логов для визуализации памяти."""
+        lower_text = text.lower()
+        if "model doesn't contain mtp layers" in lower_text:
+            self._mtp_draft_error_seen = True
+            self._mtp_failure_reason = "main GGUF does not contain MTP layers"
+        elif "failed to create mtp context" in lower_text:
+            self._mtp_draft_error_seen = True
+            self._mtp_failure_reason = "failed to create MTP context"
+        elif (
+            "failed to load draft model" in lower_text
+            or "common_speculative_init_result" in lower_text
+            or "invalid vector subscript" in lower_text
+        ):
+            self._mtp_draft_error_seen = True
+            self._mtp_failure_reason = "draft GGUF failed to load"
         for line in text.splitlines():
             parse_line(line, self._mem_data)
+        self._maybe_log_memory_summary()
         # Принудительно обновляем UI после каждого блока логов
         self.ui.mem_viz.update_from_data(self._mem_data)
         # Обрабатываем события Qt чтобы UI не зависал
@@ -796,6 +1159,7 @@ class LlamaGUI:
     def _reset_mem_viz(self, status: str | None = None):
         """Сброс визуализации памяти."""
         self._mem_data = MemoryData()
+        self._memory_summary_logged = False
         self.ui.mem_viz.clear()
         if status:
             self.ui.mem_viz.status_label.setText(status)
@@ -813,14 +1177,82 @@ class LlamaGUI:
             self._reset_mem_viz(status)
         self.ui.tabs.setCurrentIndex(1)
 
+    def _strip_mtp_args(self, args: list[str]) -> list[str]:
+        value_flags = {
+            "-md",
+            "--model-draft",
+            "--spec-draft-device",
+            "--spec-type",
+            "--spec-draft-n-max",
+            "--spec-draft-n-min",
+            "--spec-draft-p-min",
+            "--spec-draft-ngl",
+            "--spec-draft-type-k",
+            "--spec-draft-type-v",
+        }
+        stripped = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            base = arg.split("=", 1)[0] if str(arg).startswith("-") else arg
+            if base in value_flags:
+                if "=" not in str(arg) and i + 1 < len(args):
+                    i += 2
+                else:
+                    i += 1
+                continue
+            stripped.append(arg)
+            i += 1
+        return stripped
+
+    def _retry_without_mtp_if_needed(self, exit_code: int) -> bool:
+        if exit_code == 0 or self._mtp_fallback_attempted:
+            return False
+        if not self._mtp_draft_error_seen or not self._last_server_launch:
+            return False
+
+        exe, args, env = self._last_server_launch
+        if "--spec-type" not in args and "--model-draft" not in args and "-md" not in args:
+            return False
+
+        fallback_args = self._strip_mtp_args(args)
+        if fallback_args == args:
+            return False
+
+        self._mtp_fallback_attempted = True
+        reason = self._mtp_failure_reason or "MTP initialization failed"
+        self._mtp_draft_error_seen = False
+        self._mtp_failure_reason = ""
+        self.ui.speculative_mtp.setChecked(False)
+        self.log_mgr.append(
+            f"⚠️ MTP disabled: {reason}. Retrying once without MTP so the main model can start. "
+            "For automatic MTP use a main GGUF/package that actually contains MTP layers, "
+            "or a matching supported draft GGUF with a new llama.cpp build.",
+            "warn",
+        )
+        self._reset_mem_viz("MTP failed, retrying without MTP...")
+        QTimer.singleShot(
+            150,
+            lambda: self._launch_server(
+                exe,
+                fallback_args,
+                env=env,
+                action="Retry without MTP (draft failed)",
+            ),
+        )
+        return True
+
     def _on_server_stopped(self):
         """Обработчик остановки сервера."""
         if self._restart_pending:
             self._reset_mem_viz("Сервер остановлен, перезапуск с новыми параметрами...")
             QTimer.singleShot(150, self._start_pending_restart)
             return
+        exit_code = self.server.server_proc.exitCode()
+        if self._retry_without_mtp_if_needed(exit_code):
+            return
         self._finalize_mem_viz_after_stop(
-            self.server.server_proc.exitCode(),
+            exit_code,
             "Сервер остановлен",
         )
 
@@ -855,7 +1287,18 @@ class LlamaGUI:
             # Сохранённый MTP-чекбокс/пресет не должен ломать обычные GGUF.
             # Пользовательские эксперименты всё ещё можно задать вручную в Extra params.
             self.config.settings.speculative_mtp = False
-        if self.ui.auto_params.isChecked() and is_mtp_model:
+        if (
+            self.ui.auto_params.isChecked()
+            and is_mtp_model
+            and not self._auto_mtp_supported(info)
+        ):
+            self.config.settings.speculative_mtp = False
+            self.config.settings.spec_draft_model_path = ""
+            self.log_mgr.append(
+                "MTP auto: skipped because no embedded MTP metadata and no nearby MTP draft GGUF was found.",
+                "warn",
+            )
+        if self.ui.auto_params.isChecked() and self._auto_mtp_supported(info):
             block_count = int(info.get("block_count") or 0)
             self.config.settings.gpu_auto = False
             self.config.settings.gpu_layers_all = True
@@ -868,6 +1311,13 @@ class LlamaGUI:
             self.config.settings.parallel_slots = 1
             self.config.settings.kv_unified = False
             self.config.settings.speculative_mtp = True
+            auto_draft_path = self._auto_mtp_draft_path(info)
+            if auto_draft_path:
+                self.config.settings.spec_draft_model_path = (
+                    self.config.settings.spec_draft_model_path or auto_draft_path
+                )
+            elif self._uses_embedded_mtp_mode(info):
+                self.config.settings.spec_draft_model_path = ""
             self.config.settings.spec_draft_n_max = 2
             self.config.settings.spec_draft_gpu_layers = "all"
             self.config.settings.cuda_device = (
@@ -886,7 +1336,7 @@ class LlamaGUI:
             self.config.settings.cuda_module_loading = (
                 self.config.settings.cuda_module_loading or "LAZY"
             )
-            self.config.settings.fit_off = False
+            self.config.settings.fit_off = True
             self.config.settings.reasoning_mode = "off"
             self.config.settings.enable_thinking = "false"
             self.config.settings.cache_prompt = True
@@ -901,6 +1351,19 @@ class LlamaGUI:
             return None
         if not args:
             return None
+        if getattr(self.config.settings, "speculative_mtp", False):
+            if self.config.settings.spec_draft_model_path:
+                self.log_mgr.append(
+                    "MTP auto: using separate draft GGUF (--model-draft). "
+                    "If it fails, the app will retry without MTP.",
+                    "info",
+                )
+            else:
+                self.log_mgr.append(
+                    "MTP auto: using embedded/package mode (--spec-type draft-mtp, "
+                    "no --model-draft). This is the preferred mode for Gemma 4 regular GGUF.",
+                    "info",
+                )
         env = self._server_env_from_settings()
         return exe, args, env
 
@@ -932,6 +1395,12 @@ class LlamaGUI:
         self.log_mgr.append(
             f"{action} [CUDA {cuda_ver}]: {exe}\n   Args: {' '.join(args)}{env_text}"
         )
+        self._last_server_launch = (exe, list(args), dict(env or {}))
+        if "--spec-type" in args or "--model-draft" in args or "-md" in args:
+            self._mtp_draft_error_seen = False
+            self._mtp_failure_reason = ""
+            if not action.lower().startswith("retry without mtp"):
+                self._mtp_fallback_attempted = False
         self._reset_mem_viz()
         self.server.start_server(exe, args, env=env)
         self._reset_restart_indicator()
@@ -1732,6 +2201,10 @@ class LlamaGUI:
 
 def main():
     app = QApplication(sys.argv)
+    icon_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    icon_path = icon_root / "assets" / "llama_server_icon.svg"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     gui = LlamaGUI()
     gui.ui.show()
     sys.exit(app.exec())
