@@ -27,6 +27,7 @@ from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
 from src.core.server_manager import ServerManager
+from src.core.vram_estimator import full_vram_estimate
 from src.services.autotune_manager import AutoTuneManager
 from src.services.integration_manager import IntegrationManager
 from src.services.hf_downloader import (
@@ -1318,27 +1319,110 @@ class LlamaGUI:
         except Exception:
             return None
 
-    def _update_process_working_set_memory(self) -> float | None:
-        """Adds process RAM fallback to Memory tab when llama.cpp prints no buffers."""
-        ws = self._server_working_set_mib()
-        if ws is None:
+    def _server_gpu_memory_mib(self) -> float | None:
+        """Returns llama-server GPU memory from nvidia-smi, if available."""
+        pid = int(self.server.server_proc.processId() or 0)
+        if not pid:
             return None
-        # Working Set overlaps with parsed RAM buffers, so use it only as a fallback
-        # when llama.cpp did not print detailed RAM/VRAM allocations.
-        parsed_without_fallback = sum(
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        total = 0.0
+        for line in result.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                if int(parts[0]) == pid:
+                    total += float(parts[1])
+            except ValueError:
+                continue
+        return total or None
+
+    def _parsed_memory_without_process_fallback(self) -> float:
+        return sum(
             mib
             for comps in self._mem_data.raw_devices.values()
             for comp, mib in comps.items()
-            if comp != "process_working_set"
+            if comp not in {"process_working_set", "process_gpu_memory"}
         )
-        if parsed_without_fallback <= 0:
-            self._mem_data.raw_devices.setdefault("PROCESS", {})[
-                "process_working_set"
-            ] = ws
-        return ws
+
+    def _update_process_memory_fallbacks(self) -> tuple[float | None, float | None]:
+        """Adds process RAM/VRAM fallback when llama.cpp prints no buffers."""
+        ws = self._server_working_set_mib()
+        gpu = self._server_gpu_memory_mib()
+        # Process memory overlaps with parsed buffers, so use it only as a fallback
+        # when llama.cpp did not print detailed RAM/VRAM allocations.
+        if self._parsed_memory_without_process_fallback() <= 0:
+            if ws is not None:
+                self._mem_data.raw_devices.setdefault("PROCESS", {})[
+                    "process_working_set"
+                ] = ws
+            if gpu is not None:
+                self._mem_data.raw_devices.setdefault("CUDA_PROCESS", {})[
+                    "process_gpu_memory"
+                ] = gpu
+        return ws, gpu
+
+    def _memory_estimate_lines(self) -> list[str]:
+        model_path = self._current_model_path()
+        if not model_path:
+            return []
+        info = self.ui.models_by_path.get(model_path) or extract_model_info(model_path)
+        block_count = int(info.get("block_count") or 0)
+        gpu_layers = block_count or 999
+        if not getattr(self.config.settings, "gpu_auto", True) and not getattr(
+            self.config.settings, "gpu_layers_all", False
+        ):
+            gpu_layers = int(getattr(self.config.settings, "gpu_layers", gpu_layers) or gpu_layers)
+        ctx_size = int(getattr(self.config.settings, "ctx_size", 0) or 0)
+        if ctx_size <= 0:
+            ctx_size = int(info.get("recommended_ctx") or info.get("context_length") or 4096)
+        parallel_slots = int(getattr(self.config.settings, "parallel_slots", 1) or 1)
+        if parallel_slots <= 0:
+            parallel_slots = 1
+        ncmoe = int(getattr(self.config.settings, "cpu_moe_layers", 0) or 0)
+        if ncmoe < 0:
+            ncmoe = 0
+        est = full_vram_estimate(
+            info,
+            ctx_size=ctx_size,
+            gpu_layers=gpu_layers,
+            cache_type_k=getattr(self.config.settings, "cache_type_k", "f16"),
+            cache_type_v=getattr(self.config.settings, "cache_type_v", "f16"),
+            flash_attn=bool(getattr(self.config.settings, "flash_attn", True)),
+            parallel_slots=parallel_slots,
+            ncmoe=ncmoe,
+        )
+        gpu_text = "all" if getattr(self.config.settings, "gpu_layers_all", False) else str(gpu_layers)
+        return [
+            "  Estimated VRAM allocation (heuristic, not measured):",
+            f"    Model weights: {est.model_vram_gib:.2f} GiB",
+            f"    KV cache: {est.kv_cache_gib:.2f} GiB ({est.kv_per_1k_ctx_mib:.1f} MiB / 1K ctx)",
+            f"    Runtime/compute overhead: {est.overhead_gib:.2f} GiB",
+            f"    Total estimated VRAM: {est.total_gib:.2f} GiB",
+            "    Settings: "
+            f"ctx={ctx_size:,}, KV={getattr(self.config.settings, 'cache_type_k', 'f16')}/"
+            f"{getattr(self.config.settings, 'cache_type_v', 'f16')}, "
+            f"flash-attn={'on' if getattr(self.config.settings, 'flash_attn', True) else 'off'}, "
+            f"slots={parallel_slots}, gpu-layers={gpu_text}, ncmoe={ncmoe}",
+        ]
 
     def _memory_summary_text(self) -> str:
-        ws = self._update_process_working_set_memory()
+        ws, gpu = self._update_process_memory_fallbacks()
         agg = self._mem_data.get_aggregated()
         lines = ["📊 Memory after load:"]
         for cat in ("VRAM", "RAM"):
@@ -1358,19 +1442,25 @@ class LlamaGUI:
             if comp_parts:
                 lines.append(f"    {'; '.join(comp_parts)}")
 
-        ram_comps = agg.get("RAM", {})
-        if "process_working_set" in ram_comps and len(ram_comps) == 1 and not agg.get("VRAM"):
+        parsed_detail = self._parsed_memory_without_process_fallback() > 0
+        if not parsed_detail:
+            if ws is not None and "process_working_set" not in agg.get("RAM", {}):
+                lines.append(f"  RAM Process Working Set: {fmt_mem(ws)}")
+            if gpu is not None and "process_gpu_memory" not in agg.get("VRAM", {}):
+                lines.append(f"  VRAM Process GPU memory: {fmt_mem(gpu)}")
             lines.append(
                 "  Detail: llama.cpp did not print per-buffer RAM/VRAM sizes; "
-                "showing Windows process Working Set as a fallback."
+                "using OS process counters plus an estimate below."
             )
-        if ws is not None and "process_working_set" not in agg.get("RAM", {}):
+            lines.extend(self._memory_estimate_lines())
+        elif ws is not None:
             lines.append(f"  Process RAM working set: {fmt_mem(ws)}")
         if len(lines) == 1:
             lines.append(
-                "  llama.cpp did not print buffer sizes. Increase log verbosity (-lv) "
-                "or use the Memory tab for parsed allocations."
+                "  llama.cpp did not print buffer sizes and process counters are unavailable. "
+                "Increase log verbosity (-lv) or check nvidia-smi/Task Manager."
             )
+            lines.extend(self._memory_estimate_lines())
         return "\n".join(lines)
 
     def _maybe_log_memory_summary(self):
@@ -1398,7 +1488,7 @@ class LlamaGUI:
         for line in text.splitlines():
             parse_line(line, self._mem_data)
         if self._mem_data.server_ready:
-            self._update_process_working_set_memory()
+            self._update_process_memory_fallbacks()
         self._maybe_log_memory_summary()
         # Принудительно обновляем UI после каждого блока логов
         self.ui.mem_viz.update_from_data(self._mem_data)

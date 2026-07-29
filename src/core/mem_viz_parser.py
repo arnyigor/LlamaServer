@@ -20,6 +20,7 @@ COMPONENT_ORDER = [
     "compute_pp",
     "compute",
     "process_working_set",
+    "process_gpu_memory",
 ]
 
 COMPONENT_META = {
@@ -30,6 +31,7 @@ COMPONENT_META = {
     "compute_pp": {"label": "Compute PP", "color": 160, "char": "▒"},
     "compute": {"label": "Compute", "color": 71, "char": "░"},
     "process_working_set": {"label": "Process Working Set", "color": 45, "char": "█"},
+    "process_gpu_memory": {"label": "Process GPU Memory", "color": 190, "char": "█"},
 }
 
 KIND_TO_COMPONENT = {
