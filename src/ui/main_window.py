@@ -246,6 +246,23 @@ class MainWindowUI(QMainWindow):
         self.hf_progress = QProgressBar(visible=False, minimum=0, maximum=100)
         hf.addWidget(self.hf_status)
         hf.addWidget(self.hf_progress)
+
+        hf_local_row = QHBoxLayout()
+        self.hf_refresh_local_btn = QPushButton("Refresh local")
+        self.hf_delete_local_folder_btn = QPushButton("Delete local folder")
+        self.hf_delete_local_folder_btn.setEnabled(False)
+        hf_local_row.addWidget(QLabel("Local files:"))
+        hf_local_row.addStretch(1)
+        hf_local_row.addWidget(self.hf_refresh_local_btn)
+        hf_local_row.addWidget(self.hf_delete_local_folder_btn)
+        hf.addLayout(hf_local_row)
+
+        self.hf_local_files = QListWidget()
+        self.hf_local_files.setMaximumHeight(90)
+        self.hf_local_files.setToolTip(
+            "Files already present in <Models>/<author>/<model>. Delete local folder removes the whole repo folder including mmproj/vision files."
+        )
+        hf.addWidget(self.hf_local_files)
         lay.addWidget(self.hf_panel)
 
         self.speed_label = QLabel("Speed: -")

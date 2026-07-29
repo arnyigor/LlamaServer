@@ -463,6 +463,37 @@ def lmstudio_repo_dir(base_model_dir: Path, repo_id: str) -> Path:
     return base_model_dir / author / model
 
 
+def list_local_repo_files(base_model_dir: Path, repo_id: str) -> Dict:
+    """Список локальных файлов HF repo в LM Studio-compatible папке."""
+    root = lmstudio_repo_dir(Path(base_model_dir), repo_id)
+    result = {"root": str(root), "exists": root.exists(), "files": [], "total_size": 0}
+    if not root.exists():
+        return result
+    try:
+        files = sorted((p for p in root.rglob("*") if p.is_file()), key=lambda p: str(p).lower())
+    except OSError:
+        return result
+    for path in files:
+        try:
+            rel = path.relative_to(root).as_posix()
+            size = path.stat().st_size
+        except OSError:
+            continue
+        result["files"].append(
+            {
+                "path": str(path),
+                "relative": rel,
+                "name": path.name,
+                "size": size,
+                "size_text": format_bytes(size),
+                "is_partial": path.name.lower().endswith(".part"),
+            }
+        )
+        result["total_size"] += size
+    result["total_size_text"] = format_bytes(result["total_size"])
+    return result
+
+
 def find_partial_downloads(base_model_dir: Path, repo_id: str) -> List[Dict]:
     """Возвращает локальные .gguf.part для репозитория без обращения к сети."""
     root = lmstudio_repo_dir(Path(base_model_dir), repo_id)

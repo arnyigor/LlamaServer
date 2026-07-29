@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from src.services.hf_downloader import (
     delete_file_safely,
     find_partial_downloads,
     format_bytes,
+    list_local_repo_files,
     lmstudio_repo_dir,
     normalize_hf_repo_id,
     partial_download_info,
@@ -97,6 +99,8 @@ class LlamaGUI:
         u.hf_download_btn.clicked.connect(self.download_hf_selection)
         u.hf_pause_btn.clicked.connect(self.pause_hf_download)
         u.hf_cancel_btn.clicked.connect(self.cancel_hf_download)
+        u.hf_refresh_local_btn.clicked.connect(self.refresh_hf_local_files)
+        u.hf_delete_local_folder_btn.clicked.connect(self.delete_hf_local_folder)
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
@@ -580,6 +584,7 @@ class LlamaGUI:
             f"{partial_text}{target_text}"
         )
         self._update_hf_download_button()
+        self.refresh_hf_local_files(silent=True)
         self.save_settings()
 
     def _hf_file_display(self, file_info):
@@ -628,6 +633,77 @@ class LlamaGUI:
             f"сохранено {format_bytes(total)}. Нажмите Scan HF, затем Download selected — "
             "загрузка продолжится с .part."
         )
+        self.refresh_hf_local_files(silent=True)
+
+    def _current_hf_repo_id(self):
+        if self.hf_scan_result and self.hf_scan_result.get("repo_id"):
+            return self.hf_scan_result.get("repo_id")
+        repo_text = self.ui.hf_repo.text().strip()
+        if not repo_text:
+            return ""
+        try:
+            return normalize_hf_repo_id(repo_text)
+        except Exception:
+            return ""
+
+    def refresh_hf_local_files(self, silent=False):
+        self.ui.hf_local_files.clear()
+        model_dir = self.ui.model_dir.text().strip()
+        repo_id = self._current_hf_repo_id()
+        if not model_dir or not repo_id:
+            self.ui.hf_delete_local_folder_btn.setEnabled(False)
+            if not silent:
+                self.ui.hf_status.setText("Local files: specify Models folder and HF repo")
+            return
+
+        info = list_local_repo_files(Path(model_dir), repo_id)
+        files = info.get("files") or []
+        for file_info in files:
+            marker = "partial" if file_info.get("is_partial") else "local"
+            self.ui.hf_local_files.addItem(
+                f"{file_info.get('relative')}  |  {marker}  |  {file_info.get('size_text')}"
+            )
+            self.ui.hf_local_files.item(self.ui.hf_local_files.count() - 1).setToolTip(
+                str(file_info.get("path") or "")
+            )
+        self.ui.hf_delete_local_folder_btn.setEnabled(bool(info.get("exists")))
+        if files:
+            self.ui.hf_status.setText(
+                f"Local folder: {info.get('root')} | files: {len(files)}, total {info.get('total_size_text')}"
+            )
+        elif info.get("exists"):
+            self.ui.hf_status.setText(f"Local folder exists but is empty: {info.get('root')}")
+        elif not silent:
+            self.ui.hf_status.setText(f"Local folder not found: {info.get('root')}")
+
+    def delete_hf_local_folder(self):
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            QMessageBox.warning(self.ui, "Hugging Face", "Stop the download before deleting local files")
+            return
+        model_dir = self.ui.model_dir.text().strip()
+        repo_id = self._current_hf_repo_id()
+        if not model_dir or not repo_id:
+            return
+        target_root = lmstudio_repo_dir(Path(model_dir), repo_id)
+        if not target_root.exists():
+            self.refresh_hf_local_files(silent=True)
+            return
+        reply = QMessageBox.question(
+            self.ui,
+            "Delete local model folder",
+            "Удалить всю локальную папку модели, включая main GGUF, vision/mmproj и .part?\n\n"
+            f"{target_root}",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(target_root)
+        except OSError as exc:
+            QMessageBox.critical(self.ui, "Delete failed", str(exc))
+            return
+        self.ui.hf_status.setText(f"Local model folder deleted: {target_root}")
+        self.refresh_hf_local_files(silent=True)
+        self.scan_models(silent=True)
 
     def _selected_hf_file_info(self):
         selected = self.ui.hf_files.selectedItems()
@@ -797,6 +873,7 @@ class LlamaGUI:
             item.setText(self._hf_file_display(file_info))
             item.setToolTip("")
         self.ui.hf_status.setText("Частичный .part удалён. Следующая загрузка начнётся заново.")
+        self.refresh_hf_local_files(silent=True)
         self._update_hf_download_button()
 
     def _on_hf_download_finished(self):
@@ -807,15 +884,24 @@ class LlamaGUI:
             item.setText(self._hf_file_display(file_info))
             item.setToolTip(f"Partial file: {partial.get('partial_path')}" if partial else "")
         self._set_hf_download_controls_locked(False)
+        self.refresh_hf_local_files(silent=True)
         self._update_hf_download_button()
 
     def _on_hf_download_completed(self, ok, message):
         if ok:
             self.ui.hf_progress.setValue(100)
+            QTimer.singleShot(1500, self._reset_hf_progress_after_complete)
         self.ui.hf_status.setText(message)
         self.log_mgr.append(message, "info" if ok else "error")
+        self.refresh_hf_local_files(silent=True)
         if ok:
             self.scan_models(silent=True)
+
+    def _reset_hf_progress_after_complete(self):
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            return
+        self.ui.hf_progress.setValue(0)
+        self.ui.hf_progress.setVisible(False)
 
     def on_models_found(self, models):
         self.ui.models = models
