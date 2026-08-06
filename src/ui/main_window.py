@@ -396,8 +396,8 @@ class MainWindowUI(QMainWindow):
         lperf = self.adv_panel.content_layout
         lperf.setContentsMargins(8, 6, 8, 6)
         lperf.setSpacing(8)
-        # Launch settings groupbox — первая секция общего спойлера Advanced
-        self.adv_panel.add_widget(g_launch)
+        # Launch settings — видимый блок сразу за Model (runtime stats сейчас на индексе 2)
+        lay.insertWidget(2, g_launch)
 
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 999)
