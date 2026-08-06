@@ -180,7 +180,7 @@ class MainWindowUI(QMainWindow):
         lm.addWidget(self.scan_progress)
 
         self.model_combo = QComboBox()
-        self.model_combo.setEditable(True)
+        self.model_combo.setEditable(False)
         self.model_combo.setMinimumHeight(30)
         self.model_combo.setMaxVisibleItems(25)
         self.model_combo.setMinimumContentsLength(80)
@@ -188,8 +188,6 @@ class MainWindowUI(QMainWindow):
             "QComboBox { padding-left: 6px; padding-right: 34px; } "
             "QComboBox::drop-down { width: 30px; }"
         )
-        if self.model_combo.lineEdit():
-            self.model_combo.lineEdit().setTextMargins(6, 0, 34, 0)
 
         lm.addWidget(QLabel("Found GGUF:"))
         lm.addWidget(self.model_combo)
