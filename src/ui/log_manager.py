@@ -115,6 +115,15 @@ class LogManager(QObject):
     def autoscroll(self, value: bool) -> None:
         self._autoscroll = value
 
+    @property
+    def has_speed(self) -> bool:
+        """Есть ли извлечённая из логов скорость llama_print_timings.
+
+        Такая скорость — точный замер завершённого запроса; она приоритетнее
+        дельт /slots (которые занижают: теряют хвост генерации).
+        """
+        return self._pp_speed is not None or self._tg_speed is not None
+
     def append(self, text: str, level: str = "info") -> None:
         if not text or not text.strip():
             return

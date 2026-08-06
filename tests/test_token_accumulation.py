@@ -33,6 +33,7 @@ def _make_gui() -> LlamaGUI:
     gui._saved_token_total = 0
     gui.ui = MagicMock()
     gui.log_mgr = MagicMock()
+    gui.log_mgr.has_speed = False
     return gui
 
 
@@ -127,29 +128,48 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertIn("generated", text)
         self.assertIn("40", text)
 
-    def test_fmt_counter_uses_thousands_separator(self):
-        """_fmt_counter отделяет тысячи запятыми — понятно, что это тысячи."""
+    def test_fmt_counter_plain_no_separator(self):
+        """_fmt_counter не ставит запятые-разделители тысяч (сбивают с толку)."""
         gui = _make_gui()
-        self.assertEqual(gui._fmt_counter(1234567), "1,234,567")
+        self.assertEqual(gui._fmt_counter(1234567), "1234567")
         self.assertEqual(gui._fmt_counter(0), "0")
 
     def test_format_speed_thousands_vs_fractions(self):
-        """format_speed: >=100 — тысячи с разделителем, <100 — доли без."""
+        """format_speed: большие значения — 1 знак после запятой, малые — 2."""
         from src.core.constants import format_speed
 
-        self.assertEqual(format_speed(1234.56), "1,234.6")
+        self.assertEqual(format_speed(1234.56), "1234.6")
         self.assertEqual(format_speed(25.38), "25.38")
         self.assertEqual(format_speed(0), "0.00")
 
-    def test_speed_label_has_thousands_separator(self):
-        """Большая скорость в лейбле содержит разделитель тысяч."""
+    def test_speed_label_from_slots_without_log_timing(self):
+        """Пока нет замера из логов, /slots показывает живую скорость."""
         gui = _make_gui()
         slot = _slot(0, prompt_processed=0, decoded=0, processing=True)
         slot.prompt_per_second = 1234.56
         gui._on_slot_metrics_updated([slot])
         text = gui.ui.speed_label.setText.call_args[0][0]
-        self.assertIn("1,234.6", text)
+        self.assertIn("1234.6", text)
         self.assertIn("tok/s", text)
+
+    def test_log_speed_wins_over_slots(self):
+        """Когда лог-менеджер извлёк скорость из логов, /slots не перетирает её."""
+        gui = _make_gui()
+        gui.log_mgr.has_speed = True
+        slot = _slot(0, prompt_processed=0, decoded=0, processing=True)
+        slot.prompt_per_second = 1234.56
+        gui.ui.speed_label.setText.reset_mock()
+        gui._on_slot_metrics_updated([slot])
+        gui.ui.speed_label.setText.assert_not_called()
+
+    def test_log_speed_updated_always_sets_label(self):
+        """_on_log_speed_updated обновляет лейбл даже при работающем поллере."""
+        gui = _make_gui()
+        gui.metrics = MagicMock()
+        gui.metrics._is_running = True
+        gui._on_log_speed_updated("Speed: PP 1234.6 tok/s | TG 25.38 tok/s")
+        text = gui.ui.speed_label.setText.call_args[0][0]
+        self.assertEqual(text, "Speed: PP 1234.6 tok/s | TG 25.38 tok/s")
 
     def test_reset_task_tokens_saves_task(self):
         """reset_task_tokens сохраняет накопленное и сбрасывает baseline."""

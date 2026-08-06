@@ -236,7 +236,8 @@ class LlamaGUI:
         self.server.bench_finished.connect(self._on_bench_finished)
 
     def _fmt_counter(self, value) -> str:
-        return f"{max(int(value or 0), 0):,}"
+        # Без разделителей тысяч: пользователь счёл запятые сбивающими.
+        return f"{max(int(value or 0), 0)}"
 
     def _server_metrics_url(self) -> str:
         host = str(self.ui.host.text() or "127.0.0.1").strip() or "127.0.0.1"
@@ -245,8 +246,11 @@ class LlamaGUI:
         return f"http://{host}:{self.ui.port.value()}"
 
     def _on_log_speed_updated(self, text: str):
-        if not getattr(self.metrics, "_is_running", False):
-            self.ui.speed_label.setText(text)
+        # Скорость llama_print_timings из логов — приоритетный источник:
+        # точный замер завершённого запроса. Дельты /slots занижают скорость
+        # (теряют хвост генерации и включают время HTTP-опроса), поэтому
+        # когда есть замер из логов — показываем именно его.
+        self.ui.speed_label.setText(text)
 
     def _start_metrics_polling(self):
         self.metrics.set_url(self._server_metrics_url())
@@ -351,7 +355,8 @@ class LlamaGUI:
             if getattr(slot, "n_prompt_tokens", 0) or getattr(slot, "n_decoded", 0)
         ]
         if not visible:
-            self.ui.speed_label.setText("Speed: -")
+            if not self.log_mgr.has_speed:
+                self.ui.speed_label.setText("Speed: -")
             self.ui.request_tokens_label.setText("Request: -")
             return
 
@@ -381,9 +386,10 @@ class LlamaGUI:
                     "TG", f"{format_speed(predicted_speed)} tok/s", STAT_COLOR_GENERATED
                 )
             )
-        self.ui.speed_label.setText(
-            "Speed: " + (stat_sep().join(parts) if parts else "-")
-        )
+        if not self.log_mgr.has_speed:
+            self.ui.speed_label.setText(
+                "Speed: " + (stat_sep().join(parts) if parts else "-")
+            )
         self.ui.request_tokens_label.setText(
             "Request: "
             + stat_sep().join(
@@ -439,7 +445,7 @@ class LlamaGUI:
             )
         )
         self._refresh_token_label()
-        self.log_mgr.append(f"Token counter reset: saved {task_total:,} tokens")
+        self.log_mgr.append(f"Token counter reset: saved {task_total} tokens")
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
