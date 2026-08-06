@@ -37,6 +37,11 @@ def _make_gui() -> LlamaGUI:
     gui._latest_token_total = 0
     gui._token_baseline_total = 0
     gui._saved_token_total = 0
+    gui._session_base_prompt = 0
+    gui._session_base_predicted = 0
+    gui._session_base_total = 0
+    gui._session_base_active_pp = 0.0
+    gui._session_base_active_tg = 0.0
     gui._active_prompt_s = 0.0
     gui._active_predicted_s = 0.0
     gui._cur_prompt_s = 0.0
@@ -195,6 +200,73 @@ class TestTokenAccumulation(unittest.TestCase):
         gui._latest_token_total = 1500
         gui.reset_task_tokens()
         self.assertEqual(gui._saved_token_total, 1500)
+
+    def test_reset_task_resets_current_time_and_request(self):
+        """Reset task обнуляет Current time и Request, но не трогает Active."""
+        gui = _make_gui()
+        gui._latest_token_total = 1000
+        gui._active_prompt_s = 10.0
+        gui._active_predicted_s = 20.0
+        gui._cur_prompt_s = 5.0
+        gui._cur_predicted_s = 3.0
+        gui.reset_task_tokens()
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.0)
+        self.assertAlmostEqual(gui._active_prompt_s, 10.0)  # не трогаем
+        self.assertAlmostEqual(gui._active_predicted_s, 20.0)
+        text = gui.ui.request_tokens_label.setText.call_args[0][0]
+        self.assertEqual(text, "Request: -")
+
+    def test_reset_session_zeroes_display_and_sticks(self):
+        """Reset session обнуляет отображение total/task/времени; новые токены
+        не тянут старые значения (baseline-смещения защищают от /metrics)."""
+        gui = _make_gui()
+        gui._latest_prompt_total = 500
+        gui._latest_predicted_total = 200
+        gui._latest_token_total = 700
+        gui._active_prompt_s = 10.0
+        gui._active_predicted_s = 20.0
+        gui.reset_session()
+        text = gui.ui.tokens_label.setText.call_args[0][0]
+        self.assertNotIn("500", text)
+        self.assertNotIn("700", text)
+        self.assertNotIn("200", text)
+        # Active = 0 после сброса
+        text = gui.ui.active_time_label.setText.call_args[0][0]
+        self.assertIn("0:00", text)
+        # Новые токены: отображается только дельта (740-700=40, 520-500=20)
+        gui._latest_prompt_total = 520
+        gui._latest_predicted_total = 220
+        gui._latest_token_total = 740
+        gui._refresh_token_label()
+        text = gui.ui.tokens_label.setText.call_args[0][0]
+        self.assertIn("40", text)
+        self.assertNotIn("700", text)
+        # Активное время после сброса: отображается дельта
+        gui._active_prompt_s = 135.0
+        gui._active_predicted_s = 145.0
+        gui._refresh_active_time_label()
+        text = gui.ui.active_time_label.setText.call_args[0][0]
+        self.assertIn("2:05", text)  # 125 с
+
+    def test_reset_session_keeps_saved_history(self):
+        """Reset session не трогает накопленную Saved-историю."""
+        gui = _make_gui()
+        gui._latest_token_total = 1000
+        gui._saved_token_total = 500
+        gui.reset_task_tokens()
+        self.assertEqual(gui._saved_token_total, 1500)
+        gui.reset_session()
+        self.assertEqual(gui._saved_token_total, 1500)
+
+    def test_reset_saved_total_zeroes_history(self):
+        """reset_saved_total обнуляет Saved-историю (last и total)."""
+        gui = _make_gui()
+        gui._saved_token_total = 1234
+        gui.reset_saved_total()
+        self.assertEqual(gui._saved_token_total, 0)
+        text = gui.ui.tokens_saved_label.setText.call_args[0][0]
+        self.assertNotIn("1234", text)
 
     # ------------------------------------------------------------------
     # Активное время работы модели (PP/TG): total + current

@@ -105,6 +105,14 @@ class LlamaGUI:
         self._latest_predicted_total = 0
         self._token_baseline_total = 0
         self._saved_token_total = 0
+        # Baseline-смещения "сессии": total/task токены и активное время
+        # отображаются относительно точки Reset session, поэтому следующий
+        # опрос /metrics не вернёт старые значения на экран.
+        self._session_base_prompt = 0
+        self._session_base_predicted = 0
+        self._session_base_total = 0
+        self._session_base_active_pp = 0.0
+        self._session_base_active_tg = 0.0
         self._slot_prompt_total = 0
         self._slot_predicted_total = 0
         self._slot_token_seen = {}
@@ -142,6 +150,8 @@ class LlamaGUI:
         u.stop_btn.clicked.connect(self.stop_work)
         u.force_stop_btn.clicked.connect(self.force_stop_server)
         u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
+        u.reset_session_btn.clicked.connect(self.reset_session)
+        u.reset_saved_btn.clicked.connect(self.reset_saved_total)
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
         u.hf_scan_btn.clicked.connect(self.scan_hf_repo)
@@ -284,6 +294,12 @@ class LlamaGUI:
         self._slot_token_seen = {}
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
+        self._session_base_prompt = 0
+        self._session_base_predicted = 0
+        self._session_base_total = 0
+        self._session_base_active_pp = 0.0
+        self._session_base_active_tg = 0.0
+        self._token_baseline_total = 0
         self._active_prompt_s = 0.0
         self._active_predicted_s = 0.0
         self._cur_prompt_s = 0.0
@@ -302,25 +318,28 @@ class LlamaGUI:
         self.ui.request_tokens_label.setText("Request: -")
 
     def _refresh_token_label(self):
+        total = max(self._latest_token_total - self._session_base_total, 0)
         task_total = max(self._latest_token_total - self._token_baseline_total, 0)
+        prompt = max(self._latest_prompt_total - self._session_base_prompt, 0)
+        generated = max(self._latest_predicted_total - self._session_base_predicted, 0)
         self.ui.tokens_label.setText(
             "Tokens: "
             + stat_sep().join(
                 [
                     stat_kv(
                         "total",
-                        self._fmt_counter(self._latest_token_total),
+                        self._fmt_counter(total),
                         STAT_COLOR_TOTAL,
                     ),
                     stat_kv("task", self._fmt_counter(task_total), STAT_COLOR_TASK),
                     stat_kv(
                         "prompt",
-                        self._fmt_counter(self._latest_prompt_total),
+                        self._fmt_counter(prompt),
                         STAT_COLOR_PROMPT,
                     ),
                     stat_kv(
                         "generated",
-                        self._fmt_counter(self._latest_predicted_total),
+                        self._fmt_counter(generated),
                         STAT_COLOR_GENERATED,
                     ),
                 ]
@@ -343,12 +362,10 @@ class LlamaGUI:
         return stat_kv(caption, format_duration(total), STAT_COLOR_TIME) + " " + inner
 
     def _refresh_active_time_label(self):
-        """Отрисовка total активного времени (сумма за запуск сервера)."""
-        self.ui.active_time_label.setText(
-            self._time_row_html(
-                "Active", self._active_prompt_s, self._active_predicted_s
-            )
-        )
+        """Отрисовка total активного времени (за текущую сессию)."""
+        pp = max(self._active_prompt_s - self._session_base_active_pp, 0.0)
+        tg = max(self._active_predicted_s - self._session_base_active_tg, 0.0)
+        self.ui.active_time_label.setText(self._time_row_html("Active", pp, tg))
 
     def _refresh_current_time_label(self):
         """Отрисовка времени текущего/последнего запроса."""
@@ -545,14 +562,58 @@ class LlamaGUI:
         self._refresh_token_label()
 
     def reset_task_tokens(self):
+        """Сохранить текущую задачу в Saved и начать отсчёт новой с нуля.
+
+        Обнуляет task-счётчик, Current time и Request. Total-токены и Active
+        время (server-scope) не трогает — для них есть Reset session.
+        """
         task_total = max(self._latest_token_total - self._token_baseline_total, 0)
         self._saved_token_total += task_total
         self._token_baseline_total = self._latest_token_total
+        self._set_saved_label(last_total=task_total)
+        self._cur_prompt_s = 0.0
+        self._cur_predicted_s = 0.0
+        self._refresh_current_time_label()
+        self.ui.request_tokens_label.setText("Request: -")
+        self._refresh_token_label()
+        self.log_mgr.append(
+            f"Token counter reset: saved {task_total} tokens, "
+            "Current time and Request reset"
+        )
+
+    def reset_session(self):
+        """Обнулить все живые счётчики сессии (total/task, время, Request).
+
+        Saved-история сохраняется. Реализовано через baseline-смещения,
+        поэтому следующий опрос /metrics не вернёт старые значения на экран.
+        """
+        self._session_base_prompt = self._latest_prompt_total
+        self._session_base_predicted = self._latest_predicted_total
+        self._session_base_total = self._latest_token_total
+        self._session_base_active_pp = self._active_prompt_s
+        self._session_base_active_tg = self._active_predicted_s
+        self._token_baseline_total = self._latest_token_total
+        self._cur_prompt_s = 0.0
+        self._cur_predicted_s = 0.0
+        self._refresh_token_label()
+        self._refresh_active_time_label()
+        self._refresh_current_time_label()
+        self.ui.request_tokens_label.setText("Request: -")
+        self.log_mgr.append("Session reset: tokens and time zeroed")
+
+    def reset_saved_total(self):
+        """Обнулить накопленную Saved-историю (last и total)."""
+        self._saved_token_total = 0
+        self._set_saved_label()
+        self.log_mgr.append("Saved history reset")
+
+    def _set_saved_label(self, last_total=None):
+        last = max(int(last_total or 0), 0)
         self.ui.tokens_saved_label.setText(
             "Saved: "
             + stat_sep().join(
                 [
-                    stat_kv("last", self._fmt_counter(task_total), STAT_COLOR_SAVED),
+                    stat_kv("last", self._fmt_counter(last), STAT_COLOR_SAVED),
                     stat_kv(
                         "total",
                         self._fmt_counter(self._saved_token_total),
@@ -561,8 +622,6 @@ class LlamaGUI:
                 ]
             )
         )
-        self._refresh_token_label()
-        self.log_mgr.append(f"Token counter reset: saved {task_total} tokens")
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(

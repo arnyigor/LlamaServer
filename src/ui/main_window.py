@@ -361,8 +361,9 @@ class MainWindowUI(QMainWindow):
         self.active_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
         self.active_time_label.setToolTip(
             "Active — суммарное время работы модели (prompt processing + "
-            "token generation) с момента старта сервера. Простой и ожидание "
-            "в очереди не считаются. Сбрасывается при каждом старте сервера."
+            "token generation) с момента старта сервера или последнего "
+            "Reset session. Простой и ожидание в очереди не считаются. "
+            "Сбрасывается при каждом старте сервера и по Reset session."
         )
         self.current_time_label = QLabel("Current: 0:00 (PP 0:00 | TG 0:00)")
         self.current_time_label.setTextFormat(Qt.RichText)
@@ -372,17 +373,33 @@ class MainWindowUI(QMainWindow):
             "token generation). Точное значение приходит из llama_print_timings "
             "по завершении запроса."
         )
-        self.tokens_reset_btn = QPushButton("Reset task tokens")
+        self.tokens_reset_btn = QPushButton("Reset task")
         self.tokens_reset_btn.setToolTip(
-            "Save the current task token count and start counting the next task from zero."
+            "Save current task token count to Saved and start the next task from zero. "
+            "Resets the task counter, Current time and Request label."
         )
+        self.reset_session_btn = QPushButton("Reset session")
+        self.reset_session_btn.setToolTip(
+            "Zero all live runtime stats: total/task tokens, prompt/generated, "
+            "Active and Current time, Request label. Saved history is kept."
+        )
+        self.reset_saved_btn = QPushButton("Reset saved")
+        self.reset_saved_btn.setToolTip(
+            "Zero the accumulated Saved history (last and total)."
+        )
+        stats_btns = QVBoxLayout()
+        stats_btns.setSpacing(6)
+        stats_btns.addWidget(self.tokens_reset_btn)
+        stats_btns.addWidget(self.reset_session_btn)
+        stats_btns.addWidget(self.reset_saved_btn)
+        stats_btns.addStretch(1)
         stats.addWidget(self.speed_label, 0, 0, 1, 2)
         stats.addWidget(self.tokens_label, 1, 0, 1, 2)
         stats.addWidget(self.request_tokens_label, 2, 0)
         stats.addWidget(self.tokens_saved_label, 2, 1)
         stats.addWidget(self.active_time_label, 3, 0, 1, 2)
         stats.addWidget(self.current_time_label, 4, 0, 1, 2)
-        stats.addWidget(self.tokens_reset_btn, 0, 2, 3, 1)
+        stats.addLayout(stats_btns, 0, 2, 5, 1)
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)
 
@@ -953,7 +970,11 @@ class MainWindowUI(QMainWindow):
             self.stop_btn: "Stops server",
             self.force_stop_btn: "Force kills llama-server immediately",
             self.autoscroll_logs: "Auto-scroll logs",
-            self.tokens_reset_btn: "Save current task token count and reset task counter",
+            self.tokens_reset_btn: "Save current task token count to Saved and "
+            "reset task counter, Current time and Request label",
+            self.reset_session_btn: "Zero all live runtime stats: total/task tokens, "
+            "Active/Current time, Request label. Saved history is kept.",
+            self.reset_saved_btn: "Zero the accumulated Saved history (last and total).",
         }
         for widget, text in tips.items():
             if widget:
