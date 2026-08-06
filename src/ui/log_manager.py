@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QTextEdit
 
-from src.core.constants import MAX_LOG_LINES
+from src.core.constants import MAX_LOG_LINES, format_speed
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,8 +213,8 @@ class LogManager(QObject):
     def _emit_speed(self) -> None:
         parts = []
         if self._pp_speed is not None:
-            parts.append(f"PP: {self._pp_speed:.1f} tok/s")
+            parts.append(f"PP {format_speed(self._pp_speed)} tok/s")
         if self._tg_speed is not None:
-            parts.append(f"TG: {self._tg_speed:.1f} tok/s")
+            parts.append(f"TG {format_speed(self._tg_speed)} tok/s")
         if parts:
-            self.speed_updated.emit(" / ".join(parts))
+            self.speed_updated.emit("Speed: " + " | ".join(parts))

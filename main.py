@@ -24,6 +24,16 @@ from PySide6.QtWidgets import (
 from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
+from src.core.constants import (
+    STAT_COLOR_GENERATED,
+    STAT_COLOR_PROMPT,
+    STAT_COLOR_SAVED,
+    STAT_COLOR_TASK,
+    STAT_COLOR_TOTAL,
+    format_speed,
+    stat_kv,
+    stat_sep,
+)
 from src.core.gguf_parser import extract_model_info
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
 from src.core.metrics_poller import MetricsPoller
@@ -258,10 +268,26 @@ class LlamaGUI:
         task_total = max(self._latest_token_total - self._token_baseline_total, 0)
         self.ui.tokens_label.setText(
             "Tokens: "
-            f"total {self._fmt_counter(self._latest_token_total)} | "
-            f"task {self._fmt_counter(task_total)} | "
-            f"prompt {self._fmt_counter(self._latest_prompt_total)} | "
-            f"generated {self._fmt_counter(self._latest_predicted_total)}"
+            + stat_sep().join(
+                [
+                    stat_kv(
+                        "total",
+                        self._fmt_counter(self._latest_token_total),
+                        STAT_COLOR_TOTAL,
+                    ),
+                    stat_kv("task", self._fmt_counter(task_total), STAT_COLOR_TASK),
+                    stat_kv(
+                        "prompt",
+                        self._fmt_counter(self._latest_prompt_total),
+                        STAT_COLOR_PROMPT,
+                    ),
+                    stat_kv(
+                        "generated",
+                        self._fmt_counter(self._latest_predicted_total),
+                        STAT_COLOR_GENERATED,
+                    ),
+                ]
+            )
         )
 
     def _apply_metrics_catch_up(self):
@@ -346,12 +372,34 @@ class LlamaGUI:
 
         parts = []
         if prompt_speed > 0:
-            parts.append(f"PP {prompt_speed:.2f} tok/s")
+            parts.append(
+                stat_kv("PP", f"{format_speed(prompt_speed)} tok/s", STAT_COLOR_PROMPT)
+            )
         if predicted_speed > 0:
-            parts.append(f"TG {predicted_speed:.2f} tok/s")
-        self.ui.speed_label.setText("Speed: " + (" | ".join(parts) if parts else "-"))
+            parts.append(
+                stat_kv(
+                    "TG", f"{format_speed(predicted_speed)} tok/s", STAT_COLOR_GENERATED
+                )
+            )
+        self.ui.speed_label.setText(
+            "Speed: " + (stat_sep().join(parts) if parts else "-")
+        )
         self.ui.request_tokens_label.setText(
-            f"Request: prompt {self._fmt_counter(prompt_tokens)} | generated {self._fmt_counter(predicted_tokens)}"
+            "Request: "
+            + stat_sep().join(
+                [
+                    stat_kv(
+                        "prompt",
+                        self._fmt_counter(prompt_tokens),
+                        STAT_COLOR_PROMPT,
+                    ),
+                    stat_kv(
+                        "generated",
+                        self._fmt_counter(predicted_tokens),
+                        STAT_COLOR_GENERATED,
+                    ),
+                ]
+            )
         )
         self._accumulate_slot_tokens(slots)
 
@@ -378,7 +426,17 @@ class LlamaGUI:
         self._saved_token_total += task_total
         self._token_baseline_total = self._latest_token_total
         self.ui.tokens_saved_label.setText(
-            f"Saved: last {self._fmt_counter(task_total)} | total {self._fmt_counter(self._saved_token_total)}"
+            "Saved: "
+            + stat_sep().join(
+                [
+                    stat_kv("last", self._fmt_counter(task_total), STAT_COLOR_SAVED),
+                    stat_kv(
+                        "total",
+                        self._fmt_counter(self._saved_token_total),
+                        STAT_COLOR_SAVED,
+                    ),
+                ]
+            )
         )
         self._refresh_token_label()
         self.log_mgr.append(f"Token counter reset: saved {task_total:,} tokens")

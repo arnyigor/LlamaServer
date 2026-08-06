@@ -303,17 +303,21 @@ class MainWindowUI(QMainWindow):
         stats.setHorizontalSpacing(10)
         stats.setVerticalSpacing(6)
         self.speed_label = QLabel("Speed: -")
+        self.speed_label.setTextFormat(Qt.RichText)
         self.speed_label.setStyleSheet(
-            "color: #4ec9b0; font-family: Consolas; font-weight: bold;"
+            "color: #e8e8e8; font-family: Consolas; font-weight: bold;"
         )
         self.tokens_label = QLabel("Tokens: total 0 | task 0")
-        self.tokens_label.setStyleSheet("font-family: Consolas; color: #dcdcaa;")
+        self.tokens_label.setTextFormat(Qt.RichText)
+        self.tokens_label.setStyleSheet("font-family: Consolas; color: #e8e8e8;")
         self.request_tokens_label = QLabel("Request: -")
+        self.request_tokens_label.setTextFormat(Qt.RichText)
         self.request_tokens_label.setStyleSheet(
-            "font-family: Consolas; color: #9cdcfe;"
+            "font-family: Consolas; color: #e8e8e8;"
         )
         self.tokens_saved_label = QLabel("Saved: 0")
-        self.tokens_saved_label.setStyleSheet("color: #888;")
+        self.tokens_saved_label.setTextFormat(Qt.RichText)
+        self.tokens_saved_label.setStyleSheet("color: #e8e8e8;")
         self.tokens_reset_btn = QPushButton("Reset task tokens")
         self.tokens_reset_btn.setToolTip(
             "Save the current task token count and start counting the next task from zero."

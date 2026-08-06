@@ -63,6 +63,46 @@ LLAMACPP_PROVIDER_ID = "llamacpp"
 DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
 
 
+# ============================================================================
+# Форматирование Runtime stats (токены/скорость)
+# ============================================================================
+
+# Цвета на тёмном фоне (~#1e1e1e): подписи серые, значения яркие и разные
+# по смыслу, чтобы цифры было легко сканировать.
+STAT_COLOR_CAPTION = "#9a9a9a"
+STAT_COLOR_SEP = "#555555"
+STAT_COLOR_TOTAL = "#ffffff"
+STAT_COLOR_TASK = "#ffcc66"
+STAT_COLOR_PROMPT = "#4fc1ff"
+STAT_COLOR_GENERATED = "#6bff8f"
+STAT_COLOR_SAVED = "#b0b0b0"
+
+
+def format_speed(value) -> str:
+    """Форматирование скорости: разделитель тысяч для больших значений.
+
+    1234.56 -> "1,234.6" (запятая = тысячи)
+    25.38   -> "25.38"   (без запятой = доли)
+    """
+    v = max(float(value or 0), 0.0)
+    if v >= 100:
+        return f"{v:,.1f}"
+    return f"{v:.2f}"
+
+
+def stat_kv(caption: str, value: str, color: str = STAT_COLOR_TOTAL) -> str:
+    """HTML-пара 'подпись значение' для Runtime stats."""
+    return (
+        f'<span style="color:{STAT_COLOR_CAPTION}">{caption}</span> '
+        f'<span style="color:{color}; font-weight:bold;">{value}</span>'
+    )
+
+
+def stat_sep() -> str:
+    """Разделитель между метриками в Runtime stats."""
+    return f'<span style="color:{STAT_COLOR_SEP};"> | </span>'
+
+
 class AppState(Enum):
     """Состояния приложения для безопасной работы с процессами."""
 

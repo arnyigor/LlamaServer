@@ -121,8 +121,35 @@ class TestTokenAccumulation(unittest.TestCase):
         slot.n_prompt_tokens = 150
         gui._on_slot_metrics_updated([slot])
         text = gui.ui.request_tokens_label.setText.call_args[0][0]
-        self.assertIn("prompt 150", text)
-        self.assertIn("generated 40", text)
+        # Rich-text HTML: подписи и значения в отдельных span
+        self.assertIn("prompt", text)
+        self.assertIn("150", text)
+        self.assertIn("generated", text)
+        self.assertIn("40", text)
+
+    def test_fmt_counter_uses_thousands_separator(self):
+        """_fmt_counter отделяет тысячи запятыми — понятно, что это тысячи."""
+        gui = _make_gui()
+        self.assertEqual(gui._fmt_counter(1234567), "1,234,567")
+        self.assertEqual(gui._fmt_counter(0), "0")
+
+    def test_format_speed_thousands_vs_fractions(self):
+        """format_speed: >=100 — тысячи с разделителем, <100 — доли без."""
+        from src.core.constants import format_speed
+
+        self.assertEqual(format_speed(1234.56), "1,234.6")
+        self.assertEqual(format_speed(25.38), "25.38")
+        self.assertEqual(format_speed(0), "0.00")
+
+    def test_speed_label_has_thousands_separator(self):
+        """Большая скорость в лейбле содержит разделитель тысяч."""
+        gui = _make_gui()
+        slot = _slot(0, prompt_processed=0, decoded=0, processing=True)
+        slot.prompt_per_second = 1234.56
+        gui._on_slot_metrics_updated([slot])
+        text = gui.ui.speed_label.setText.call_args[0][0]
+        self.assertIn("1,234.6", text)
+        self.assertIn("tok/s", text)
 
     def test_reset_task_tokens_saves_task(self):
         """reset_task_tokens сохраняет накопленное и сбрасывает baseline."""
