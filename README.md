@@ -22,6 +22,23 @@ Windows GUI-менеджер для локального запуска `llama-s
 - Определяет квантование по metadata или имени файла.
 - Автоматически ищет `mmproj` / `projector` рядом с моделью.
 
+### Менеджер локальных моделей и загрузка с Hugging Face
+
+Панель `Local model manager and download` (`models_panel`) объединяет два подблока:
+
+- **Локальные модели** (`Local model manager`):
+  - показывает все модели и папки под `Models` (не только HF-загрузки);
+  - `Refresh local models` — перечитать список;
+  - `Delete selected` — безопасное удаление выбранной папки/файла модели (projectors и MTP draft включаются в удаление папки, но не показываются отдельными моделями).
+- **Загрузка GGUF с Hugging Face** (подблок можно скрыть чекбоксом `Show Hugging Face download`):
+  - вставка repo id или URL (например, `unsloth/Qwen3.6-27B-MTP-GGUF`);
+  - файлы сохраняются как `<Models>/<author>/<model>/<file>.gguf` — совместимо с LM Studio;
+  - `Scan HF` — сканирование репозитория через Hugging Face API, список `.gguf` файлов с фильтром по квантованию (например, `Q4_K_M`, `IQ4`, `Q3-BF16` — от Q3 до BF16);
+  - опция `also vision/mmproj` — включить в список projector-файлы;
+  - `Download selected` с прогрессом, `Pause` / `Cancel` (отмена удаляет частично скачанные файлы);
+  - блок `Local files:` показывает уже скачанные файлы для репозитория; `Delete local folder` удаляет всю папку репо включая vision-файлы;
+  - фоновая загрузка в `QThread` (`HfRepoScanner` / `HfModelDownloader`), UI не блокируется.
+
 ### Запуск llama-server
 
 - Запускает и останавливает `llama-server.exe` через `QProcess`.
@@ -37,8 +54,11 @@ Windows GUI-менеджер для локального запуска `llama-s
   - `-ncmoe`;
   - `--flash-attn`;
   - `--fit off`;
-  - `-rea`;
+  - `-rea / --reasoning`;
+  - `--ctx-checkpoints`, `--cache-ram`, `-kvu`;
   - `--chat-template-kwargs {"enable_thinking":...}`;
+  - `--chat-template-file` (свой шаблон, напр. `templates/qwen3_claude_relaxed.jinja`);
+  - `--jinja`;
   - `--mmap` / `--no-mmap`;
   - `--mlock`;
   - `--verbose`;
@@ -47,8 +67,11 @@ Windows GUI-менеджер для локального запуска `llama-s
   - `--no-cache-prompt`;
   - `--context-shift`;
   - `--no-webui`;
-  - `--jinja`;
   - `-mm`, `--no-mmproj`, `--no-mmproj-offload`.
+- **MTP speculative decoding** (чекбокс `MTP speculative` в Launch settings):
+  - `--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`, `--spec-draft-p-min`, `--spec-draft-ngl`, `--spec-draft-device`, `--spec-draft-type-k` / `-ctkd`, `--spec-draft-type-v` / `-ctvd`;
+  - отдельный draft GGUF через `--model-draft` (поле `MTP draft GGUF`);
+  - минималистичный CLI намеренно: лишние draft KV/device/ngl флаги могут конфликтовать с Gemma4Assistant draft GGUF в текущих сборках `llama.cpp`.
 - Позволяет добавить дополнительные аргументы вручную.
 - Для дополнительных аргументов выполняется базовая защита:
   - проверка путей у path-like флагов (`--grammar-file`, `--lora`, `--mmproj`, `--chat-template-file` и др.);
@@ -60,6 +83,17 @@ Windows GUI-менеджер для локального запуска `llama-s
 - Запускает `llama-bench` с выбранной моделью.
 - Настраивает prompt/generation длину для benchmark.
 - Парсит `tok/s` / `tokens/s` из логов и показывает скорость.
+
+### AutoTune
+
+Кнопка `AutoTune...` в панели Benchmark открывает встроенный AutoTune widget:
+
+- строит план кандидатов из текущих настроек модели/контекста (GPU layers, MoE, ctx, KV cache, batch/ubatch, threads, Flash Attention, etc.);
+- прогоняет `llama-bench` для каждого кандидата в фоновом `QThread` (`AutoTuneManager`), UI не блокируется;
+- показывает результаты с дельтами относительно baseline, early stop после пика;
+- кандидатов можно редактировать прямо в таблице;
+- сохраняет отчёты (текстовый/JSON) и выбирает лучший набор параметров;
+- поддерживает отмену и прогресс по шагам.
 
 ### Автонастройка контекста и памяти
 
@@ -97,7 +131,7 @@ Windows GUI-менеджер для локального запуска `llama-s
 
 ### Визуализация памяти по логам
 
-Во вкладке `Memory` отображается разбор логов `llama.cpp`:
+Парсер `src/core/mem_viz_parser.py` разбирает логи `llama.cpp` и собирает:
 
 - VRAM/RAM по категориям;
 - веса модели;
@@ -109,6 +143,8 @@ Windows GUI-менеджер для локального запуска `llama-s
 - offloaded layers;
 - примерное состояние готовности сервера.
 
+В текущей версии UI вкладка `Memory` скрыта: данные разбора выводятся в общий лог после загрузки модели (блок `📊 Memory after load:`), а `MemoryVisualizationWidget` остаётся подключённым к данным на будущее.
+
 Данные берутся из stdout/stderr `llama.cpp`, поэтому полнота визуализации зависит от версии и подробности логов `llama-server`.
 
 ### Логи
@@ -118,6 +154,27 @@ Windows GUI-менеджер для локального запуска `llama-s
 - Ограничение количества строк (`MAX_LOG_LINES = 10000`).
 - Автоопределение уровней: info/warn/error/bench.
 - Автоскролл можно выключить при ручном просмотре старых строк.
+
+### Runtime stats
+
+Блок `Runtime stats` показывает живые метрики сервера:
+
+- **Speed** — текущая скорость генерации, tok/s;
+- **Tokens: total | task** — накопленные токены (total — за сессию, task — текущей задачи);
+- **Request** — prompt/generated токены последнего запроса;
+- **Saved** — история «закрытых» задач;
+- **Active** — суммарное время работы модели (PP + TG) с момента старта сервера или последнего `Reset session`; простой и ожидание в очереди не считаются. Берётся из логов `/slots` как сумма интервалов;
+- **Current** — точное время последнего запроса (PP/TG), извлекается из `llama_print_timings` в логах (`src/ui/log_manager.py`, сигнал `timing_updated`). `/metrics` не используется, потому что `*_tokens_seconds` — это throughput, а не время.
+
+Три кнопки сброса:
+
+| Кнопка | Действие |
+|---|---|
+| `Reset task` | сохраняет текущую задачу в Saved и начинает следующую с нуля: сбрасывает task-счётчик, Request и Current time |
+| `Reset session` | обнуляет все живые счётчики (total/task токены, prompt/generated, Active и Current time, Request) через baseline-смещения; Saved-история сохраняется |
+| `Reset saved` | обнуляет накопленную историю Saved (last и total) |
+
+Сброс реализован в `main.py` через сессионные смещения `_session_base_*`; при каждом старте сервера статистика автоматически сбрасывается.
 
 ### Профили и performance presets
 
@@ -152,6 +209,7 @@ Performance preset сохраняется для пары:
   3. Vulkan;
   4. AVX2;
   5. generic Windows;
+- в UI можно выбрать мажорную версию CUDA (12 или 13) через `cuda_version_combo`; для CUDA 13 дополнительно скачиваются cudart DLL, minor-версия (12.4/13.3) определяется из release автоматически;
 - создаёт backup текущих `.exe`/`.dll`;
 - безопасно распаковывает zip с защитой от path traversal;
 - копирует новую сборку в папку с `llama-server.exe`.
@@ -198,6 +256,24 @@ Performance preset сохраняется для пары:
 ```
 
 Фактический контейнер provider определяется гибко: `provider`, `providers` или корневой объект.
+
+## Структура окна
+
+Левая панель собрана в `src/ui/main_window.py` в следующем порядке:
+
+1. **Кнопки управления** — `Start Server`, `Restart`, `Stop`, `Force Stop` (вверху, чтобы не скролить);
+2. **Paths** — пути к llama.cpp и моделям + `Update llama.cpp`;
+3. **Model** — селектор модели (read-only) и `Scan`;
+4. **Launch settings** — видимый блок сразу за Model (context size с быстрыми кнопками, GPU offload, batch/ubatch, threads, Save Preset, MTP speculative);
+5. **Runtime stats** — живые метрики и кнопки Reset;
+6. **Advanced: Paths and llama.cpp** — спойлер с путями и обновлением;
+7. **Advanced: Memory, Sampling, Server** — спойлер со всеми параметрами производительности и памяти;
+8. **Local model manager and download** — менеджер моделей + HF;
+9. **Integration (OpenCode / PI)**;
+10. **Benchmark** — `Test Speed`, `AutoTune...` + AutoTune widget;
+11. **CLI Preview** — финальная строка запуска.
+
+Правая панель — вкладки **Logs** и **AutoTune** (`MemoryVisualizationWidget` скрыт).
 
 ## Требования
 
@@ -269,10 +345,13 @@ pip install pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI main.py
 ```
 
-В репозитории также есть spec-файлы:
+В репозитории есть spec-файл `LlamaServerGUI.spec` (onefile, windowed, иконка `assets/llama_server_icon.ico`):
 
-- `LlamaServer.spec`;
-- `LlamaServerGUI.spec`.
+```powershell
+.\.venv\Scripts\pyinstaller.exe --noconfirm --clean LlamaServerGUI.spec
+```
+
+`dist/` и `build/` находятся в `.gitignore` и не коммитятся.
 
 ## Основной сценарий работы
 
@@ -282,14 +361,15 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServe
 4. Выбрать GGUF-модель.
 5. Оставить `Auto setup ctx/GPU/cache by GGUF`, если нужны безопасные стартовые параметры.
 6. При необходимости изменить:
-   - context size;
-   - GPU layers / auto;
+   - context size (быстрые кнопки `8K`–`256K`);
+   - GPU layers / auto / all;
    - CPU MoE layers;
    - KV cache K/V;
    - batch / ubatch;
    - threads;
    - parallel slots;
    - port;
+   - MTP speculative decoding и draft GGUF;
    - mmap/mlock/debug/server flags.
 7. Проверить `CLI Preview`.
 8. Нажать `Test Speed` или `Start Server`.
@@ -341,18 +421,29 @@ src/core/metrics_poller.py      HTTP poller /slots и /metrics
 src/core/moe_advisor.py         рекомендации по CPU MoE offload
 src/core/server_manager.py      QProcess-управление server/benchmark
 src/core/vram_estimator.py      оценка VRAM/KV/model memory
+src/core/benchmark_models.py    генерация кандидатов AutoTune
+src/core/benchmark_plan.py      план AutoTune и ранжирование кандидатов
+src/core/benchmark_scorer.py    скоринг результатов benchmark
 
-src/services/threads.py         ModelScanner и LlamaCppUpdater
+src/services/autotune_manager.py  фоновый QThread-прогон AutoTune
+src/services/benchmark_runner.py  запуск llama-bench для кандидата
+src/services/hf_downloader.py     сканирование HF-репо и загрузка GGUF
+src/services/report_writer.py     запись отчётов AutoTune
+src/services/threads.py         ModelScanner, LlamaCppUpdater, HfRepoScanner
 src/services/integration.py     функции формирования OpenCode/PI provider
 src/services/integration_manager.py  бизнес-логика интеграции
 
 src/ui/main_window.py           построение главного окна
-src/ui/log_manager.py           логирование, цвета, скорость
-src/ui/mem_viz_widget.py        виджеты визуализации памяти
+src/ui/log_manager.py           логирование, цвета, скорость, llama_print_timings
+src/ui/mem_viz_widget.py        виджеты визуализации памяти (скрыты)
+src/ui/autotune_widget.py       UI-панель AutoTune
 src/ui/tooltips.py              расширенные подсказки ctx/ncmoe
 src/ui/widgets.py               CollapsiblePanel
 
 src/utils/file_utils.py         JSON I/O, атомарная запись, path validation
+src/utils/subprocess_utils.py   helpers для subprocess/QProcess
+
+templates/qwen3_claude_relaxed.jinja  chat template для Qwen3.6 tool calls
 
 tests/                          unit/UI tests
 ```
@@ -361,14 +452,15 @@ tests/                          unit/UI tests
 
 `LlamaGUI` — главный coordinator:
 
-- создаёт `MainWindowUI`, `ConfigManager`, `ServerManager`;
+- создаёт `MainWindowUI`, `ConfigManager`, `ServerManager`, `MetricsPoller`;
 - загружает настройки;
 - соединяет сигналы UI с обработчиками;
 - запускает автосканирование моделей;
 - обновляет CLI preview;
 - применяет auto params;
 - обрабатывает выбор модели;
-- запускает server/benchmark;
+- запускает server/benchmark/AutoTune;
+- агрегирует runtime stats (токены, скорость, Active/Current время) и обрабатывает Reset task/session/saved через сессионные смещения `_session_base_*`;
 - сбрасывает и обновляет memory visualization;
 - управляет tray icon;
 - сохраняет настройки при выходе.
@@ -472,10 +564,18 @@ KV-cache зависит от:
 
 Содержит HTTP-клиент для опроса:
 
-- `/slots`;
-- `/metrics`.
+- `/slots` — состояния слотов и расчёт скорости по дельтам токенов;
+- `/metrics` — кумулятивные серверные счётчики (опрашиваются реже).
 
-На текущий момент основной UI получает скорость и память преимущественно из логов. `MetricsPoller` подготовлен как отдельный модуль для более точных live-метрик.
+`MetricsPoller` работает в фоновом `QThread` (`_MetricsFetchWorker`), сигналы `slot_metrics_updated` / `server_metrics_updated` приходят в UI. Точное время запроса (PP/TG) берётся из `llama_print_timings` в логах через `log_manager.py`, а `/metrics` используется как дополнительный источник.
+
+### `src/ui/autotune_widget.py`
+
+Панель AutoTune: таблица кандидатов с редактируемыми параметрами, запуск/остановка, прогресс, дельты к baseline, выбор лучшего результата. Работает через `AutoTuneManager` (QThread) и `benchmark_runner.py`.
+
+### `src/services/hf_downloader.py`
+
+`HfRepoScanner` — сканирование Hugging Face репозитория (repo id или URL) и фильтрация `.gguf` по квантованию. `HfModelDownloader` — фоновая загрузка выбранных файлов с прогрессом, pause/cancel (отмена удаляет частичные файлы), сохранение в `<Models>/<author>/<model>/`.
 
 ## Проверка и тесты
 
@@ -496,7 +596,7 @@ python -m pytest -q
 Текущий результат проверки в локальном `.venv`:
 
 ```text
-50 passed, 12 subtests passed
+142 passed, 12 subtests passed
 ```
 
 Если запускать `pytest` системным Python без зависимостей, возможна ошибка `ModuleNotFoundError: No module named 'PySide6'`. Используйте виртуальное окружение, где установлен `requirements.txt`.
