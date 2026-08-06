@@ -80,6 +80,37 @@ class MainWindowUI(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(10)
 
+        # === 0. Кнопки управления (вверху, чтобы не скролить) ===
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("Start Server")
+        self.start_btn.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.reload_btn = QPushButton("Restart", enabled=False)
+        self.reload_btn.setVisible(False)
+        self.reload_btn.setToolTip(
+            "Restart the running server and apply the current model parameters"
+        )
+        self.reload_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.stop_btn = QPushButton("Stop", enabled=False)
+        self.stop_btn.setStyleSheet(
+            "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.force_stop_btn = QPushButton("Force Stop", enabled=True)
+        self.force_stop_btn.setToolTip(
+            "Immediately kills llama-server process tree if normal stop is stuck"
+        )
+        self.force_stop_btn.setStyleSheet(
+            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
+        )
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.reload_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.force_stop_btn)
+        lay.addLayout(btn_row)
+
         # === 1. Пути ===
         g_paths = QGroupBox("Paths")
         lp = QVBoxLayout(g_paths)
@@ -196,9 +227,9 @@ class MainWindowUI(QMainWindow):
         lm.addLayout(mrow)
         lay.addWidget(g_model)
 
-        # === 2a. Управление локальными моделями ===
-        self.local_models_panel = CollapsiblePanel("Local model manager")
-        local = self.local_models_panel.content_layout
+        # === 2a. Локальные модели + загрузка с Hugging Face ===
+        self.models_panel = CollapsiblePanel("Local model manager and download")
+        local = self.models_panel.content_layout
 
         local_row = QHBoxLayout()
         self.local_models_refresh_btn = QPushButton("Refresh local models")
@@ -224,11 +255,19 @@ class MainWindowUI(QMainWindow):
         self.local_models_status = QLabel("Refresh to list local models")
         self.local_models_status.setWordWrap(True)
         local.addWidget(self.local_models_status)
-        lay.addWidget(self.local_models_panel)
 
-        # === 2b. Hugging Face загрузка ===
-        self.hf_panel = CollapsiblePanel("Download GGUF from Hugging Face")
-        hf = self.hf_panel.content_layout
+        # --- Подблок загрузки с Hugging Face (можно скрыть) ---
+        self.show_hf_download = QCheckBox("Show Hugging Face download")
+        self.show_hf_download.setChecked(True)
+        self.show_hf_download.setToolTip(
+            "Uncheck to hide the Hugging Face download section and keep the panel compact."
+        )
+        local.addWidget(self.show_hf_download)
+
+        self.hf_section = QWidget()
+        hf = QVBoxLayout(self.hf_section)
+        hf.setContentsMargins(0, 0, 0, 0)
+        hf.setSpacing(6)
 
         self.hf_repo = QLineEdit(
             placeholderText="repo or URL, e.g. unsloth/Qwen3.6-27B-MTP-GGUF"
@@ -295,7 +334,8 @@ class MainWindowUI(QMainWindow):
             "Files already present in <Models>/<author>/<model>. Delete local folder removes the whole repo folder including mmproj/vision files."
         )
         hf.addWidget(self.hf_local_files)
-        lay.addWidget(self.hf_panel)
+        local.addWidget(self.hf_section)
+        self.show_hf_download.toggled.connect(self.hf_section.setVisible)
 
         self.runtime_stats_group = QGroupBox("Runtime stats")
         stats = QGridLayout(self.runtime_stats_group)
@@ -354,10 +394,12 @@ class MainWindowUI(QMainWindow):
         launch.setContentsMargins(12, 18, 12, 12)
         launch.setSpacing(8)
 
-        g_perf = CollapsiblePanel("Advanced: Performance and Memory")
-        lperf = g_perf.content_layout
+        self.adv_panel = CollapsiblePanel("Advanced: Memory, Sampling, Server")
+        lperf = self.adv_panel.content_layout
         lperf.setContentsMargins(8, 6, 8, 6)
         lperf.setSpacing(8)
+        # Launch settings groupbox — первая секция общего спойлера Advanced
+        self.adv_panel.add_widget(g_launch)
 
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 999)
@@ -460,6 +502,9 @@ class MainWindowUI(QMainWindow):
         r4.addWidget(QLabel("Threads gen / batch (-t / -tb):"))
         r4.addWidget(self.threads)
         r4.addWidget(self.threads_batch)
+        perf_header = QLabel("Performance and Memory:")
+        perf_header.setStyleSheet("font-weight: bold; color: #666;")
+        lperf.addWidget(perf_header)
         lperf.addLayout(r4)
 
         self.cache_type_k = QComboBox()
@@ -592,13 +637,10 @@ class MainWindowUI(QMainWindow):
         r9.addWidget(QLabel("Cache RAM (MiB):"))
         r9.addWidget(self.cache_ram)
         lperf.addLayout(r9)
-        lay.insertWidget(1, g_launch)
-        lay.insertWidget(2, self.runtime_stats_group)
-        lay.insertWidget(3, g_perf)
-        lay.insertWidget(4, self.paths_panel)
-
-        # === 4. Спойлеры ===
-        self.adv_panel = CollapsiblePanel("Advanced: Sampling, Debug, Server")
+        # === 4. Sampling / Debug / Server (общий спойлер Advanced) ===
+        samp_header = QLabel("Sampling, Debug, Server:")
+        samp_header.setStyleSheet("font-weight: bold; color: #666;")
+        self.adv_panel.add_widget(samp_header)
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(-1.0, 2.0)
         self.temperature.setSingleStep(0.1)
@@ -681,7 +723,6 @@ class MainWindowUI(QMainWindow):
         self.adv_panel.add_widget(QLabel("Extra params:"))
         self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
         self.adv_panel.add_widget(self.extra_args)
-        lay.addWidget(self.adv_panel)
 
         # === 5. Интеграция ===
         self.int_panel = CollapsiblePanel("Integration (OpenCode / PI)")
@@ -734,7 +775,6 @@ class MainWindowUI(QMainWindow):
             "Specify config path and click Check", wordWrap=True
         )
         self.int_panel.add_widget(self.integration_status)
-        lay.addWidget(self.int_panel)
 
         # === 6. Бенчмарк ===
         self.bench_panel = CollapsiblePanel("Benchmark")
@@ -772,7 +812,6 @@ class MainWindowUI(QMainWindow):
 
         self.autotune = AutoTuneWidget()
         self.bench_panel.add_widget(self.autotune)
-        lay.addWidget(self.bench_panel)
 
         # === 7. Preview CLI ===
         g_cli = QGroupBox("CLI Preview")
@@ -784,38 +823,14 @@ class MainWindowUI(QMainWindow):
         )
         g_cli.setLayout(QVBoxLayout())
         g_cli.layout().addWidget(self.cli_preview)
-        lay.addWidget(g_cli)
 
-        # === 8. Кнопки управления ===
-        btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("Start Server")
-        self.start_btn.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.reload_btn = QPushButton("Restart", enabled=False)
-        self.reload_btn.setVisible(False)
-        self.reload_btn.setToolTip(
-            "Restart the running server and apply the current model parameters"
-        )
-        self.reload_btn.setStyleSheet(
-            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.stop_btn = QPushButton("Stop", enabled=False)
-        self.stop_btn.setStyleSheet(
-            "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.force_stop_btn = QPushButton("Force Stop", enabled=True)
-        self.force_stop_btn.setToolTip(
-            "Immediately kills llama-server process tree if normal stop is stuck"
-        )
-        self.force_stop_btn.setStyleSheet(
-            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
-        )
-        btn_row.addWidget(self.start_btn)
-        btn_row.addWidget(self.reload_btn)
-        btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.force_stop_btn)
-        lay.addLayout(btn_row)
+        # === 8. Итоговый порядок блоков ===
+        lay.addWidget(self.paths_panel)
+        lay.addWidget(self.adv_panel)
+        lay.addWidget(self.models_panel)
+        lay.addWidget(self.int_panel)
+        lay.addWidget(self.bench_panel)
+        lay.addWidget(g_cli)
         lay.addStretch()
 
         # Collect all widgets that must be locked while server/bench/autotune runs
