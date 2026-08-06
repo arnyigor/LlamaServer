@@ -93,8 +93,11 @@ class LlamaGUI:
         self._slot_prompt_total = 0
         self._slot_predicted_total = 0
         self._slot_token_seen = {}
-        self._metrics_total_seen = False
-
+        # Кумулятивные значения из /metrics (с момента старта сервера).
+        # Используются только для "догоняющей" синхронизации вверх, т.к.
+        # llama.cpp обновляет их лишь по завершении запросов.
+        self._metrics_prompt_total = 0
+        self._metrics_predicted_total = 0
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
@@ -122,7 +125,9 @@ class LlamaGUI:
         u.hf_delete_local_folder_btn.clicked.connect(self.delete_hf_local_folder)
         u.local_models_refresh_btn.clicked.connect(self.refresh_local_model_manager)
         u.local_models_delete_btn.clicked.connect(self.delete_selected_local_model)
-        u.local_models_list.itemSelectionChanged.connect(self._update_local_model_delete_button)
+        u.local_models_list.itemSelectionChanged.connect(
+            self._update_local_model_delete_button
+        )
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
@@ -235,7 +240,8 @@ class LlamaGUI:
         self._slot_prompt_total = 0
         self._slot_predicted_total = 0
         self._slot_token_seen = {}
-        self._metrics_total_seen = False
+        self._metrics_prompt_total = 0
+        self._metrics_predicted_total = 0
         self.metrics.start()
         self.ui.speed_label.setText("Speed: waiting for /slots...")
         self.ui.request_tokens_label.setText("Request: -")
@@ -255,25 +261,41 @@ class LlamaGUI:
             f"generated {self._fmt_counter(self._latest_predicted_total)}"
         )
 
-    def _slot_speed(self, slot, token_attr: str, ms_attr: str, speed_attr: str) -> float:
-        speed = float(getattr(slot, speed_attr, 0.0) or 0.0)
-        if speed > 0:
-            return speed
-        token_count = int(getattr(slot, token_attr, 0) or 0)
-        elapsed_ms = float(getattr(slot, ms_attr, 0.0) or 0.0)
-        if token_count > 0 and elapsed_ms > 0:
-            return token_count / elapsed_ms * 1000.0
-        return 0.0
+    def _apply_metrics_catch_up(self):
+        """Синхронизация счётчиков с /metrics — только вверх.
+
+        /metrics считает кумулятивно с момента старта сервера, но llama.cpp
+        обновляет его счётчики только по завершении запроса (см. вызовы
+        metrics.on_prediction / metrics.on_prompt_eval в server-context.cpp).
+        Поэтому /metrics не может быть единственным источником (во время
+        генерации числа замирают), а используется лишь как "догоняющий":
+        если сервер знает больше — подтягиваем суммы вверх.
+        """
+        if self._metrics_prompt_total > self._slot_prompt_total:
+            self._slot_prompt_total = self._metrics_prompt_total
+        if self._metrics_predicted_total > self._slot_predicted_total:
+            self._slot_predicted_total = self._metrics_predicted_total
 
     def _accumulate_slot_tokens(self, slots):
-        if self._metrics_total_seen:
-            return
+        """Накопление токенов из дельт /slots.
+
+        Слоты накапливаются всегда: счётчики n_prompt_tokens_processed /
+        n_decoded сохраняются у слота даже после завершения запроса
+        (сбрасываются только при старте следующего), поэтому дельты
+        покрывают и "быстрые" запросы, целиком уложившиеся между опросами.
+        """
         for slot in slots:
             slot_id = int(getattr(slot, "id", 0) or 0)
-            prompt_tokens = int(getattr(slot, "prompt_n", 0) or 0)
-            predicted_tokens = int(getattr(slot, "predicted_n", 0) or 0)
-            previous_prompt, previous_predicted = self._slot_token_seen.get(slot_id, (0, 0))
-            prompt_delta = prompt_tokens - previous_prompt if prompt_tokens >= previous_prompt else prompt_tokens
+            prompt_tokens = int(getattr(slot, "n_prompt_tokens_processed", 0) or 0)
+            predicted_tokens = int(getattr(slot, "n_decoded", 0) or 0)
+            previous_prompt, previous_predicted = self._slot_token_seen.get(
+                slot_id, (0, 0)
+            )
+            prompt_delta = (
+                prompt_tokens - previous_prompt
+                if prompt_tokens >= previous_prompt
+                else prompt_tokens
+            )
             predicted_delta = (
                 predicted_tokens - previous_predicted
                 if predicted_tokens >= previous_predicted
@@ -282,9 +304,12 @@ class LlamaGUI:
             self._slot_prompt_total += max(prompt_delta, 0)
             self._slot_predicted_total += max(predicted_delta, 0)
             self._slot_token_seen[slot_id] = (prompt_tokens, predicted_tokens)
+        self._apply_metrics_catch_up()
         self._latest_prompt_total = self._slot_prompt_total
         self._latest_predicted_total = self._slot_predicted_total
-        self._latest_token_total = self._latest_prompt_total + self._latest_predicted_total
+        self._latest_token_total = (
+            self._latest_prompt_total + self._latest_predicted_total
+        )
         self._refresh_token_label()
 
     def _on_slot_metrics_updated(self, slots):
@@ -294,10 +319,7 @@ class LlamaGUI:
         visible = active or [
             slot
             for slot in slots
-            if getattr(slot, "prompt_per_second", 0.0)
-            or getattr(slot, "predicted_per_second", 0.0)
-            or getattr(slot, "prompt_n", 0)
-            or getattr(slot, "predicted_n", 0)
+            if getattr(slot, "n_prompt_tokens", 0) or getattr(slot, "n_decoded", 0)
         ]
         if not visible:
             self.ui.speed_label.setText("Speed: -")
@@ -305,15 +327,19 @@ class LlamaGUI:
             return
 
         prompt_speed = sum(
-            self._slot_speed(slot, "prompt_n", "prompt_ms", "prompt_per_second")
+            max(float(getattr(slot, "prompt_per_second", 0.0) or 0.0), 0.0)
             for slot in visible
         )
         predicted_speed = sum(
-            self._slot_speed(slot, "predicted_n", "predicted_ms", "predicted_per_second")
+            max(float(getattr(slot, "predicted_per_second", 0.0) or 0.0), 0.0)
             for slot in visible
         )
-        prompt_tokens = sum(int(getattr(slot, "prompt_n", 0) or 0) for slot in visible)
-        predicted_tokens = sum(int(getattr(slot, "predicted_n", 0) or 0) for slot in visible)
+        prompt_tokens = sum(
+            int(getattr(slot, "n_prompt_tokens", 0) or 0) for slot in visible
+        )
+        predicted_tokens = sum(
+            int(getattr(slot, "n_decoded", 0) or 0) for slot in visible
+        )
 
         parts = []
         if prompt_speed > 0:
@@ -332,12 +358,16 @@ class LlamaGUI:
         total = prompt_total + predicted_total
         if total <= 0:
             return
-        self._metrics_total_seen = True
+        self._metrics_prompt_total = prompt_total
+        self._metrics_predicted_total = predicted_total
         if total < self._token_baseline_total:
             self._token_baseline_total = 0
-        self._latest_prompt_total = prompt_total
-        self._latest_predicted_total = predicted_total
-        self._latest_token_total = total
+        self._apply_metrics_catch_up()
+        self._latest_prompt_total = self._slot_prompt_total
+        self._latest_predicted_total = self._slot_predicted_total
+        self._latest_token_total = (
+            self._latest_prompt_total + self._latest_predicted_total
+        )
         self._refresh_token_label()
 
     def reset_task_tokens(self):
@@ -349,6 +379,7 @@ class LlamaGUI:
         )
         self._refresh_token_label()
         self.log_mgr.append(f"Token counter reset: saved {task_total:,} tokens")
+
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
             self.ui, "Select opencode.json", "", "JSON (*.json);;All files (*.*)"
@@ -701,7 +732,9 @@ class LlamaGUI:
                 f"Local models: {len(entries)}, total {info.get('total_size_text')} | root: {info.get('root')}"
             )
         elif not silent:
-            self.ui.local_models_status.setText(f"No local GGUF models found in {model_dir}")
+            self.ui.local_models_status.setText(
+                f"No local GGUF models found in {model_dir}"
+            )
 
     def _selected_local_model_entry(self):
         selected = self.ui.local_models_list.selectedItems()
@@ -744,12 +777,24 @@ class LlamaGUI:
         model_dir = self.ui.model_dir.text().strip()
         target = Path(str(entry.get("path") or ""))
         base = Path(model_dir) if model_dir else Path()
-        if not target.exists() or not model_dir or not self._path_is_inside(target, base):
-            QMessageBox.warning(self.ui, "Delete local model", "Selected path is invalid or outside Models folder.")
+        if (
+            not target.exists()
+            or not model_dir
+            or not self._path_is_inside(target, base)
+        ):
+            QMessageBox.warning(
+                self.ui,
+                "Delete local model",
+                "Selected path is invalid or outside Models folder.",
+            )
             self.refresh_local_model_manager(silent=True)
             return
         if target.resolve() == base.resolve():
-            QMessageBox.warning(self.ui, "Delete local model", "Refusing to delete the Models root folder.")
+            QMessageBox.warning(
+                self.ui,
+                "Delete local model",
+                "Refusing to delete the Models root folder.",
+            )
             return
         if self.server.is_server_running() and self._current_model_uses_path(target):
             QMessageBox.warning(
@@ -793,7 +838,9 @@ class LlamaGUI:
 
         repo = self.ui.hf_repo.text().strip()
         if not repo:
-            QMessageBox.warning(self.ui, "Hugging Face", "Вставьте repo id или URL модели")
+            QMessageBox.warning(
+                self.ui, "Hugging Face", "Вставьте repo id или URL модели"
+            )
             return
 
         self.save_settings()
@@ -844,7 +891,9 @@ class LlamaGUI:
         target_text = ""
         model_dir = self.ui.model_dir.text().strip()
         if model_dir:
-            target_text = f" → {lmstudio_repo_dir(Path(model_dir), result.get('repo_id', ''))}"
+            target_text = (
+                f" → {lmstudio_repo_dir(Path(model_dir), result.get('repo_id', ''))}"
+            )
         projector = self._select_hf_projector()
         projector_text = f", vision: {projector.get('name')}" if projector else ""
         total_size = sum(int(f.get("size") or 0) for f in files)
@@ -925,7 +974,9 @@ class LlamaGUI:
         if not model_dir or not repo_id:
             self.ui.hf_delete_local_folder_btn.setEnabled(False)
             if not silent:
-                self.ui.hf_status.setText("Local files: specify Models folder and HF repo")
+                self.ui.hf_status.setText(
+                    "Local files: specify Models folder and HF repo"
+                )
             return
 
         info = list_local_repo_files(Path(model_dir), repo_id)
@@ -944,13 +995,17 @@ class LlamaGUI:
                 f"Local folder: {info.get('root')} | files: {len(files)}, total {info.get('total_size_text')}"
             )
         elif info.get("exists"):
-            self.ui.hf_status.setText(f"Local folder exists but is empty: {info.get('root')}")
+            self.ui.hf_status.setText(
+                f"Local folder exists but is empty: {info.get('root')}"
+            )
         elif not silent:
             self.ui.hf_status.setText(f"Local folder not found: {info.get('root')}")
 
     def delete_hf_local_folder(self):
         if self.hf_downloader and self.hf_downloader.isRunning():
-            QMessageBox.warning(self.ui, "Hugging Face", "Stop the download before deleting local files")
+            QMessageBox.warning(
+                self.ui, "Hugging Face", "Stop the download before deleting local files"
+            )
             return
         model_dir = self.ui.model_dir.text().strip()
         repo_id = self._current_hf_repo_id()
@@ -1040,7 +1095,12 @@ class LlamaGUI:
             for item in projectors:
                 if key in str(item.get("name") or "").upper():
                     return item
-        projectors.sort(key=lambda item: (int(item.get("size") or 0), str(item.get("name") or "").lower()))
+        projectors.sort(
+            key=lambda item: (
+                int(item.get("size") or 0),
+                str(item.get("name") or "").lower(),
+            )
+        )
         return projectors[0]
 
     def download_hf_selection(self):
@@ -1048,11 +1108,15 @@ class LlamaGUI:
             return
 
         if not self.hf_scan_result:
-            QMessageBox.warning(self.ui, "Hugging Face", "Сначала просканируйте репозиторий")
+            QMessageBox.warning(
+                self.ui, "Hugging Face", "Сначала просканируйте репозиторий"
+            )
             return
         selected = self.ui.hf_files.selectedItems()
         if not selected:
-            QMessageBox.warning(self.ui, "Hugging Face", "Выберите GGUF файл для скачивания")
+            QMessageBox.warning(
+                self.ui, "Hugging Face", "Выберите GGUF файл для скачивания"
+            )
             return
         selected_partial = self._selected_hf_partial_info()
         model_dir = self.ui.model_dir.text().strip()
@@ -1145,7 +1209,9 @@ class LlamaGUI:
         if item and file_info:
             item.setText(self._hf_file_display(file_info))
             item.setToolTip("")
-        self.ui.hf_status.setText("Частичный .part удалён. Следующая загрузка начнётся заново.")
+        self.ui.hf_status.setText(
+            "Частичный .part удалён. Следующая загрузка начнётся заново."
+        )
         self.refresh_hf_local_files(silent=True)
         self._update_hf_download_button()
 
@@ -1155,7 +1221,9 @@ class LlamaGUI:
         if item and file_info:
             partial = self._hf_partial_info(file_info)
             item.setText(self._hf_file_display(file_info))
-            item.setToolTip(f"Partial file: {partial.get('partial_path')}" if partial else "")
+            item.setToolTip(
+                f"Partial file: {partial.get('partial_path')}" if partial else ""
+            )
         self._set_hf_download_controls_locked(False)
         self.refresh_hf_local_files(silent=True)
         self.refresh_local_model_manager(silent=True)
@@ -1299,7 +1367,9 @@ class LlamaGUI:
                 self.ui.spec_draft_model_path.setPlaceholderText(
                     "Auto: embedded/package MTP mode, no --model-draft"
                 )
-            elif draft_path and (not current_draft or not os.path.exists(current_draft)):
+            elif draft_path and (
+                not current_draft or not os.path.exists(current_draft)
+            ):
                 self.ui.spec_draft_model_path.setText(draft_path)
             self.ui.speculative_mtp.setToolTip(
                 "Enable llama.cpp MTP speculative decoding automatically. Gemma 4 regular GGUF uses package/embedded mode; QAT/manual modes can use a separate draft GGUF."
@@ -1443,7 +1513,9 @@ class LlamaGUI:
                 "MTP auto: not enabled. No embedded MTP metadata and no nearby MTP draft GGUF was found.",
                 "warn",
             )
-        if str(info.get("architecture") or "").lower().startswith("gemma4") or info.get("is_qat"):
+        if str(info.get("architecture") or "").lower().startswith("gemma4") or info.get(
+            "is_qat"
+        ):
             self.ui.flash_attn.setChecked(True)
             self.ui.jinja.setChecked(True)
         q = (info.get("quant") or "").upper()
@@ -1737,10 +1809,14 @@ class LlamaGUI:
         if not getattr(self.config.settings, "gpu_auto", True) and not getattr(
             self.config.settings, "gpu_layers_all", False
         ):
-            gpu_layers = int(getattr(self.config.settings, "gpu_layers", gpu_layers) or gpu_layers)
+            gpu_layers = int(
+                getattr(self.config.settings, "gpu_layers", gpu_layers) or gpu_layers
+            )
         ctx_size = int(getattr(self.config.settings, "ctx_size", 0) or 0)
         if ctx_size <= 0:
-            ctx_size = int(info.get("recommended_ctx") or info.get("context_length") or 4096)
+            ctx_size = int(
+                info.get("recommended_ctx") or info.get("context_length") or 4096
+            )
         parallel_slots = int(getattr(self.config.settings, "parallel_slots", 1) or 1)
         if parallel_slots <= 0:
             parallel_slots = 1
@@ -1757,7 +1833,11 @@ class LlamaGUI:
             parallel_slots=parallel_slots,
             ncmoe=ncmoe,
         )
-        gpu_text = "all" if getattr(self.config.settings, "gpu_layers_all", False) else str(gpu_layers)
+        gpu_text = (
+            "all"
+            if getattr(self.config.settings, "gpu_layers_all", False)
+            else str(gpu_layers)
+        )
         return [
             "  Estimated VRAM allocation (heuristic, not measured):",
             f"    Model weights: {est.model_vram_gib:.2f} GiB",
@@ -1790,9 +1870,13 @@ class LlamaGUI:
                 )
             if system_ram:
                 used, total, pct = system_ram
-                lines.append(f"    System RAM: {fmt_mem(used)} / {fmt_mem(total)} ({pct:.1f}%)")
+                lines.append(
+                    f"    System RAM: {fmt_mem(used)} / {fmt_mem(total)} ({pct:.1f}%)"
+                )
             if gpu_snapshots:
-                lines.append("    Note: GPU total includes desktop and other processes.")
+                lines.append(
+                    "    Note: GPU total includes desktop and other processes."
+                )
         for cat in ("VRAM", "RAM"):
             total = self._mem_data.total(cat)
             cap = self._mem_data.system_memory.get(cat)
@@ -1804,7 +1888,9 @@ class LlamaGUI:
             lines.append(f"  {cat}: {fmt_mem(total)}{cap_text}{util_text}")
             comps = agg.get(cat, {})
             comp_parts = []
-            for comp, mib in sorted(comps.items(), key=lambda item: item[1], reverse=True):
+            for comp, mib in sorted(
+                comps.items(), key=lambda item: item[1], reverse=True
+            ):
                 label = COMPONENT_META.get(comp, {}).get("label", comp)
                 comp_parts.append(f"{label} {fmt_mem(mib, short=True)}")
             if comp_parts:
@@ -1859,7 +1945,9 @@ class LlamaGUI:
         """Обработка логов для визуализации памяти."""
         lower_text = text.lower()
         if "model doesn't contain mtp layers" in lower_text:
-            self._mark_mtp_launch_failed("main GGUF does not contain MTP layers", fatal=True)
+            self._mark_mtp_launch_failed(
+                "main GGUF does not contain MTP layers", fatal=True
+            )
         elif "failed to create mtp context" in lower_text:
             self._mark_mtp_launch_failed("failed to create MTP context", fatal=True)
         elif (
@@ -1942,7 +2030,11 @@ class LlamaGUI:
             return False
 
         exe, args, env = self._last_server_launch
-        if "--spec-type" not in args and "--model-draft" not in args and "-md" not in args:
+        if (
+            "--spec-type" not in args
+            and "--model-draft" not in args
+            and "-md" not in args
+        ):
             return False
 
         fallback_args = self._strip_mtp_args(args)

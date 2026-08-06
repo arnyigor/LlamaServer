@@ -161,6 +161,7 @@ def _filter_duplicate_extra_args(
         "--jinja",
         "--kv-unified",
         "-kvu",
+        "--metrics",
     }
     managed = {_flag_base(a) for a in existing_args if str(a).startswith("-")}
     filtered: List[str] = []
@@ -169,11 +170,7 @@ def _filter_duplicate_extra_args(
         arg = extra[i]
         base = _flag_base(arg)
         if base in managed and base in flags_with_values:
-            if (
-                "=" not in arg
-                and i + 1 < len(extra)
-                and _is_value_token(extra[i + 1])
-            ):
+            if "=" not in arg and i + 1 < len(extra) and _is_value_token(extra[i + 1]):
                 i += 2
             else:
                 i += 1
@@ -400,6 +397,7 @@ def build_args(
             args.append("--no-webui")
         if cfg.jinja:
             args.append("--jinja")
+        args.append("--metrics")
 
     if cfg.extra_args.strip():
         try:

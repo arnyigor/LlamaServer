@@ -46,10 +46,17 @@ _CONTENT_COLORS = [
     (re.compile(r"⚠️|warning", re.I), QColor("#dcdcaa")),
 ]
 
-_TOKPS_PATTERN = re.compile(
-    r"(?:eval time|prompt eval time)[^\d]*"
-    r"(\d+(?:\.\d+)?)\s*tokens/s|"
-    r"(\d+(?:\.\d+)?)\s*tok/s",
+_PP_SPEED_PATTERN = re.compile(
+    r"prompt (?:eval time|processing).*?"
+    r"(\d+(?:\.\d+)?)\s*tokens (?:per second|/s)",
+    re.I,
+)
+
+_TG_SPEED_PATTERN = re.compile(
+    r"(?<!prompt )eval time.*?"
+    r"(\d+(?:\.\d+)?)\s*tokens (?:per second|/s)"
+    r"|\btg\b\s*=\s*(\d+(?:\.\d+)?)\s*t/s"
+    r"|(\d+(?:\.\d+)?)\s*tok/s",
     re.I,
 )
 
@@ -186,21 +193,22 @@ class LogManager(QObject):
         self._line_count = MAX_LOG_LINES
 
     def _extract_speed(self, text: str) -> None:
-        matches = _TOKPS_PATTERN.findall(text)
-        if not matches:
-            return
+        changed = False
 
-        values = [float(v) for pair in matches for v in pair if v]
-        if not values:
-            return
+        pp_match = _PP_SPEED_PATTERN.search(text)
+        if pp_match:
+            self._pp_speed = float(pp_match.group(1))
+            changed = True
 
-        if len(values) >= 2:
-            self._pp_speed = values[0]
-            self._tg_speed = values[1]
-        elif len(values) == 1:
-            self._tg_speed = values[0]
+        tg_match = _TG_SPEED_PATTERN.search(text)
+        if tg_match:
+            value = next((float(g) for g in tg_match.groups() if g), None)
+            if value is not None:
+                self._tg_speed = value
+                changed = True
 
-        self._emit_speed()
+        if changed:
+            self._emit_speed()
 
     def _emit_speed(self) -> None:
         parts = []

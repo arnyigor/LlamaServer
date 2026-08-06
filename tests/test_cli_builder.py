@@ -216,7 +216,9 @@ class TestBuildArgs(unittest.TestCase):
         self.assertNotIn("--spec-draft-type-k", args)
         self.assertNotIn("--spec-draft-type-v", args)
         self.assertNotIn("--spec-draft-device", args)
-        self.assertEqual(args[args.index("--model-draft") + 1], "/models/test-mtp-draft.gguf")
+        self.assertEqual(
+            args[args.index("--model-draft") + 1], "/models/test-mtp-draft.gguf"
+        )
         self.assertIn("--split-mode", args)
         self.assertIn("none", args)
         self.assertIn("--main-gpu", args)
@@ -274,6 +276,22 @@ class TestBuildArgs(unittest.TestCase):
     def test_empty_model_returns_none(self):
         self.assertIsNone(build_args(self.cfg, ""))
         self.assertIsNone(build_args(self.cfg, None))
+
+    def test_server_args_include_metrics(self):
+        """llama-server всегда получает --metrics (нужен GUI-счётчикам)."""
+        args = build_args(self.cfg, self.model)
+        self.assertIn("--metrics", args)
+
+    def test_benchmark_args_exclude_metrics(self):
+        """llama-bench не получает --metrics."""
+        args = build_args(self.cfg, self.model, for_benchmark=True)
+        self.assertNotIn("--metrics", args)
+
+    def test_extra_metrics_duplicate_is_filtered(self):
+        """--metrics из Extra args не дублируется."""
+        self.cfg.extra_args = "--metrics"
+        args = build_args(self.cfg, self.model)
+        self.assertEqual(args.count("--metrics"), 1)
 
 
 class TestValidateExtraArgs(unittest.TestCase):
