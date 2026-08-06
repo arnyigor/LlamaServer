@@ -76,6 +76,13 @@ STAT_COLOR_TASK = "#b35c00"
 STAT_COLOR_PROMPT = "#0b6ac2"
 STAT_COLOR_GENERATED = "#1e7e34"
 STAT_COLOR_SAVED = "#3a3a3a"
+STAT_COLOR_TIME = "#5e35b1"
+
+# Максимальный интервал между опросами /slots, который ещё считается
+# "непрерывной работой" для подсчёта активного времени. Бóльший зазор
+# означает паузу опроса/простой — такие дельты отбрасываются (их догонит
+# точный /metrics по завершении запроса).
+MAX_ACTIVE_TIME_DT = 5.0
 
 
 def format_speed(value) -> str:
@@ -108,6 +115,21 @@ def stat_kv(caption: str, value: str, color: str = STAT_COLOR_TOTAL) -> str:
 def stat_sep() -> str:
     """Разделитель между метриками в Runtime stats."""
     return f'<span style="color:{STAT_COLOR_SEP};"> | </span>'
+
+
+def format_duration(total_seconds: float) -> str:
+    """Форматирование длительности: H:MM:SS / M:SS.
+
+    7235 -> "2:00:35"
+    125  -> "2:05"
+    0    -> "0:00"
+    """
+    total = max(int(round(float(total_seconds or 0))), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
 
 
 class AppState(Enum):

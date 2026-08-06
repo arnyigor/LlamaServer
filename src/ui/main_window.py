@@ -318,6 +318,14 @@ class MainWindowUI(QMainWindow):
         self.tokens_saved_label = QLabel("Saved: 0")
         self.tokens_saved_label.setTextFormat(Qt.RichText)
         self.tokens_saved_label.setStyleSheet("color: #1a1a1a;")
+        self.active_time_label = QLabel("Active: 0:00 (PP 0:00 | TG 0:00)")
+        self.active_time_label.setTextFormat(Qt.RichText)
+        self.active_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
+        self.active_time_label.setToolTip(
+            "Суммарное время работы модели: prompt processing (PP) + "
+            "token generation (TG). Простой и ожидание в очереди не считаются. "
+            "Сбрасывается при каждом старте сервера."
+        )
         self.tokens_reset_btn = QPushButton("Reset task tokens")
         self.tokens_reset_btn.setToolTip(
             "Save the current task token count and start counting the next task from zero."
@@ -326,6 +334,7 @@ class MainWindowUI(QMainWindow):
         stats.addWidget(self.tokens_label, 1, 0, 1, 2)
         stats.addWidget(self.request_tokens_label, 2, 0)
         stats.addWidget(self.tokens_saved_label, 2, 1)
+        stats.addWidget(self.active_time_label, 3, 0, 1, 2)
         stats.addWidget(self.tokens_reset_btn, 0, 2, 3, 1)
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)

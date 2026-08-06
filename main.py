@@ -25,11 +25,15 @@ from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.constants import (
+    MAX_ACTIVE_TIME_DT,
+    STAT_COLOR_CAPTION,
     STAT_COLOR_GENERATED,
     STAT_COLOR_PROMPT,
     STAT_COLOR_SAVED,
     STAT_COLOR_TASK,
+    STAT_COLOR_TIME,
     STAT_COLOR_TOTAL,
+    format_duration,
     format_speed,
     stat_kv,
     stat_sep,
@@ -108,6 +112,13 @@ class LlamaGUI:
         # llama.cpp обновляет их лишь по завершении запросов.
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
+        # Активное время работы модели (секунды PP/TG). Живой подсчёт —
+        # интервалы опросов /slots, пока хоть один слот обрабатывает; /metrics
+        # (llamacpp:prompt_tokens_seconds / predicted_tokens_seconds) — точный
+        # "догоняющий" источник (llama.cpp обновляет его по завершении запроса).
+        self._active_prompt_s = 0.0
+        self._active_predicted_s = 0.0
+        self._last_poll_time = None
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
@@ -259,6 +270,10 @@ class LlamaGUI:
         self._slot_token_seen = {}
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
+        self._active_prompt_s = 0.0
+        self._active_predicted_s = 0.0
+        self._last_poll_time = None
+        self._refresh_active_time_label()
         self.metrics.start()
         self.ui.speed_label.setText("Speed: waiting for /slots...")
         self.ui.request_tokens_label.setText("Request: -")
@@ -293,6 +308,58 @@ class LlamaGUI:
                 ]
             )
         )
+
+    def _refresh_active_time_label(self):
+        """Отрисовка строки активного времени: Active: X (PP Y | TG Z)."""
+        inner = (
+            f'<span style="color:{STAT_COLOR_CAPTION};">(</span>'
+            + stat_sep().join(
+                [
+                    stat_kv(
+                        "PP",
+                        format_duration(self._active_prompt_s),
+                        STAT_COLOR_PROMPT,
+                    ),
+                    stat_kv(
+                        "TG",
+                        format_duration(self._active_predicted_s),
+                        STAT_COLOR_GENERATED,
+                    ),
+                ]
+            )
+            + f'<span style="color:{STAT_COLOR_CAPTION};">)</span>'
+        )
+        total = self._active_prompt_s + self._active_predicted_s
+        self.ui.active_time_label.setText(
+            stat_kv("Active", format_duration(total), STAT_COLOR_TIME) + " " + inner
+        )
+
+    def _accumulate_active_time(self, dt: float, active):
+        """Накопление активного времени по интервалу между опросами.
+
+        dt — время между двумя последовательными опросами /slots, когда
+        активен хотя бы один слот. Распределение между PP и TG — по долям
+        мгновенных скоростей; точную разбивку потом даёт /metrics.
+        """
+        prompt_speed = sum(
+            max(float(getattr(slot, "prompt_per_second", 0.0) or 0.0), 0.0)
+            for slot in active
+        )
+        predicted_speed = sum(
+            max(float(getattr(slot, "predicted_per_second", 0.0) or 0.0), 0.0)
+            for slot in active
+        )
+        if prompt_speed > 0 and predicted_speed > 0:
+            total_speed = prompt_speed + predicted_speed
+            self._active_prompt_s += dt * prompt_speed / total_speed
+            self._active_predicted_s += dt * predicted_speed / total_speed
+        elif predicted_speed > 0:
+            self._active_predicted_s += dt
+        elif prompt_speed > 0:
+            self._active_prompt_s += dt
+        # Иначе скорость ещё не измерилась (первый опрос запроса): интервал
+        # пропускаем — /metrics по завершении запроса догонит точным значением.
+        self._refresh_active_time_label()
 
     def _apply_metrics_catch_up(self):
         """Синхронизация счётчиков с /metrics — только вверх.
@@ -346,9 +413,19 @@ class LlamaGUI:
         self._refresh_token_label()
 
     def _on_slot_metrics_updated(self, slots):
+        # Активное время: интервалы опросов, пока хоть один слот обрабатывает.
+        # Большой зазор между опросами (> MAX_ACTIVE_TIME_DT) — пауза/простой,
+        # его не считаем: точный /metrics догонит по завершении запроса.
+        now = time.monotonic()
+        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
+        if self._last_poll_time is not None and active:
+            dt = max(now - self._last_poll_time, 0.0)
+            if dt <= MAX_ACTIVE_TIME_DT:
+                self._accumulate_active_time(dt, active)
+        self._last_poll_time = now
+
         if not slots:
             return
-        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
         visible = active or [
             slot
             for slot in slots
@@ -420,6 +497,18 @@ class LlamaGUI:
         if total < self._token_baseline_total:
             self._token_baseline_total = 0
         self._apply_metrics_catch_up()
+        # Точное активное время из /metrics: llama.cpp суммирует секунды
+        # prompt_eval / decode по завершении запросов, поэтому используем их
+        # как "догоняющий" источник — только вверх.
+        prompt_seconds = float(getattr(metrics, "prompt_tokens_seconds", 0.0) or 0.0)
+        predicted_seconds = float(
+            getattr(metrics, "predicted_tokens_seconds", 0.0) or 0.0
+        )
+        if prompt_seconds > self._active_prompt_s:
+            self._active_prompt_s = prompt_seconds
+        if predicted_seconds > self._active_predicted_s:
+            self._active_predicted_s = predicted_seconds
+        self._refresh_active_time_label()
         self._latest_prompt_total = self._slot_prompt_total
         self._latest_predicted_total = self._slot_predicted_total
         self._latest_token_total = (

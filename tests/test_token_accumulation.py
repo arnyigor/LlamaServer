@@ -10,7 +10,7 @@ generation-токены замирали на нуле (llama.cpp обновля
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -31,6 +31,9 @@ def _make_gui() -> LlamaGUI:
     gui._latest_token_total = 0
     gui._token_baseline_total = 0
     gui._saved_token_total = 0
+    gui._active_prompt_s = 0.0
+    gui._active_predicted_s = 0.0
+    gui._last_poll_time = None
     gui.ui = MagicMock()
     gui.log_mgr = MagicMock()
     gui.log_mgr.has_speed = False
@@ -50,6 +53,8 @@ def _metrics(prompt_total: int, predicted_total: int) -> MagicMock:
     m = MagicMock()
     m.prompt_tokens_total = prompt_total
     m.tokens_predicted_total = predicted_total
+    m.prompt_tokens_seconds = 0.0
+    m.predicted_tokens_seconds = 0.0
     return m
 
 
@@ -181,6 +186,111 @@ class TestTokenAccumulation(unittest.TestCase):
         gui._latest_token_total = 1500
         gui.reset_task_tokens()
         self.assertEqual(gui._saved_token_total, 1500)
+
+    # ------------------------------------------------------------------
+    # Активное время работы модели (PP/TG)
+    # ------------------------------------------------------------------
+
+    def test_format_duration(self):
+        """format_duration: H:MM:SS / M:SS."""
+        from src.core.constants import format_duration
+
+        self.assertEqual(format_duration(0), "0:00")
+        self.assertEqual(format_duration(59), "0:59")
+        self.assertEqual(format_duration(125), "2:05")
+        self.assertEqual(format_duration(7235), "2:00:35")
+        self.assertEqual(format_duration(3600), "1:00:00")
+        self.assertEqual(format_duration(-5), "0:00")
+
+    def test_active_time_ticks_while_processing(self):
+        """Интервалы опросов, пока слот обрабатывает, идут в активное время."""
+        gui = _make_gui()
+        slot = _slot(0, decoded=0, processing=True)
+        slot.predicted_per_second = 10.0
+        with patch("main.time.monotonic", side_effect=[100.0, 100.5, 101.0, 101.5]):
+            gui._on_slot_metrics_updated([slot])  # last=None → только запоминаем
+            gui._on_slot_metrics_updated([slot])  # dt=0.5 → TG
+            gui._on_slot_metrics_updated([slot])  # dt=0.5 → TG
+        self.assertAlmostEqual(gui._active_predicted_s, 1.0)
+        self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+
+    def test_active_time_idle_not_counted(self):
+        """Простой (idle-слоты) не увеличивает активное время."""
+        gui = _make_gui()
+        slot = _slot(0, decoded=0, processing=False)
+        with patch("main.time.monotonic", side_effect=[100.0, 100.5, 101.0]):
+            gui._on_slot_metrics_updated([slot])
+            gui._on_slot_metrics_updated([slot])
+        self.assertAlmostEqual(gui._active_predicted_s, 0.0)
+        self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+
+    def test_active_time_split_prompt_and_generation(self):
+        """Одновременные PP и TG распределяются пропорционально скоростям."""
+        gui = _make_gui()
+        slot = _slot(0, decoded=0, processing=True)
+        slot.prompt_per_second = 100.0
+        slot.predicted_per_second = 300.0
+        with patch("main.time.monotonic", side_effect=[100.0, 100.4, 100.8]):
+            gui._on_slot_metrics_updated([slot])
+            gui._on_slot_metrics_updated([slot])  # dt=0.4 → PP 0.1, TG 0.3
+        self.assertAlmostEqual(gui._active_prompt_s, 0.1)
+        self.assertAlmostEqual(gui._active_predicted_s, 0.3)
+
+    def test_active_time_large_gap_not_counted(self):
+        """Зазор опроса больше MAX_ACTIVE_TIME_DT — пауза, время не считаем."""
+        gui = _make_gui()
+        slot = _slot(0, decoded=0, processing=True)
+        slot.predicted_per_second = 10.0
+        with patch("main.time.monotonic", side_effect=[100.0, 100.25, 110.0]):
+            gui._on_slot_metrics_updated([slot])  # 100.0, last=None
+            gui._on_slot_metrics_updated([slot])  # dt=0.25 → TG
+            gui._on_slot_metrics_updated([slot])  # dt=9.75 > 5 → не считаем
+        self.assertAlmostEqual(gui._active_predicted_s, 0.25)
+
+    def test_active_time_metrics_catch_up_increases(self):
+        """/metrics догоняет активное время вверх (точные секунды)."""
+        gui = _make_gui()
+        m = _metrics(100, 50)
+        m.prompt_tokens_seconds = 10.0
+        m.predicted_tokens_seconds = 20.0
+        gui._on_server_metrics_updated(m)
+        self.assertAlmostEqual(gui._active_prompt_s, 10.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 20.0)
+
+    def test_active_time_metrics_never_decreases(self):
+        """/metrics не уменьшает активное время, уже накопленное живьём."""
+        gui = _make_gui()
+        gui._active_prompt_s = 30.0
+        gui._active_predicted_s = 40.0
+        m = _metrics(100, 50)
+        m.prompt_tokens_seconds = 10.0
+        m.predicted_tokens_seconds = 20.0
+        gui._on_server_metrics_updated(m)
+        self.assertAlmostEqual(gui._active_prompt_s, 30.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 40.0)
+
+    def test_active_time_label_format(self):
+        """Лейбл активного времени: Active: total (PP pp | TG tg)."""
+        gui = _make_gui()
+        gui._active_prompt_s = 125
+        gui._active_predicted_s = 7235
+        gui._refresh_active_time_label()
+        text = gui.ui.active_time_label.setText.call_args[0][0]
+        self.assertIn("Active", text)
+        self.assertIn("2:00:35", text)  # TG
+        self.assertIn("2:05", text)  # PP
+
+    def test_start_metrics_polling_resets_active_time(self):
+        """Каждый старт сервера сбрасывает активное время."""
+        gui = _make_gui()
+        gui.metrics = MagicMock()
+        gui._active_prompt_s = 10.0
+        gui._active_predicted_s = 20.0
+        gui._last_poll_time = 5.0
+        gui._start_metrics_polling()
+        self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 0.0)
+        self.assertIsNone(gui._last_poll_time)
 
 
 if __name__ == "__main__":
