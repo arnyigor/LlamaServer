@@ -146,12 +146,16 @@ class MetricsPoller(QObject):
             # Парсинг timings если есть
             timings = slot_data.get("timings", {})
             if isinstance(timings, dict):
-                slot.prompt_per_second = timings.get("prompt_per_second", 0.0)
-                slot.predicted_per_second = timings.get("predicted_per_second", 0.0)
                 slot.prompt_ms = timings.get("prompt_ms", 0.0)
                 slot.predicted_ms = timings.get("predicted_ms", 0.0)
                 slot.prompt_n = timings.get("prompt_n", 0)
                 slot.predicted_n = timings.get("predicted_n", 0)
+                slot.prompt_per_second = timings.get("prompt_per_second", 0.0)
+                slot.predicted_per_second = timings.get("predicted_per_second", 0.0)
+                if not slot.prompt_per_second and slot.prompt_n and slot.prompt_ms:
+                    slot.prompt_per_second = slot.prompt_n / slot.prompt_ms * 1000.0
+                if not slot.predicted_per_second and slot.predicted_n and slot.predicted_ms:
+                    slot.predicted_per_second = slot.predicted_n / slot.predicted_ms * 1000.0
                 slot.cache_n = timings.get("cache_n", 0)
 
             slots.append(slot)

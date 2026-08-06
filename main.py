@@ -26,6 +26,7 @@ from src.core.cli_builder import build_args
 from src.core.config import ConfigManager
 from src.core.gguf_parser import extract_model_info
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
+from src.core.metrics_poller import MetricsPoller
 from src.core.server_manager import ServerManager
 from src.core.vram_estimator import full_vram_estimate
 from src.services.autotune_manager import AutoTuneManager
@@ -36,6 +37,7 @@ from src.services.hf_downloader import (
     delete_file_safely,
     find_partial_downloads,
     format_bytes,
+    list_all_local_model_entries,
     list_local_repo_files,
     lmstudio_repo_dir,
     normalize_hf_repo_id,
@@ -72,13 +74,27 @@ class LlamaGUI:
         self._mtp_draft_error_seen = False
         self._mtp_failure_reason = ""
         self._mtp_fallback_attempted = False
+        self._mtp_auto_abort_requested = False
         self._memory_summary_logged = False
 
         self.log_mgr = LogManager(self.ui.logs)
-        self.log_mgr.speed_updated.connect(self.ui.speed_label.setText)
+        self.log_mgr.speed_updated.connect(self._on_log_speed_updated)
         self.ui.autoscroll_logs.toggled.connect(
             lambda checked: setattr(self.log_mgr, "autoscroll", checked)
         )
+        self.metrics = MetricsPoller(poll_interval_ms=250)
+        self.metrics.slot_metrics_updated.connect(self._on_slot_metrics_updated)
+        self.metrics.server_metrics_updated.connect(self._on_server_metrics_updated)
+        self._latest_token_total = 0
+        self._latest_prompt_total = 0
+        self._latest_predicted_total = 0
+        self._token_baseline_total = 0
+        self._saved_token_total = 0
+        self._slot_prompt_total = 0
+        self._slot_predicted_total = 0
+        self._slot_token_seen = {}
+        self._metrics_total_seen = False
+
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
@@ -95,6 +111,7 @@ class LlamaGUI:
         u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
         u.force_stop_btn.clicked.connect(self.force_stop_server)
+        u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
         u.test_btn.clicked.connect(self.run_benchmark)
         u.scan_btn.clicked.connect(self.scan_models)
         u.hf_scan_btn.clicked.connect(self.scan_hf_repo)
@@ -103,6 +120,9 @@ class LlamaGUI:
         u.hf_cancel_btn.clicked.connect(self.cancel_hf_download)
         u.hf_refresh_local_btn.clicked.connect(self.refresh_hf_local_files)
         u.hf_delete_local_folder_btn.clicked.connect(self.delete_hf_local_folder)
+        u.local_models_refresh_btn.clicked.connect(self.refresh_local_model_manager)
+        u.local_models_delete_btn.clicked.connect(self.delete_selected_local_model)
+        u.local_models_list.itemSelectionChanged.connect(self._update_local_model_delete_button)
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
@@ -197,6 +217,138 @@ class LlamaGUI:
         self.server.server_stopped.connect(self._on_server_stopped)
         self.server.bench_finished.connect(self._on_bench_finished)
 
+    def _fmt_counter(self, value) -> str:
+        return f"{max(int(value or 0), 0):,}"
+
+    def _server_metrics_url(self) -> str:
+        host = str(self.ui.host.text() or "127.0.0.1").strip() or "127.0.0.1"
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+        return f"http://{host}:{self.ui.port.value()}"
+
+    def _on_log_speed_updated(self, text: str):
+        if not getattr(self.metrics, "_is_running", False):
+            self.ui.speed_label.setText(text)
+
+    def _start_metrics_polling(self):
+        self.metrics.set_url(self._server_metrics_url())
+        self._slot_prompt_total = 0
+        self._slot_predicted_total = 0
+        self._slot_token_seen = {}
+        self._metrics_total_seen = False
+        self.metrics.start()
+        self.ui.speed_label.setText("Speed: waiting for /slots...")
+        self.ui.request_tokens_label.setText("Request: -")
+
+    def _stop_metrics_polling(self):
+        self.metrics.stop()
+        self.ui.speed_label.setText("Speed: -")
+        self.ui.request_tokens_label.setText("Request: -")
+
+    def _refresh_token_label(self):
+        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
+        self.ui.tokens_label.setText(
+            "Tokens: "
+            f"total {self._fmt_counter(self._latest_token_total)} | "
+            f"task {self._fmt_counter(task_total)} | "
+            f"prompt {self._fmt_counter(self._latest_prompt_total)} | "
+            f"generated {self._fmt_counter(self._latest_predicted_total)}"
+        )
+
+    def _slot_speed(self, slot, token_attr: str, ms_attr: str, speed_attr: str) -> float:
+        speed = float(getattr(slot, speed_attr, 0.0) or 0.0)
+        if speed > 0:
+            return speed
+        token_count = int(getattr(slot, token_attr, 0) or 0)
+        elapsed_ms = float(getattr(slot, ms_attr, 0.0) or 0.0)
+        if token_count > 0 and elapsed_ms > 0:
+            return token_count / elapsed_ms * 1000.0
+        return 0.0
+
+    def _accumulate_slot_tokens(self, slots):
+        if self._metrics_total_seen:
+            return
+        for slot in slots:
+            slot_id = int(getattr(slot, "id", 0) or 0)
+            prompt_tokens = int(getattr(slot, "prompt_n", 0) or 0)
+            predicted_tokens = int(getattr(slot, "predicted_n", 0) or 0)
+            previous_prompt, previous_predicted = self._slot_token_seen.get(slot_id, (0, 0))
+            prompt_delta = prompt_tokens - previous_prompt if prompt_tokens >= previous_prompt else prompt_tokens
+            predicted_delta = (
+                predicted_tokens - previous_predicted
+                if predicted_tokens >= previous_predicted
+                else predicted_tokens
+            )
+            self._slot_prompt_total += max(prompt_delta, 0)
+            self._slot_predicted_total += max(predicted_delta, 0)
+            self._slot_token_seen[slot_id] = (prompt_tokens, predicted_tokens)
+        self._latest_prompt_total = self._slot_prompt_total
+        self._latest_predicted_total = self._slot_predicted_total
+        self._latest_token_total = self._latest_prompt_total + self._latest_predicted_total
+        self._refresh_token_label()
+
+    def _on_slot_metrics_updated(self, slots):
+        if not slots:
+            return
+        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
+        visible = active or [
+            slot
+            for slot in slots
+            if getattr(slot, "prompt_per_second", 0.0)
+            or getattr(slot, "predicted_per_second", 0.0)
+            or getattr(slot, "prompt_n", 0)
+            or getattr(slot, "predicted_n", 0)
+        ]
+        if not visible:
+            self.ui.speed_label.setText("Speed: -")
+            self.ui.request_tokens_label.setText("Request: -")
+            return
+
+        prompt_speed = sum(
+            self._slot_speed(slot, "prompt_n", "prompt_ms", "prompt_per_second")
+            for slot in visible
+        )
+        predicted_speed = sum(
+            self._slot_speed(slot, "predicted_n", "predicted_ms", "predicted_per_second")
+            for slot in visible
+        )
+        prompt_tokens = sum(int(getattr(slot, "prompt_n", 0) or 0) for slot in visible)
+        predicted_tokens = sum(int(getattr(slot, "predicted_n", 0) or 0) for slot in visible)
+
+        parts = []
+        if prompt_speed > 0:
+            parts.append(f"PP {prompt_speed:.2f} tok/s")
+        if predicted_speed > 0:
+            parts.append(f"TG {predicted_speed:.2f} tok/s")
+        self.ui.speed_label.setText("Speed: " + (" | ".join(parts) if parts else "-"))
+        self.ui.request_tokens_label.setText(
+            f"Request: prompt {self._fmt_counter(prompt_tokens)} | generated {self._fmt_counter(predicted_tokens)}"
+        )
+        self._accumulate_slot_tokens(slots)
+
+    def _on_server_metrics_updated(self, metrics):
+        prompt_total = int(getattr(metrics, "prompt_tokens_total", 0) or 0)
+        predicted_total = int(getattr(metrics, "tokens_predicted_total", 0) or 0)
+        total = prompt_total + predicted_total
+        if total <= 0:
+            return
+        self._metrics_total_seen = True
+        if total < self._token_baseline_total:
+            self._token_baseline_total = 0
+        self._latest_prompt_total = prompt_total
+        self._latest_predicted_total = predicted_total
+        self._latest_token_total = total
+        self._refresh_token_label()
+
+    def reset_task_tokens(self):
+        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
+        self._saved_token_total += task_total
+        self._token_baseline_total = self._latest_token_total
+        self.ui.tokens_saved_label.setText(
+            f"Saved: last {self._fmt_counter(task_total)} | total {self._fmt_counter(self._saved_token_total)}"
+        )
+        self._refresh_token_label()
+        self.log_mgr.append(f"Token counter reset: saved {task_total:,} tokens")
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
             self.ui, "Select opencode.json", "", "JSON (*.json);;All files (*.*)"
@@ -515,6 +667,124 @@ class LlamaGUI:
         )
         self.scanner.start()
 
+    def _update_local_model_delete_button(self):
+        self.ui.local_models_delete_btn.setEnabled(
+            bool(self.ui.local_models_list.selectedItems())
+        )
+
+    def refresh_local_model_manager(self, silent=False):
+        self.ui.local_models_list.clear()
+        model_dir = self.ui.model_dir.text().strip()
+        if not model_dir or not os.path.exists(model_dir):
+            self.ui.local_models_delete_btn.setEnabled(False)
+            if not silent:
+                self.ui.local_models_status.setText("Specify existing Models folder")
+            return
+
+        info = list_all_local_model_entries(Path(model_dir))
+        entries = info.get("entries") or []
+        for entry in entries:
+            examples = ", ".join(entry.get("examples") or [])
+            suffix = f" | {examples}" if examples else ""
+            item_text = (
+                f"{entry.get('relative')}  |  {entry.get('type')}  |  "
+                f"GGUF: {entry.get('gguf_count')}  |  {entry.get('size_text')}{suffix}"
+            )
+            self.ui.local_models_list.addItem(item_text)
+            item = self.ui.local_models_list.item(self.ui.local_models_list.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(str(entry.get("path") or ""))
+
+        self.ui.local_models_delete_btn.setEnabled(False)
+        if entries:
+            self.ui.local_models_status.setText(
+                f"Local models: {len(entries)}, total {info.get('total_size_text')} | root: {info.get('root')}"
+            )
+        elif not silent:
+            self.ui.local_models_status.setText(f"No local GGUF models found in {model_dir}")
+
+    def _selected_local_model_entry(self):
+        selected = self.ui.local_models_list.selectedItems()
+        if not selected:
+            return None
+        return selected[0].data(Qt.ItemDataRole.UserRole)
+
+    def _path_is_inside(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _current_model_uses_path(self, target: Path) -> bool:
+        current = self._current_model_path()
+        if not current:
+            return False
+        current_path = Path(current)
+        try:
+            if target.is_dir():
+                current_path.resolve().relative_to(target.resolve())
+                return True
+            return current_path.resolve() == target.resolve()
+        except (OSError, ValueError):
+            return False
+
+    def delete_selected_local_model(self):
+        entry = self._selected_local_model_entry()
+        if not entry:
+            return
+        if self.hf_downloader and self.hf_downloader.isRunning():
+            QMessageBox.warning(
+                self.ui,
+                "Delete local model",
+                "Stop the Hugging Face download before deleting local models.",
+            )
+            return
+
+        model_dir = self.ui.model_dir.text().strip()
+        target = Path(str(entry.get("path") or ""))
+        base = Path(model_dir) if model_dir else Path()
+        if not target.exists() or not model_dir or not self._path_is_inside(target, base):
+            QMessageBox.warning(self.ui, "Delete local model", "Selected path is invalid or outside Models folder.")
+            self.refresh_local_model_manager(silent=True)
+            return
+        if target.resolve() == base.resolve():
+            QMessageBox.warning(self.ui, "Delete local model", "Refusing to delete the Models root folder.")
+            return
+        if self.server.is_server_running() and self._current_model_uses_path(target):
+            QMessageBox.warning(
+                self.ui,
+                "Delete local model",
+                "This model is currently loaded. Stop the server first to release RAM/VRAM, then delete it.",
+            )
+            return
+
+        delete_kind = "folder" if target.is_dir() else "file"
+        reply = QMessageBox.question(
+            self.ui,
+            "Delete local model",
+            f"Delete selected local model {delete_kind}?\n\n"
+            f"{target}\n\n"
+            "This cannot be undone. For folders, all GGUF/mmproj/.part files inside are removed.",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError as exc:
+            QMessageBox.critical(self.ui, "Delete failed", str(exc))
+            return
+
+        self.log_mgr.append(f"Local model {delete_kind} deleted: {target}", "warn")
+        self.ui.local_models_status.setText(f"Deleted: {target}")
+        self.refresh_local_model_manager(silent=True)
+        self.refresh_hf_local_files(silent=True)
+        self.scan_models(silent=True)
+
     def scan_hf_repo(self):
         if self.hf_scanner and self.hf_scanner.isRunning():
             self.hf_scanner.requestInterruption()
@@ -705,6 +975,7 @@ class LlamaGUI:
             return
         self.ui.hf_status.setText(f"Local model folder deleted: {target_root}")
         self.refresh_hf_local_files(silent=True)
+        self.refresh_local_model_manager(silent=True)
         self.scan_models(silent=True)
 
     def _selected_hf_file_info(self):
@@ -887,6 +1158,7 @@ class LlamaGUI:
             item.setToolTip(f"Partial file: {partial.get('partial_path')}" if partial else "")
         self._set_hf_download_controls_locked(False)
         self.refresh_hf_local_files(silent=True)
+        self.refresh_local_model_manager(silent=True)
         self._update_hf_download_button()
 
     def _on_hf_download_completed(self, ok, message):
@@ -896,6 +1168,7 @@ class LlamaGUI:
         self.ui.hf_status.setText(message)
         self.log_mgr.append(message, "info" if ok else "error")
         self.refresh_hf_local_files(silent=True)
+        self.refresh_local_model_manager(silent=True)
         if ok:
             self.scan_models(silent=True)
 
@@ -920,6 +1193,7 @@ class LlamaGUI:
         self.save_settings()
         self.log_mgr.append(f"Found models: {len(models)}")
         self.ui.scan_status.setText(f"Found models: {len(models)}")
+        self.refresh_local_model_manager(silent=True)
 
     def on_model_selected(self, *_):
         path = self.ui.model_combo.currentData()
@@ -1104,13 +1378,14 @@ class LlamaGUI:
         )
 
     def _auto_mtp_supported(self, info):
-        """Авто-включение MTP, если есть встроенные MTP layers или draft GGUF.
+        """Auto-enable MTP only for known-safe embedded mode or a local draft.
 
-        Для локальных Gemma 4 GGUF рядом может лежать mtp-*.gguf. Тогда нужно
-        запускать llama.cpp с --model-draft. Если конкретная сборка llama.cpp
-        или файл несовместимы, приложение сделает fallback без MTP.
+        Для LM Studio layout ищем draft только внутри папки выбранной модели.
+        Соседние модели не используются, чтобы не подставить несовместимый
+        Qwen/Gemma draft и не получить GGML_ASSERT по ширине embedding.
+        Если ручной draft всё же несовместим, приложение сделает fallback без MTP.
         """
-        return bool(info.get("mtp_capable") or info.get("mtp_draft_path"))
+        return bool(self._uses_embedded_mtp_mode(info) or info.get("mtp_draft_path"))
 
     def _auto_mtp_draft_path(self, info):
         if not self._auto_mtp_supported(info) or self._uses_embedded_mtp_mode(info):
@@ -1133,7 +1408,7 @@ class LlamaGUI:
         draft_path = self._auto_mtp_draft_path(info)
         if draft_path:
             self.ui.spec_draft_model_path.setText(draft_path)
-        elif self._uses_embedded_mtp_mode(info):
+        else:
             self.ui.spec_draft_model_path.clear()
         self.ui.spec_draft_n_max.setValue(2)
         self.ui.spec_draft_gpu_layers.setText("all")
@@ -1562,22 +1837,46 @@ class LlamaGUI:
         self._memory_summary_logged = True
         self.log_mgr.append(self._memory_summary_text())
 
+    def _abort_bad_mtp_launch(self):
+        """Immediately kill a broken MTP launch so model loading cannot keep VRAM busy."""
+        if not self.server.is_server_running():
+            return
+        self.log_mgr.append(
+            "⛔ Fatal MTP error detected during load: killing llama-server now to free RAM/VRAM. "
+            "The app will retry once without MTP.",
+            "error",
+        )
+        self.server.force_stop_server()
+
+    def _mark_mtp_launch_failed(self, reason: str, fatal: bool = False):
+        self._mtp_draft_error_seen = True
+        self._mtp_failure_reason = reason
+        if fatal and not self._mtp_auto_abort_requested:
+            self._mtp_auto_abort_requested = True
+            QTimer.singleShot(0, self._abort_bad_mtp_launch)
+
     def _on_log_for_mem_viz(self, text: str, level: str):
         """Обработка логов для визуализации памяти."""
         lower_text = text.lower()
         if "model doesn't contain mtp layers" in lower_text:
-            self._mtp_draft_error_seen = True
-            self._mtp_failure_reason = "main GGUF does not contain MTP layers"
+            self._mark_mtp_launch_failed("main GGUF does not contain MTP layers", fatal=True)
         elif "failed to create mtp context" in lower_text:
-            self._mtp_draft_error_seen = True
-            self._mtp_failure_reason = "failed to create MTP context"
+            self._mark_mtp_launch_failed("failed to create MTP context", fatal=True)
         elif (
             "failed to load draft model" in lower_text
             or "common_speculative_init_result" in lower_text
             or "invalid vector subscript" in lower_text
         ):
-            self._mtp_draft_error_seen = True
-            self._mtp_failure_reason = "draft GGUF failed to load"
+            self._mark_mtp_launch_failed("draft GGUF failed to load", fatal=True)
+        elif (
+            "mtp input row width must match" in lower_text
+            or ("ggml_assert" in lower_text and "mtp" in lower_text)
+            or ("speculative.cpp" in lower_text and "mtp" in lower_text)
+        ):
+            self._mark_mtp_launch_failed(
+                "draft GGUF is incompatible with the main model (embedding width mismatch)",
+                fatal=True,
+            )
         for line in text.splitlines():
             parse_line(line, self._mem_data)
         if self._mem_data.server_ready:
@@ -1654,6 +1953,7 @@ class LlamaGUI:
         reason = self._mtp_failure_reason or "MTP initialization failed"
         self._mtp_draft_error_seen = False
         self._mtp_failure_reason = ""
+        self._mtp_auto_abort_requested = False
         self.ui.speculative_mtp.setChecked(False)
         self.log_mgr.append(
             f"⚠️ MTP disabled: {reason}. Retrying once without MTP so the main model can start. "
@@ -1675,6 +1975,7 @@ class LlamaGUI:
 
     def _on_server_stopped(self):
         """Обработчик остановки сервера."""
+        self._stop_metrics_polling()
         if self._restart_pending:
             self._reset_mem_viz("Сервер остановлен, перезапуск с новыми параметрами...")
             QTimer.singleShot(150, self._start_pending_restart)
@@ -1820,6 +2121,9 @@ class LlamaGUI:
         action: str = "Starting server",
     ):
         cuda_ver = self._selected_cuda_version()
+        is_retry = action.lower().startswith("retry without mtp")
+        if not is_retry:
+            self.log_mgr.clear()
         env_text = ""
         if env:
             env_text = "\n   Env: " + " ".join(f"{k}={v}" for k, v in env.items())
@@ -1830,10 +2134,12 @@ class LlamaGUI:
         if "--spec-type" in args or "--model-draft" in args or "-md" in args:
             self._mtp_draft_error_seen = False
             self._mtp_failure_reason = ""
+            self._mtp_auto_abort_requested = False
             if not action.lower().startswith("retry without mtp"):
                 self._mtp_fallback_attempted = False
         self._reset_mem_viz()
         self.server.start_server(exe, args, env=env)
+        self._start_metrics_polling()
         self._reset_restart_indicator()
         self.ui.start_btn.setVisible(False)
         self.ui.reload_btn.setVisible(True)
@@ -2625,6 +2931,7 @@ class LlamaGUI:
     def quit_app(self):
         self.save_settings()
         self.ui.save_ui_state()
+        self.metrics.stop()
         self.log_mgr.stop()
         self.server.terminate_all()
         if self.scanner and self.scanner.isRunning():

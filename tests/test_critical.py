@@ -27,6 +27,7 @@ from src.utils.file_utils import (
     write_json_file_safely,
     load_or_create_json,
 )
+from src.services.hf_downloader import list_all_local_model_entries
 from src.services.threads import LlamaCppUpdater
 
 
@@ -93,6 +94,39 @@ class TestGGUFParser(unittest.TestCase):
 
             self.assertTrue(is_mtp_draft_file(draft))
             self.assertEqual(detect_mtp_draft_for_model(model), str(draft))
+
+    def test_mtp_draft_detection_ignores_sibling_model_folders(self):
+        """MTP draft search must not cross-pair LM Studio sibling models."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            author = Path(tmpdir) / "unsloth"
+            gemma_dir = author / "gemma-4-26B-A4B-it-qat-GGUF"
+            qwen_dir = author / "Qwen3.6-27B-MTP-GGUF"
+            gemma_dir.mkdir(parents=True)
+            qwen_dir.mkdir(parents=True)
+            model = gemma_dir / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
+            model.write_bytes(b"fake")
+            qwen_draft = qwen_dir / "Qwen3.6-27B-UD-IQ3_XXS.gguf"
+            qwen_draft.write_bytes(b"fake")
+
+            self.assertEqual(detect_mtp_draft_for_model(model), "")
+
+    def test_list_all_local_model_entries(self):
+        """Local manager lists all model folders, not only downloaded HF repos."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lm_model = root / "unsloth" / "model-a"
+            lm_model.mkdir(parents=True)
+            (lm_model / "model-a-Q4_K_M.gguf").write_bytes(b"a" * 10)
+            (lm_model / "mmproj-model-a.gguf").write_bytes(b"p" * 5)
+            direct = root / "direct-model-Q8_0.gguf"
+            direct.write_bytes(b"d" * 7)
+
+            result = list_all_local_model_entries(root)
+            relatives = {entry["relative"] for entry in result["entries"]}
+
+            self.assertIn("unsloth/model-a", relatives)
+            self.assertIn("direct-model-Q8_0.gguf", relatives)
+            self.assertEqual(len(result["entries"]), 2)
 
     def test_recommend_context(self):
         """Рекомендация размера контекста."""

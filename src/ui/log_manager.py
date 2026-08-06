@@ -126,6 +126,7 @@ class LogManager(QObject):
         self._line_count = 0
         self._pp_speed = None
         self._tg_speed = None
+        self.speed_updated.emit("Speed: -")
 
     def stop(self) -> None:
         self._timer.stop()

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSplitter,
+    QGridLayout,
 )
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QFont, QIcon
@@ -128,7 +129,8 @@ class MainWindowUI(QMainWindow):
 
         self.update_progress = QProgressBar(visible=False, minimum=0, maximum=100)
         lp.addWidget(self.update_progress)
-        lay.addWidget(g_paths)
+        self.paths_panel = CollapsiblePanel("Advanced: Paths and llama.cpp")
+        self.paths_panel.add_widget(g_paths)
 
         # === 2. Модель ===
         g_model = QGroupBox("Model")
@@ -193,6 +195,36 @@ class MainWindowUI(QMainWindow):
         lm.addWidget(self.model_info)
         lm.addLayout(mrow)
         lay.addWidget(g_model)
+
+        # === 2a. Управление локальными моделями ===
+        self.local_models_panel = CollapsiblePanel("Local model manager")
+        local = self.local_models_panel.content_layout
+
+        local_row = QHBoxLayout()
+        self.local_models_refresh_btn = QPushButton("Refresh local models")
+        self.local_models_delete_btn = QPushButton("Delete selected")
+        self.local_models_delete_btn.setEnabled(False)
+        self.local_models_delete_btn.setToolTip(
+            "Safely delete the selected model folder/file from the Models base folder."
+        )
+        local_row.addWidget(QLabel("All models under Models:"))
+        local_row.addStretch(1)
+        local_row.addWidget(self.local_models_refresh_btn)
+        local_row.addWidget(self.local_models_delete_btn)
+        local.addLayout(local_row)
+
+        self.local_models_list = QListWidget()
+        self.local_models_list.setMaximumHeight(130)
+        self.local_models_list.setToolTip(
+            "Shows every local model folder/file found under the Models path, not only HF downloads. "
+            "Projectors/MTP drafts are included in folder deletion but not shown as standalone models."
+        )
+        local.addWidget(self.local_models_list)
+
+        self.local_models_status = QLabel("Refresh to list local models")
+        self.local_models_status.setWordWrap(True)
+        local.addWidget(self.local_models_status)
+        lay.addWidget(self.local_models_panel)
 
         # === 2b. Hugging Face загрузка ===
         self.hf_panel = CollapsiblePanel("Download GGUF from Hugging Face")
@@ -265,13 +297,39 @@ class MainWindowUI(QMainWindow):
         hf.addWidget(self.hf_local_files)
         lay.addWidget(self.hf_panel)
 
+        self.runtime_stats_group = QGroupBox("Runtime stats")
+        stats = QGridLayout(self.runtime_stats_group)
+        stats.setContentsMargins(12, 18, 12, 12)
+        stats.setHorizontalSpacing(10)
+        stats.setVerticalSpacing(6)
         self.speed_label = QLabel("Speed: -")
         self.speed_label.setStyleSheet(
             "color: #4ec9b0; font-family: Consolas; font-weight: bold;"
         )
-        lay.addWidget(self.speed_label)
+        self.tokens_label = QLabel("Tokens: total 0 | task 0")
+        self.tokens_label.setStyleSheet("font-family: Consolas; color: #dcdcaa;")
+        self.request_tokens_label = QLabel("Request: -")
+        self.request_tokens_label.setStyleSheet("font-family: Consolas; color: #9cdcfe;")
+        self.tokens_saved_label = QLabel("Saved: 0")
+        self.tokens_saved_label.setStyleSheet("color: #888;")
+        self.tokens_reset_btn = QPushButton("Reset task tokens")
+        self.tokens_reset_btn.setToolTip(
+            "Save the current task token count and start counting the next task from zero."
+        )
+        stats.addWidget(self.speed_label, 0, 0, 1, 2)
+        stats.addWidget(self.tokens_label, 1, 0, 1, 2)
+        stats.addWidget(self.request_tokens_label, 2, 0)
+        stats.addWidget(self.tokens_saved_label, 2, 1)
+        stats.addWidget(self.tokens_reset_btn, 0, 2, 3, 1)
+        stats.setColumnStretch(1, 1)
+        lay.addWidget(self.runtime_stats_group)
 
         # === 3. Производительность ===
+        g_launch = QGroupBox("Launch settings")
+        launch = QVBoxLayout(g_launch)
+        launch.setContentsMargins(12, 18, 12, 12)
+        launch.setSpacing(8)
+
         g_perf = CollapsiblePanel("Advanced: Performance and Memory")
         lperf = g_perf.content_layout
         lperf.setContentsMargins(8, 6, 8, 6)
@@ -299,14 +357,11 @@ class MainWindowUI(QMainWindow):
         self.cpu_moe_layers.setSpecialValueText("auto")
 
         r1 = QHBoxLayout()
-        r1.addWidget(QLabel("GPU Layers (-ngl):"))
+        r1.addWidget(QLabel("GPU offload (-ngl):"))
         r1.addWidget(self.gpu_layers)
         r1.addWidget(self.gpu_auto)
         r1.addWidget(self.gpu_layers_all)
-        r1.addSpacing(10)
-        r1.addWidget(QLabel("CPU MoE (-ncmoe):"))
-        r1.addWidget(self.cpu_moe_layers)
-        lperf.addLayout(r1)
+        r1.addStretch(1)
 
         self.ctx_size = QSpinBox()
         self.ctx_size.setRange(-1, 1048576)
@@ -346,12 +401,13 @@ class MainWindowUI(QMainWindow):
             r2.addWidget(btn)
 
         r2.addStretch(1)
-        lperf.addLayout(r2)
+        launch.addLayout(r2)
+        launch.addLayout(r1)
 
         r2b = QHBoxLayout()
         r2b.addWidget(self.save_preset_btn)
         r2b.addWidget(self.preset_status, 1)
-        lperf.addLayout(r2b)
+        launch.addLayout(r2b)
 
         self.batch_size = QSpinBox()
         self.batch_size.setRange(-1, 32768)
@@ -367,7 +423,7 @@ class MainWindowUI(QMainWindow):
         r3.addWidget(QLabel("Batch / UBatch (-b / -ub):"))
         r3.addWidget(self.batch_size)
         r3.addWidget(self.ubatch_size)
-        lperf.addLayout(r3)
+        launch.addLayout(r3)
 
         self.threads = QSpinBox()
         self.threads.setRange(1, 64)
@@ -391,7 +447,7 @@ class MainWindowUI(QMainWindow):
         r5.addWidget(QLabel("KV Cache K / V (-ctk / -ctv):"))
         r5.addWidget(self.cache_type_k)
         r5.addWidget(self.cache_type_v)
-        lperf.addLayout(r5)
+        launch.addLayout(r5)
 
         self.flash_attn = QCheckBox("Flash Attention (-fa)")
         self.flash_attn.setChecked(True)
@@ -400,7 +456,13 @@ class MainWindowUI(QMainWindow):
         r6 = QHBoxLayout()
         r6.addWidget(self.flash_attn)
         r6.addWidget(self.fit_off)
-        lperf.addLayout(r6)
+        launch.addLayout(r6)
+
+        r_cpu = QHBoxLayout()
+        r_cpu.addWidget(QLabel("CPU MoE offload (-ncmoe):"))
+        r_cpu.addWidget(self.cpu_moe_layers)
+        r_cpu.addStretch(1)
+        lperf.addLayout(r_cpu)
 
         self.reasoning_mode = QComboBox()
         self.reasoning_mode.addItems(["off", "auto", "on"])
@@ -506,7 +568,10 @@ class MainWindowUI(QMainWindow):
         r9.addWidget(QLabel("Cache RAM (MiB):"))
         r9.addWidget(self.cache_ram)
         lperf.addLayout(r9)
-        lay.addWidget(g_perf)
+        lay.insertWidget(1, g_launch)
+        lay.insertWidget(2, self.runtime_stats_group)
+        lay.insertWidget(3, g_perf)
+        lay.insertWidget(4, self.paths_panel)
 
         # === 4. Спойлеры ===
         self.adv_panel = CollapsiblePanel("Advanced: Sampling, Debug, Server")
@@ -832,6 +897,7 @@ class MainWindowUI(QMainWindow):
             self.stop_btn: "Stops server",
             self.force_stop_btn: "Force kills llama-server immediately",
             self.autoscroll_logs: "Auto-scroll logs",
+            self.tokens_reset_btn: "Save current task token count and reset task counter",
         }
         for widget, text in tips.items():
             if widget:

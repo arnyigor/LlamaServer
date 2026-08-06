@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List
 
 from PySide6.QtCore import QThread, Signal
 
-from src.core.gguf_parser import is_projector_file
+from src.core.gguf_parser import is_mtp_draft_file, is_projector_file
 
 
 HF_API_MODEL_URL = "https://huggingface.co/api/models/{repo_id}?blobs=true"
@@ -490,6 +490,88 @@ def list_local_repo_files(base_model_dir: Path, repo_id: str) -> Dict:
             }
         )
         result["total_size"] += size
+    result["total_size_text"] = format_bytes(result["total_size"])
+    return result
+
+
+def _folder_size(path: Path) -> int:
+    total = 0
+    try:
+        files = path.rglob("*") if path.is_dir() else [path]
+        for item in files:
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
+def list_all_local_model_entries(base_model_dir: Path) -> Dict:
+    """List all local model folders/files under Models, not only HF downloads.
+
+    Entries are intentionally based on detected main GGUF files.  Projectors and
+    MTP/draft GGUF files are not shown as standalone models, but are included in
+    folder size and will be deleted when their model folder is deleted.
+    """
+    root = Path(base_model_dir)
+    result = {"root": str(root), "exists": root.exists(), "entries": [], "total_size": 0}
+    if not root.exists() or not root.is_dir():
+        return result
+
+    try:
+        ggufs = sorted(root.rglob("*.gguf"), key=lambda p: str(p).lower())
+    except OSError:
+        return result
+
+    grouped: Dict[Path, Dict] = {}
+    root_resolved = root.resolve()
+    for gguf in ggufs:
+        try:
+            if not gguf.is_file() or is_projector_file(gguf) or is_mtp_draft_file(gguf):
+                continue
+            gguf.relative_to(root_resolved)
+        except (OSError, ValueError):
+            continue
+
+        if gguf.parent.resolve() == root_resolved:
+            key = gguf.resolve()
+            entry_type = "file"
+            target = gguf
+        else:
+            key = gguf.parent.resolve()
+            entry_type = "folder"
+            target = gguf.parent
+
+        entry = grouped.setdefault(
+            key,
+            {
+                "type": entry_type,
+                "path": str(target),
+                "relative": target.resolve().relative_to(root_resolved).as_posix(),
+                "name": target.name,
+                "gguf_count": 0,
+                "examples": [],
+                "size": 0,
+                "size_text": "0 B",
+            },
+        )
+        entry["gguf_count"] += 1
+        if len(entry["examples"]) < 3:
+            entry["examples"].append(gguf.name)
+
+    entries = []
+    for entry in grouped.values():
+        target = Path(entry["path"])
+        size = _folder_size(target)
+        entry["size"] = size
+        entry["size_text"] = format_bytes(size)
+        result["total_size"] += size
+        entries.append(entry)
+    entries.sort(key=lambda item: str(item.get("relative", "")).lower())
+    result["entries"] = entries
     result["total_size_text"] = format_bytes(result["total_size"])
     return result
 

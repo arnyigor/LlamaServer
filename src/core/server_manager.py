@@ -1,10 +1,12 @@
 """Управление процессами llama-server и llama-bench."""
 
 import os
+import subprocess
 import sys
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 from src.core.constants import KILL_TIMEOUT_SERVER, KILL_TIMEOUT_BENCHMARK
+from src.utils.subprocess_utils import no_console_kwargs
 
 
 class ServerManager(QObject):
@@ -114,6 +116,8 @@ class ServerManager(QObject):
     def stop_server(self):
         if self.server_proc.state() != QProcess.ProcessState.NotRunning:
             if self.server_stop_requested:
+                self._emit("⛔ Stop pressed again: forcing llama-server shutdown...")
+                self.force_stop_server()
                 return
             self.server_stop_requested = True
             self._emit("⏹ Остановка сервера...")
@@ -124,12 +128,23 @@ class ServerManager(QObject):
         if self.server_proc.state() == QProcess.ProcessState.NotRunning:
             return
         self.server_stop_requested = True
-        self._emit("⛔ Force stop: принудительная остановка llama-server...")
+        self._emit("⛔ Force stop: killing llama-server process tree to free RAM/VRAM...")
         pid = int(self.server_proc.processId() or 0)
         if pid and sys.platform.startswith("win"):
-            QProcess.execute("taskkill", ["/PID", str(pid), "/T", "/F"])
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=8,
+                    check=False,
+                    **no_console_kwargs(),
+                )
+            except Exception:
+                pass
         if self.server_proc.state() != QProcess.ProcessState.NotRunning:
             self.server_proc.kill()
+        if self.server_proc.state() != QProcess.ProcessState.NotRunning:
+            self.server_proc.waitForFinished(2000)
 
     def _kill_server_if_needed(self):
         if self.server_proc.state() != QProcess.ProcessState.NotRunning:

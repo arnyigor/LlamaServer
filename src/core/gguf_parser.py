@@ -288,18 +288,19 @@ def detect_mtp_draft_for_model(path: Union[str, Path]) -> str:
         return ""
 
     roots = [model_path.parent]
-    for base in (model_path.parent, model_path.parent.parent):
-        if not base.exists():
-            continue
-        try:
-            for child in base.iterdir():
-                if not child.is_dir() or child in roots:
-                    continue
-                name = child.name.lower()
-                if any(token in name for token in ("mtp", "draft", "assistant")):
-                    roots.append(child)
-        except OSError:
-            continue
+    # Only search inside the selected model package/folder.  In LM Studio layout
+    # (<models>/<author>/<model>/<file>.gguf), model_path.parent.parent contains
+    # sibling model folders.  Searching there can accidentally pair Gemma with a
+    # Qwen MTP draft, which later crashes llama.cpp with an embedding mismatch.
+    try:
+        for child in model_path.parent.iterdir():
+            if not child.is_dir() or child in roots:
+                continue
+            name = child.name.lower()
+            if any(token in name for token in ("mtp", "draft", "assistant")):
+                roots.append(child)
+    except OSError:
+        pass
 
     candidates = []
     for root in roots:
