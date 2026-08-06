@@ -145,6 +145,7 @@ def _filter_duplicate_extra_args(
         "-fa",
         "-mm",
         "--mmproj",
+        "--chat-template-file",
     }
     bool_flags = {
         "--no-mmproj",
@@ -397,6 +398,9 @@ def build_args(
             args.append("--no-webui")
         if cfg.jinja:
             args.append("--jinja")
+        chat_template = str(getattr(cfg, "chat_template_file", "") or "").strip()
+        if getattr(cfg, "use_chat_template", False) and chat_template:
+            args += ["--chat-template-file", chat_template]
         args.append("--metrics")
 
     if cfg.extra_args.strip():

@@ -309,7 +309,9 @@ class MainWindowUI(QMainWindow):
         self.tokens_label = QLabel("Tokens: total 0 | task 0")
         self.tokens_label.setStyleSheet("font-family: Consolas; color: #dcdcaa;")
         self.request_tokens_label = QLabel("Request: -")
-        self.request_tokens_label.setStyleSheet("font-family: Consolas; color: #9cdcfe;")
+        self.request_tokens_label.setStyleSheet(
+            "font-family: Consolas; color: #9cdcfe;"
+        )
         self.tokens_saved_label = QLabel("Saved: 0")
         self.tokens_saved_label.setStyleSheet("color: #888;")
         self.tokens_reset_btn = QPushButton("Reset task tokens")
@@ -635,6 +637,25 @@ class MainWindowUI(QMainWindow):
             s3.addWidget(w)
         self.adv_panel.add_layout(s3)
 
+        s_tpl = QHBoxLayout()
+        self.use_chat_template = QCheckBox("--chat-template-file")
+        self.chat_template_file = QLineEdit(
+            placeholderText="Path to .jinja chat template"
+        )
+        self.chat_template_file.setToolTip(
+            "Override the model's built-in chat template with an external .jinja file. "
+            "Required for Qwen3.6 tool calls when using the relaxed template."
+        )
+        self.chat_template_btn = QPushButton("...")
+        self.chat_template_btn.setFixedWidth(32)
+        self.chat_template_btn.clicked.connect(
+            lambda _checked=False: self._browse_chat_template_clicked()
+        )
+        s_tpl.addWidget(self.use_chat_template)
+        s_tpl.addWidget(self.chat_template_file, 1)
+        s_tpl.addWidget(self.chat_template_btn)
+        self.adv_panel.add_layout(s_tpl)
+
         self.adv_panel.add_widget(QLabel("Extra params:"))
         self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
         self.adv_panel.add_widget(self.extra_args)
@@ -929,6 +950,9 @@ class MainWindowUI(QMainWindow):
         pass
 
     def _browse_pi_clicked(self):
+        pass
+
+    def _browse_chat_template_clicked(self):
         pass
 
     def current_config_target(self):

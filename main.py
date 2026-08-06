@@ -180,6 +180,8 @@ class LlamaGUI:
         u.mmproj_offload.stateChanged.connect(self._on_param_changed)
         u.extra_args.textChanged.connect(self._on_param_changed)
         u.jinja.stateChanged.connect(self._on_param_changed)
+        u.use_chat_template.stateChanged.connect(self._on_param_changed)
+        u.chat_template_file.textChanged.connect(self._on_param_changed)
         u.enable_thinking.currentIndexChanged.connect(self._on_param_changed)
         u.update_llama_btn.clicked.connect(self.update_llamacpp)
         u.cuda_version_combo.currentIndexChanged.connect(
@@ -199,6 +201,7 @@ class LlamaGUI:
         u._browse_model_dir_clicked = self.browse_model_dir
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
+        u._browse_chat_template_clicked = self.browse_chat_template
         u._browse_mtp_draft_clicked = self.browse_mtp_draft_model
         u.save_preset_btn.clicked.connect(self.save_preset)
         u.autotune_btn.clicked.connect(self.open_autotune_tab)
@@ -661,6 +664,22 @@ class LlamaGUI:
         if f:
             self.ui.spec_draft_model_path.setText(f)
             self.ui.speculative_mtp.setChecked(True)
+            self.save_settings()
+
+    def browse_chat_template(self):
+        start_dir = self.ui.model_dir.text().strip() or ""
+        current = self.ui.chat_template_file.text().strip()
+        if current:
+            start_dir = str(Path(current).parent)
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui,
+            "Select chat template (.jinja)",
+            start_dir,
+            "Jinja (*.jinja);;Text (*.txt);;All files (*.*)",
+        )
+        if f:
+            self.ui.chat_template_file.setText(f)
+            self.ui.use_chat_template.setChecked(True)
             self.save_settings()
 
     def auto_scan_models(self):

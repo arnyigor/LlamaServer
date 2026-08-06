@@ -77,6 +77,8 @@ class AppSettings:
     context_shift: bool = False
     no_webui: bool = False
     jinja: bool = False
+    use_chat_template: bool = False
+    chat_template_file: str = ""
     extra_args: str = ""
     enable_thinking: str = "off"
     cuda_version: str = "12"
@@ -139,6 +141,8 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "context_shift": "context_shift",
     "no_webui": "no_webui",
     "jinja": "jinja",
+    "use_chat_template": "use_chat_template",
+    "chat_template_file": "chat_template_file",
     "extra_args": "extra_args",
     "enable_thinking": "enable_thinking",
     "cuda_version": "cuda_version_combo",
@@ -244,6 +248,7 @@ _MANAGED_EXTRA_FLAGS = {
     "-md",
     "--model-draft",
     "--jinja",
+    "--chat-template-file",
     "--no-cache-prompt",
     "--flash-attn",
     "-fa",

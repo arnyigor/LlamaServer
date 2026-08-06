@@ -56,6 +56,8 @@ class MockConfig:
     no_webui: bool = False
     extra_args: str = ""
     jinja: bool = False
+    use_chat_template: bool = False
+    chat_template_file: str = ""
     temperature: float = -1.0
     repeat_penalty: float = -1.0
     use_mmproj: bool = True
@@ -292,6 +294,43 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.extra_args = "--metrics"
         args = build_args(self.cfg, self.model)
         self.assertEqual(args.count("--metrics"), 1)
+
+    def test_chat_template_enabled_adds_flag(self):
+        self.cfg.use_chat_template = True
+        self.cfg.chat_template_file = "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
+        args = build_args(self.cfg, self.model)
+        idx = args.index("--chat-template-file")
+        self.assertEqual(
+            args[idx + 1], "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
+        )
+
+    def test_chat_template_disabled_omits_flag(self):
+        self.cfg.use_chat_template = False
+        self.cfg.chat_template_file = "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--chat-template-file", args)
+
+    def test_chat_template_empty_path_omits_flag(self):
+        self.cfg.use_chat_template = True
+        self.cfg.chat_template_file = ""
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--chat-template-file", args)
+
+    def test_chat_template_omitted_for_benchmark(self):
+        self.cfg.use_chat_template = True
+        self.cfg.chat_template_file = "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
+        args = build_args(self.cfg, self.model, for_benchmark=True)
+        self.assertNotIn("--chat-template-file", args)
+
+    def test_chat_template_duplicate_from_extra_args_is_filtered(self):
+        """Флаг из Extra args не дублируется, когда управляется UI."""
+        self.cfg.use_chat_template = True
+        self.cfg.chat_template_file = "G:/templates/custom.jinja"
+        self.cfg.extra_args = "--chat-template-file /models/custom.jinja --top-p 0.9"
+        args = build_args(self.cfg, self.model)
+        self.assertEqual(args.count("--chat-template-file"), 1)
+        self.assertIn("--top-p", args)
+        self.assertIn("0.9", args)
 
 
 class TestValidateExtraArgs(unittest.TestCase):
