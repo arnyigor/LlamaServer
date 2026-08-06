@@ -1,10 +1,16 @@
-"""Тесты накопления токенов в main.py (счётчик prompt/generation).
+"""Тесты накопления токенов и активного времени в main.py.
 
 Регрессионные тесты на фикс: раньше `_accumulate_slot_tokens` останавливался
 навсегда после первого ненулевого /metrics (`_metrics_total_seen`), из-за чего
 generation-токены замирали на нуле (llama.cpp обновляет /metrics только по
 завершении запроса). Теперь дельты слотов накапливаются всегда, а /metrics
 используется только для догоняющей синхронизации вверх.
+
+Активное время модели: total — живая сумма интервалов /slots за запуск
+сервера; current — время текущего/последнего запроса, точное значение
+которого приходит из логов llama_print_timings. ВАЖНО: /metrics
+(*tokens_seconds) — это throughput (токены/сек), а не секунды, поэтому для
+времени он не используется.
 """
 
 import sys
@@ -33,6 +39,9 @@ def _make_gui() -> LlamaGUI:
     gui._saved_token_total = 0
     gui._active_prompt_s = 0.0
     gui._active_predicted_s = 0.0
+    gui._cur_prompt_s = 0.0
+    gui._cur_predicted_s = 0.0
+    gui._was_processing = False
     gui._last_poll_time = None
     gui.ui = MagicMock()
     gui.log_mgr = MagicMock()
@@ -188,7 +197,7 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertEqual(gui._saved_token_total, 1500)
 
     # ------------------------------------------------------------------
-    # Активное время работы модели (PP/TG)
+    # Активное время работы модели (PP/TG): total + current
     # ------------------------------------------------------------------
 
     def test_format_duration(self):
@@ -203,16 +212,18 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertEqual(format_duration(-5), "0:00")
 
     def test_active_time_ticks_while_processing(self):
-        """Интервалы опросов, пока слот обрабатывает, идут в активное время."""
+        """Интервалы опросов, пока слот обрабатывает, идут и в total, и в current."""
         gui = _make_gui()
         slot = _slot(0, decoded=0, processing=True)
         slot.predicted_per_second = 10.0
         with patch("main.time.monotonic", side_effect=[100.0, 100.5, 101.0, 101.5]):
-            gui._on_slot_metrics_updated([slot])  # last=None → только запоминаем
+            gui._on_slot_metrics_updated([slot])  # старт запроса: current сброшен
             gui._on_slot_metrics_updated([slot])  # dt=0.5 → TG
             gui._on_slot_metrics_updated([slot])  # dt=0.5 → TG
-        self.assertAlmostEqual(gui._active_predicted_s, 1.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 1.0)  # total
+        self.assertAlmostEqual(gui._cur_predicted_s, 1.0)  # current
         self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.0)
 
     def test_active_time_idle_not_counted(self):
         """Простой (idle-слоты) не увеличивает активное время."""
@@ -223,6 +234,8 @@ class TestTokenAccumulation(unittest.TestCase):
             gui._on_slot_metrics_updated([slot])
         self.assertAlmostEqual(gui._active_predicted_s, 0.0)
         self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.0)
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.0)
 
     def test_active_time_split_prompt_and_generation(self):
         """Одновременные PP и TG распределяются пропорционально скоростям."""
@@ -235,6 +248,8 @@ class TestTokenAccumulation(unittest.TestCase):
             gui._on_slot_metrics_updated([slot])  # dt=0.4 → PP 0.1, TG 0.3
         self.assertAlmostEqual(gui._active_prompt_s, 0.1)
         self.assertAlmostEqual(gui._active_predicted_s, 0.3)
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.1)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.3)
 
     def test_active_time_large_gap_not_counted(self):
         """Зазор опроса больше MAX_ACTIVE_TIME_DT — пауза, время не считаем."""
@@ -242,26 +257,68 @@ class TestTokenAccumulation(unittest.TestCase):
         slot = _slot(0, decoded=0, processing=True)
         slot.predicted_per_second = 10.0
         with patch("main.time.monotonic", side_effect=[100.0, 100.25, 110.0]):
-            gui._on_slot_metrics_updated([slot])  # 100.0, last=None
+            gui._on_slot_metrics_updated([slot])  # 100.0, старт запроса
             gui._on_slot_metrics_updated([slot])  # dt=0.25 → TG
             gui._on_slot_metrics_updated([slot])  # dt=9.75 > 5 → не считаем
         self.assertAlmostEqual(gui._active_predicted_s, 0.25)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.25)
 
-    def test_active_time_log_timing_catch_up_increases(self):
-        """llama_print_timings из логов догоняет активное время вверх."""
+    def test_current_time_reset_on_new_request(self):
+        """Переход idle → processing сбрасывает current (новый запрос)."""
+        gui = _make_gui()
+        gui._cur_prompt_s = 5.0
+        gui._cur_predicted_s = 3.0
+        gui._was_processing = False
+        slot = _slot(0, decoded=0, processing=True)
+        slot.predicted_per_second = 10.0
+        with patch("main.time.monotonic", side_effect=[100.0, 100.5]):
+            gui._on_slot_metrics_updated([slot])
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.0)
+
+    def test_current_time_keeps_accumulating_on_same_request(self):
+        """Пока слот processing, current не сбрасывается повторно."""
+        gui = _make_gui()
+        slot = _slot(0, decoded=0, processing=True)
+        slot.predicted_per_second = 10.0
+        with patch("main.time.monotonic", side_effect=[100.0, 100.5, 101.0]):
+            gui._on_slot_metrics_updated([slot])
+            gui._on_slot_metrics_updated([slot])  # dt=0.5
+        # current копился, не сброшен (processing всё время True)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.5)
+
+    def test_active_time_log_timing_sets_current(self):
+        """llama_print_timings из логов даёт точное значение current."""
         gui = _make_gui()
         gui._on_log_timing_updated(6.77, 1.30)
-        self.assertAlmostEqual(gui._active_prompt_s, 6.77)
-        self.assertAlmostEqual(gui._active_predicted_s, 1.30)
+        self.assertAlmostEqual(gui._cur_prompt_s, 6.77)
+        self.assertAlmostEqual(gui._cur_predicted_s, 1.30)
+        # total не затронут логами (остаётся живой суммой)
+        self.assertAlmostEqual(gui._active_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 0.0)
 
-    def test_active_time_log_timing_never_decreases(self):
-        """Логовое время не уменьшает активное время, накопленное живьём."""
+    def test_total_accumulates_across_requests(self):
+        """total копится между запросами, current показывает последний."""
         gui = _make_gui()
-        gui._active_prompt_s = 30.0
-        gui._active_predicted_s = 40.0
-        gui._on_log_timing_updated(6.77, 1.30)
-        self.assertAlmostEqual(gui._active_prompt_s, 30.0)
-        self.assertAlmostEqual(gui._active_predicted_s, 40.0)
+        s1 = _slot(0, decoded=0, processing=True)
+        s1.predicted_per_second = 10.0
+        idle = _slot(0, decoded=0, processing=False)
+        s2 = _slot(0, decoded=0, processing=True)
+        s2.predicted_per_second = 10.0
+        with patch(
+            "main.time.monotonic",
+            side_effect=[100.0, 100.5, 101.0, 101.5, 102.0],
+        ):
+            gui._on_slot_metrics_updated([s1])  # 100.0: старт запроса 1
+            gui._on_slot_metrics_updated([s1])  # 100.5: total 0.5, cur 0.5
+            gui._on_slot_metrics_updated([idle])  # 101.0: простой
+            gui._on_slot_metrics_updated([s2])  # 101.5: старт запроса 2 → cur сброс
+            gui._on_slot_metrics_updated([s2])  # 102.0: total 1.5, cur 1.0
+        # total = 0.5 (запрос 1) + 0.5 + 0.5 (запрос 2, включая интервал
+        # после idle-опроса, т.к. точный момент старта неизвестен)
+        self.assertAlmostEqual(gui._active_predicted_s, 1.5)
+        # current = время запроса 2 (после сброса) = 0.5 + 0.5
+        self.assertAlmostEqual(gui._cur_predicted_s, 1.0)
 
     def test_active_time_metrics_seconds_not_used(self):
         """/metrics prompt_tokens_seconds — throughput (токены/сек), а не
@@ -298,7 +355,7 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertIsNone(_PP_TIME_PATTERN.search(line_tg))
 
     def test_active_time_label_format(self):
-        """Лейбл активного времени: Active: total (PP pp | TG tg)."""
+        """Лейбл Active (total): Active: total (PP pp | TG tg)."""
         gui = _make_gui()
         gui._active_prompt_s = 125
         gui._active_predicted_s = 7235
@@ -308,16 +365,34 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertIn("2:00:35", text)  # TG
         self.assertIn("2:05", text)  # PP
 
+    def test_current_time_label_format(self):
+        """Лейбл Current: Current: total (PP pp | TG tg)."""
+        gui = _make_gui()
+        gui._cur_prompt_s = 6.77
+        gui._cur_predicted_s = 1.30
+        gui._refresh_current_time_label()
+        text = gui.ui.current_time_label.setText.call_args[0][0]
+        self.assertIn("Current", text)
+        self.assertIn("0:08", text)  # total = 6.77+1.30 = 8.07 → 0:08
+        self.assertIn("0:07", text)  # PP 6.77 → 0:07
+        self.assertIn("0:01", text)  # TG 1.30 → 0:01
+
     def test_start_metrics_polling_resets_active_time(self):
-        """Каждый старт сервера сбрасывает активное время."""
+        """Каждый старт сервера сбрасывает total и current время."""
         gui = _make_gui()
         gui.metrics = MagicMock()
         gui._active_prompt_s = 10.0
         gui._active_predicted_s = 20.0
+        gui._cur_prompt_s = 5.0
+        gui._cur_predicted_s = 3.0
+        gui._was_processing = True
         gui._last_poll_time = 5.0
         gui._start_metrics_polling()
         self.assertAlmostEqual(gui._active_prompt_s, 0.0)
         self.assertAlmostEqual(gui._active_predicted_s, 0.0)
+        self.assertAlmostEqual(gui._cur_prompt_s, 0.0)
+        self.assertAlmostEqual(gui._cur_predicted_s, 0.0)
+        self.assertFalse(gui._was_processing)
         self.assertIsNone(gui._last_poll_time)
 
 

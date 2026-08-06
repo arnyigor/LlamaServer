@@ -322,9 +322,17 @@ class MainWindowUI(QMainWindow):
         self.active_time_label.setTextFormat(Qt.RichText)
         self.active_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
         self.active_time_label.setToolTip(
-            "Суммарное время работы модели: prompt processing (PP) + "
-            "token generation (TG). Простой и ожидание в очереди не считаются. "
-            "Сбрасывается при каждом старте сервера."
+            "Active — суммарное время работы модели (prompt processing + "
+            "token generation) с момента старта сервера. Простой и ожидание "
+            "в очереди не считаются. Сбрасывается при каждом старте сервера."
+        )
+        self.current_time_label = QLabel("Current: 0:00 (PP 0:00 | TG 0:00)")
+        self.current_time_label.setTextFormat(Qt.RichText)
+        self.current_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
+        self.current_time_label.setToolTip(
+            "Current — время последнего запроса (prompt processing + "
+            "token generation). Точное значение приходит из llama_print_timings "
+            "по завершении запроса."
         )
         self.tokens_reset_btn = QPushButton("Reset task tokens")
         self.tokens_reset_btn.setToolTip(
@@ -335,6 +343,7 @@ class MainWindowUI(QMainWindow):
         stats.addWidget(self.request_tokens_label, 2, 0)
         stats.addWidget(self.tokens_saved_label, 2, 1)
         stats.addWidget(self.active_time_label, 3, 0, 1, 2)
+        stats.addWidget(self.current_time_label, 4, 0, 1, 2)
         stats.addWidget(self.tokens_reset_btn, 0, 2, 3, 1)
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)

@@ -113,13 +113,17 @@ class LlamaGUI:
         # llama.cpp обновляет их лишь по завершении запросов.
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
-        # Активное время работы модели (секунды PP/TG). Живой подсчёт —
-        # интервалы опросов /slots, пока хоть один слот обрабатывает; точный
-        # "догоняющий" источник — llama_print_timings из логов (по завершении
-        # запроса). /metrics для этого не годится (его *tokens_seconds — это
+        # Активное время работы модели (секунды PP/TG).
+        #   _active_*    — total: сумма интервалов /slots за запуск сервера;
+        #   _cur_*       — current: время текущего/последнего запроса
+        #                  (точное значение приходит из llama_print_timings).
+        # /metrics для времени не годится (его *tokens_seconds — это
         # throughput, а не длительность).
         self._active_prompt_s = 0.0
         self._active_predicted_s = 0.0
+        self._cur_prompt_s = 0.0
+        self._cur_predicted_s = 0.0
+        self._was_processing = False
         self._last_poll_time = None
 
         self.config.load()
@@ -266,14 +270,12 @@ class LlamaGUI:
         self.ui.speed_label.setText(text)
 
     def _on_log_timing_updated(self, pp_seconds: float, tg_seconds: float):
-        # Точное активное время из llama_print_timings (по завершении запроса).
-        # Догоняем только вверх: живой подсчёт по /slots недооценивает
-        # (теряет первый интервал опроса запроса).
-        if pp_seconds > self._active_prompt_s:
-            self._active_prompt_s = pp_seconds
-        if tg_seconds > self._active_predicted_s:
-            self._active_predicted_s = tg_seconds
-        self._refresh_active_time_label()
+        # Точное время завершённого запроса из llama_print_timings — им
+        # заменяем current (живой подсчёт теряет первый интервал опроса).
+        # Total остаётся живой суммой интервалов /slots.
+        self._cur_prompt_s = pp_seconds
+        self._cur_predicted_s = tg_seconds
+        self._refresh_current_time_label()
 
     def _start_metrics_polling(self):
         self.metrics.set_url(self._server_metrics_url())
@@ -284,8 +286,12 @@ class LlamaGUI:
         self._metrics_predicted_total = 0
         self._active_prompt_s = 0.0
         self._active_predicted_s = 0.0
+        self._cur_prompt_s = 0.0
+        self._cur_predicted_s = 0.0
+        self._was_processing = False
         self._last_poll_time = None
         self._refresh_active_time_label()
+        self._refresh_current_time_label()
         self.metrics.start()
         self.ui.speed_label.setText("Speed: waiting for /slots...")
         self.ui.request_tokens_label.setText("Request: -")
@@ -321,29 +327,33 @@ class LlamaGUI:
             )
         )
 
-    def _refresh_active_time_label(self):
-        """Отрисовка строки активного времени: Active: X (PP Y | TG Z)."""
+    def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
+        """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
         inner = (
             f'<span style="color:{STAT_COLOR_CAPTION};">(</span>'
             + stat_sep().join(
                 [
-                    stat_kv(
-                        "PP",
-                        format_duration(self._active_prompt_s),
-                        STAT_COLOR_PROMPT,
-                    ),
-                    stat_kv(
-                        "TG",
-                        format_duration(self._active_predicted_s),
-                        STAT_COLOR_GENERATED,
-                    ),
+                    stat_kv("PP", format_duration(pp_s), STAT_COLOR_PROMPT),
+                    stat_kv("TG", format_duration(tg_s), STAT_COLOR_GENERATED),
                 ]
             )
             + f'<span style="color:{STAT_COLOR_CAPTION};">)</span>'
         )
-        total = self._active_prompt_s + self._active_predicted_s
+        total = pp_s + tg_s
+        return stat_kv(caption, format_duration(total), STAT_COLOR_TIME) + " " + inner
+
+    def _refresh_active_time_label(self):
+        """Отрисовка total активного времени (сумма за запуск сервера)."""
         self.ui.active_time_label.setText(
-            stat_kv("Active", format_duration(total), STAT_COLOR_TIME) + " " + inner
+            self._time_row_html(
+                "Active", self._active_prompt_s, self._active_predicted_s
+            )
+        )
+
+    def _refresh_current_time_label(self):
+        """Отрисовка времени текущего/последнего запроса."""
+        self.ui.current_time_label.setText(
+            self._time_row_html("Current", self._cur_prompt_s, self._cur_predicted_s)
         )
 
     def _accumulate_active_time(self, dt: float, active):
@@ -351,7 +361,8 @@ class LlamaGUI:
 
         dt — время между двумя последовательными опросами /slots, когда
         активен хотя бы один слот. Распределение между PP и TG — по долям
-        мгновенных скоростей; точную разбивку потом даёт /metrics.
+        мгновенных скоростей; точную разбивку завершённого запроса потом
+        дают логи llama_print_timings (для current).
         """
         prompt_speed = sum(
             max(float(getattr(slot, "prompt_per_second", 0.0) or 0.0), 0.0)
@@ -363,15 +374,22 @@ class LlamaGUI:
         )
         if prompt_speed > 0 and predicted_speed > 0:
             total_speed = prompt_speed + predicted_speed
-            self._active_prompt_s += dt * prompt_speed / total_speed
-            self._active_predicted_s += dt * predicted_speed / total_speed
+            dt_pp = dt * prompt_speed / total_speed
+            dt_tg = dt * predicted_speed / total_speed
         elif predicted_speed > 0:
-            self._active_predicted_s += dt
+            dt_pp, dt_tg = 0.0, dt
         elif prompt_speed > 0:
-            self._active_prompt_s += dt
-        # Иначе скорость ещё не измерилась (первый опрос запроса): интервал
-        # пропускаем — /metrics по завершении запроса догонит точным значением.
+            dt_pp, dt_tg = dt, 0.0
+        else:
+            # Скорость ещё не измерилась (первый опрос запроса): интервал
+            # пропускаем — current получит точное значение из логов.
+            return
+        self._active_prompt_s += dt_pp
+        self._active_predicted_s += dt_tg
+        self._cur_prompt_s += dt_pp
+        self._cur_predicted_s += dt_tg
         self._refresh_active_time_label()
+        self._refresh_current_time_label()
 
     def _apply_metrics_catch_up(self):
         """Синхронизация счётчиков с /metrics — только вверх.
@@ -427,9 +445,16 @@ class LlamaGUI:
     def _on_slot_metrics_updated(self, slots):
         # Активное время: интервалы опросов, пока хоть один слот обрабатывает.
         # Большой зазор между опросами (> MAX_ACTIVE_TIME_DT) — пауза/простой,
-        # его не считаем: точный /metrics догонит по завершении запроса.
+        # его не считаем: точный current приходит из логов llama_print_timings.
         now = time.monotonic()
         active = [slot for slot in slots if getattr(slot, "is_processing", False)]
+        if active and not self._was_processing:
+            # Переход idle → processing: начался новый запрос, время текущего
+            # запроса обнуляется.
+            self._cur_prompt_s = 0.0
+            self._cur_predicted_s = 0.0
+            self._refresh_current_time_label()
+        self._was_processing = bool(active)
         if self._last_poll_time is not None and active:
             dt = max(now - self._last_poll_time, 0.0)
             if dt <= MAX_ACTIVE_TIME_DT:
