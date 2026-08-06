@@ -247,27 +247,55 @@ class TestTokenAccumulation(unittest.TestCase):
             gui._on_slot_metrics_updated([slot])  # dt=9.75 > 5 → не считаем
         self.assertAlmostEqual(gui._active_predicted_s, 0.25)
 
-    def test_active_time_metrics_catch_up_increases(self):
-        """/metrics догоняет активное время вверх (точные секунды)."""
+    def test_active_time_log_timing_catch_up_increases(self):
+        """llama_print_timings из логов догоняет активное время вверх."""
         gui = _make_gui()
-        m = _metrics(100, 50)
-        m.prompt_tokens_seconds = 10.0
-        m.predicted_tokens_seconds = 20.0
-        gui._on_server_metrics_updated(m)
-        self.assertAlmostEqual(gui._active_prompt_s, 10.0)
-        self.assertAlmostEqual(gui._active_predicted_s, 20.0)
+        gui._on_log_timing_updated(6.77, 1.30)
+        self.assertAlmostEqual(gui._active_prompt_s, 6.77)
+        self.assertAlmostEqual(gui._active_predicted_s, 1.30)
 
-    def test_active_time_metrics_never_decreases(self):
-        """/metrics не уменьшает активное время, уже накопленное живьём."""
+    def test_active_time_log_timing_never_decreases(self):
+        """Логовое время не уменьшает активное время, накопленное живьём."""
         gui = _make_gui()
         gui._active_prompt_s = 30.0
         gui._active_predicted_s = 40.0
-        m = _metrics(100, 50)
-        m.prompt_tokens_seconds = 10.0
-        m.predicted_tokens_seconds = 20.0
-        gui._on_server_metrics_updated(m)
+        gui._on_log_timing_updated(6.77, 1.30)
         self.assertAlmostEqual(gui._active_prompt_s, 30.0)
         self.assertAlmostEqual(gui._active_predicted_s, 40.0)
+
+    def test_active_time_metrics_seconds_not_used(self):
+        """/metrics prompt_tokens_seconds — throughput (токены/сек), а не
+        секунды: он не должен затирать живое активное время."""
+        gui = _make_gui()
+        gui._active_prompt_s = 6.0
+        m = _metrics(100, 50)
+        m.prompt_tokens_seconds = 1154.77  # фактически токены/сек PP
+        m.predicted_tokens_seconds = 41.5  # фактически токены/сек TG
+        gui._on_server_metrics_updated(m)
+        self.assertAlmostEqual(gui._active_prompt_s, 6.0)
+        self.assertAlmostEqual(gui._active_predicted_s, 0.0)
+
+    def test_log_timing_patterns(self):
+        """Паттерны извлекают время PP/TG из llama_print_timings (мс)."""
+        from src.ui.log_manager import _PP_TIME_PATTERN, _TG_TIME_PATTERN
+
+        line_pp = (
+            "0.34.820.765 I slot print_timing: id  0 | task 97 | "
+            "prompt eval time =    6770.15 ms /  7818 tokens"
+        )
+        line_tg = (
+            "0.34.820.770 I slot print_timing: id  0 | task 97 | "
+            "eval time =    1301.15 ms /    54 tokens"
+        )
+        m = _PP_TIME_PATTERN.search(line_pp)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "6770.15")
+        m = _TG_TIME_PATTERN.search(line_tg)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "1301.15")
+        # "prompt eval time" не должен матчиться как TG
+        self.assertIsNone(_TG_TIME_PATTERN.search(line_pp))
+        self.assertIsNone(_PP_TIME_PATTERN.search(line_tg))
 
     def test_active_time_label_format(self):
         """Лейбл активного времени: Active: total (PP pp | TG tg)."""

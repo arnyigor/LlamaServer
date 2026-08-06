@@ -93,6 +93,7 @@ class LlamaGUI:
 
         self.log_mgr = LogManager(self.ui.logs)
         self.log_mgr.speed_updated.connect(self._on_log_speed_updated)
+        self.log_mgr.timing_updated.connect(self._on_log_timing_updated)
         self.ui.autoscroll_logs.toggled.connect(
             lambda checked: setattr(self.log_mgr, "autoscroll", checked)
         )
@@ -113,9 +114,10 @@ class LlamaGUI:
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
         # Активное время работы модели (секунды PP/TG). Живой подсчёт —
-        # интервалы опросов /slots, пока хоть один слот обрабатывает; /metrics
-        # (llamacpp:prompt_tokens_seconds / predicted_tokens_seconds) — точный
-        # "догоняющий" источник (llama.cpp обновляет его по завершении запроса).
+        # интервалы опросов /slots, пока хоть один слот обрабатывает; точный
+        # "догоняющий" источник — llama_print_timings из логов (по завершении
+        # запроса). /metrics для этого не годится (его *tokens_seconds — это
+        # throughput, а не длительность).
         self._active_prompt_s = 0.0
         self._active_predicted_s = 0.0
         self._last_poll_time = None
@@ -262,6 +264,16 @@ class LlamaGUI:
         # (теряют хвост генерации и включают время HTTP-опроса), поэтому
         # когда есть замер из логов — показываем именно его.
         self.ui.speed_label.setText(text)
+
+    def _on_log_timing_updated(self, pp_seconds: float, tg_seconds: float):
+        # Точное активное время из llama_print_timings (по завершении запроса).
+        # Догоняем только вверх: живой подсчёт по /slots недооценивает
+        # (теряет первый интервал опроса запроса).
+        if pp_seconds > self._active_prompt_s:
+            self._active_prompt_s = pp_seconds
+        if tg_seconds > self._active_predicted_s:
+            self._active_predicted_s = tg_seconds
+        self._refresh_active_time_label()
 
     def _start_metrics_polling(self):
         self.metrics.set_url(self._server_metrics_url())
@@ -497,18 +509,9 @@ class LlamaGUI:
         if total < self._token_baseline_total:
             self._token_baseline_total = 0
         self._apply_metrics_catch_up()
-        # Точное активное время из /metrics: llama.cpp суммирует секунды
-        # prompt_eval / decode по завершении запросов, поэтому используем их
-        # как "догоняющий" источник — только вверх.
-        prompt_seconds = float(getattr(metrics, "prompt_tokens_seconds", 0.0) or 0.0)
-        predicted_seconds = float(
-            getattr(metrics, "predicted_tokens_seconds", 0.0) or 0.0
-        )
-        if prompt_seconds > self._active_prompt_s:
-            self._active_prompt_s = prompt_seconds
-        if predicted_seconds > self._active_predicted_s:
-            self._active_predicted_s = predicted_seconds
-        self._refresh_active_time_label()
+        # НЕ используем llamacpp:prompt_tokens_seconds / predicted_tokens_seconds
+        # из /metrics как длительность: это throughput (токены/сек), а не время.
+        # Точное время PP/TG берём из логов llama_print_timings.
         self._latest_prompt_total = self._slot_prompt_total
         self._latest_predicted_total = self._slot_predicted_total
         self._latest_token_total = (

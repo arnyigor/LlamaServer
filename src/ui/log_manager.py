@@ -60,6 +60,13 @@ _TG_SPEED_PATTERN = re.compile(
     re.I,
 )
 
+# Точное время этапов завершённого запроса из llama_print_timings (мс).
+# ВНИМАНИЕ: нельзя брать секунды из /metrics (llamacpp:prompt_tokens_seconds
+# / predicted_tokens_seconds) — это throughput в токенах/сек (n_tokens / t_sec),
+# а не длительность.
+_PP_TIME_PATTERN = re.compile(r"prompt eval time\s*=\s*(\d+(?:\.\d+)?)\s*ms", re.I)
+_TG_TIME_PATTERN = re.compile(r"(?<!prompt )eval time\s*=\s*(\d+(?:\.\d+)?)\s*ms", re.I)
+
 
 @lru_cache(maxsize=64)
 def _get_format_cached(level: str, content_key: str) -> QTextCharFormat:
@@ -86,6 +93,9 @@ class LogManager(QObject):
     """Менеджер логов с буферизацией и ограничением памяти."""
 
     speed_updated = Signal(str)
+    # Точное время (секунды) prompt processing / generation завершённого
+    # запроса из llama_print_timings. Эмитится, когда известны оба значения.
+    timing_updated = Signal(float, float)
 
     _MAX_BUFFER = 500
 
@@ -103,6 +113,8 @@ class LogManager(QObject):
         self._autoscroll = True
         self._pp_speed: Optional[float] = None
         self._tg_speed: Optional[float] = None
+        self._pp_time: Optional[float] = None
+        self._tg_time: Optional[float] = None
 
         sb = text_edit.verticalScrollBar()
         sb.sliderPressed.connect(self._on_user_scroll)
@@ -142,6 +154,8 @@ class LogManager(QObject):
         self._line_count = 0
         self._pp_speed = None
         self._tg_speed = None
+        self._pp_time = None
+        self._tg_time = None
         self.speed_updated.emit("Speed: -")
 
     def stop(self) -> None:
@@ -218,6 +232,27 @@ class LogManager(QObject):
 
         if changed:
             self._emit_speed()
+
+        # Точное время этапов из llama_print_timings — "догоняющий" источник
+        # для активного времени в Runtime stats. Храним только вверх: замеры
+        # приходят по завершении каждого запроса и время не убывает.
+        timing_changed = False
+        pp_time_match = _PP_TIME_PATTERN.search(text)
+        if pp_time_match:
+            new_pp_time = float(pp_time_match.group(1)) / 1000.0
+            if self._pp_time is None or new_pp_time > self._pp_time:
+                self._pp_time = new_pp_time
+                timing_changed = True
+
+        tg_time_match = _TG_TIME_PATTERN.search(text)
+        if tg_time_match:
+            new_tg_time = float(tg_time_match.group(1)) / 1000.0
+            if self._tg_time is None or new_tg_time > self._tg_time:
+                self._tg_time = new_tg_time
+                timing_changed = True
+
+        if timing_changed and self._pp_time is not None and self._tg_time is not None:
+            self.timing_updated.emit(self._pp_time, self._tg_time)
 
     def _emit_speed(self) -> None:
         parts = []
