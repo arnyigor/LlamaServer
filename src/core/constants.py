@@ -67,15 +67,15 @@ DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
 # Форматирование Runtime stats (токены/скорость)
 # ============================================================================
 
-# Цвета на тёмном фоне (~#1e1e1e): подписи серые, значения яркие и разные
-# по смыслу, чтобы цифры было легко сканировать.
-STAT_COLOR_CAPTION = "#9a9a9a"
-STAT_COLOR_SEP = "#555555"
-STAT_COLOR_TOTAL = "#ffffff"
-STAT_COLOR_TASK = "#ffcc66"
-STAT_COLOR_PROMPT = "#4fc1ff"
-STAT_COLOR_GENERATED = "#6bff8f"
-STAT_COLOR_SAVED = "#b0b0b0"
+# Палитра для СВЕТЛОГО фона (дефолтный серый Windows ~#f0f0f0):
+# подписи и значения тёмные и насыщенные, чтобы читались на сером.
+STAT_COLOR_CAPTION = "#1a1a1a"
+STAT_COLOR_SEP = "#909090"
+STAT_COLOR_TOTAL = "#000000"
+STAT_COLOR_TASK = "#b35c00"
+STAT_COLOR_PROMPT = "#0b6ac2"
+STAT_COLOR_GENERATED = "#1e7e34"
+STAT_COLOR_SAVED = "#3a3a3a"
 
 
 def format_speed(value) -> str:
@@ -91,9 +91,14 @@ def format_speed(value) -> str:
 
 
 def stat_kv(caption: str, value: str, color: str = STAT_COLOR_TOTAL) -> str:
-    """HTML-пара 'подпись значение' для Runtime stats."""
+    """HTML-пара 'подпись значение' для Runtime stats.
+
+    Подписи жирные и тёмные — обязательное условие читаемости на светлом
+    фоне (пользовательские жалобы на невидимые подписи при сером фоне).
+    """
     return (
-        f'<span style="color:{STAT_COLOR_CAPTION}">{caption}</span> '
+        f'<span style="color:{STAT_COLOR_CAPTION}; font-weight:bold;">'
+        f"{caption}</span> "
         f'<span style="color:{color}; font-weight:bold;">{value}</span>'
     )
 
