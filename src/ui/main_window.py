@@ -373,7 +373,7 @@ class MainWindowUI(QMainWindow):
             "token generation). Точное значение приходит из llama_print_timings "
             "по завершении запроса."
         )
-        self.tokens_reset_btn = QPushButton("Reset task")
+        self.tokens_reset_btn = QPushButton("Save task & reset")
         self.tokens_reset_btn.setToolTip(
             "Save current task token count to Saved and start the next task from zero. "
             "Resets the task counter, Current time and Request label."
@@ -387,19 +387,23 @@ class MainWindowUI(QMainWindow):
         self.reset_saved_btn.setToolTip(
             "Zero the accumulated Saved history (last and total)."
         )
-        stats_btns = QVBoxLayout()
-        stats_btns.setSpacing(6)
-        stats_btns.addWidget(self.tokens_reset_btn)
-        stats_btns.addWidget(self.reset_session_btn)
-        stats_btns.addWidget(self.reset_saved_btn)
-        stats_btns.addStretch(1)
-        stats.addWidget(self.speed_label, 0, 0, 1, 2)
+        for btn in [
+            self.tokens_reset_btn,
+            self.reset_session_btn,
+            self.reset_saved_btn,
+        ]:
+            btn.setMinimumWidth(120)
+            btn.setMaximumWidth(150)
+
+        stats.addWidget(self.speed_label, 0, 0, 1, 3)
         stats.addWidget(self.tokens_label, 1, 0, 1, 2)
+        stats.addWidget(self.tokens_reset_btn, 1, 2)
         stats.addWidget(self.request_tokens_label, 2, 0)
         stats.addWidget(self.tokens_saved_label, 2, 1)
+        stats.addWidget(self.reset_saved_btn, 2, 2)
         stats.addWidget(self.active_time_label, 3, 0, 1, 2)
-        stats.addWidget(self.current_time_label, 4, 0, 1, 2)
-        stats.addLayout(stats_btns, 0, 2, 5, 1)
+        stats.addWidget(self.reset_session_btn, 3, 2)
+        stats.addWidget(self.current_time_label, 4, 0, 1, 3)
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)
 
