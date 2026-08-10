@@ -900,6 +900,9 @@ class LlamaGUI:
         self.log_mgr.append(
             f"Preset saved: {os.path.basename(model_path)} | ctx={ctx:,}"
         )
+        if hasattr(self.ui, "preset_status"):
+            self.ui.preset_status.setText(f"Preset: saved ctx={ctx:,}")
+            self.ui.preset_status.setStyleSheet("color: #4CAF50;")
         QMessageBox.information(
             self.ui,
             "Saved",
@@ -936,6 +939,15 @@ class LlamaGUI:
 
         self.update_cli_preview()
         return True
+
+    def _mark_preset_modified(self):
+        label = getattr(self.ui, "preset_status", None)
+        if label is None:
+            return
+        text = label.text()
+        if text.startswith("Preset: loaded") or text.startswith("Preset: saved"):
+            label.setText("Preset: modified")
+            label.setStyleSheet("color: #FF9800;")
 
     def auto_detect_bench(self):
         bench = self._resolve_llamacpp_executable("bench")
@@ -1922,6 +1934,7 @@ class LlamaGUI:
             preset_loaded = self._try_load_perf_preset(model_path, ctx_size)
 
         if not preset_loaded:
+            self._mark_preset_modified()
             self.update_cli_preview()
 
         self._mark_restart_needed()
@@ -1934,6 +1947,7 @@ class LlamaGUI:
         if info:
             self._refresh_tooltips(info)
 
+        self._mark_preset_modified()
         self.update_cli_preview()
         self._mark_restart_needed()
 
@@ -1946,6 +1960,7 @@ class LlamaGUI:
         if info:
             self._refresh_tooltips(info)
 
+        self._mark_preset_modified()
         self.update_cli_preview()
         self._mark_restart_needed()
 
