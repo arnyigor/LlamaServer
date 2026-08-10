@@ -489,11 +489,6 @@ class MainWindowUI(QMainWindow):
         launch.addLayout(r2)
         launch.addLayout(r1)
 
-        r2b = QHBoxLayout()
-        r2b.addWidget(self.save_preset_btn)
-        r2b.addWidget(self.preset_status, 1)
-        launch.addLayout(r2b)
-
         self.batch_size = QSpinBox()
         self.batch_size.setRange(-1, 32768)
         self.batch_size.setSingleStep(128)
@@ -504,10 +499,22 @@ class MainWindowUI(QMainWindow):
         self.ubatch_size.setSingleStep(64)
         self.ubatch_size.setValue(-1)
         self.ubatch_size.setSpecialValueText("auto")
+
+        self.cache_type_k = QComboBox()
+        self.cache_type_v = QComboBox()
+        for ct in ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]:
+            self.cache_type_k.addItem(ct)
+            self.cache_type_v.addItem(ct)
+
         r3 = QHBoxLayout()
-        r3.addWidget(QLabel("Batch / UBatch (-b / -ub):"))
+        r3.addWidget(QLabel("Batch / UBatch:"))
         r3.addWidget(self.batch_size)
         r3.addWidget(self.ubatch_size)
+        r3.addSpacing(12)
+        r3.addWidget(QLabel("KV K / V:"))
+        r3.addWidget(self.cache_type_k)
+        r3.addWidget(self.cache_type_v)
+        r3.addStretch(1)
         launch.addLayout(r3)
 
         self.threads = QSpinBox()
@@ -526,17 +533,6 @@ class MainWindowUI(QMainWindow):
         lperf.addWidget(perf_header)
         lperf.addLayout(r4)
 
-        self.cache_type_k = QComboBox()
-        self.cache_type_v = QComboBox()
-        for ct in ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]:
-            self.cache_type_k.addItem(ct)
-            self.cache_type_v.addItem(ct)
-        r5 = QHBoxLayout()
-        r5.addWidget(QLabel("KV Cache K / V (-ctk / -ctv):"))
-        r5.addWidget(self.cache_type_k)
-        r5.addWidget(self.cache_type_v)
-        launch.addLayout(r5)
-
         self.flash_attn = QCheckBox("Flash Attention (-fa)")
         self.flash_attn.setChecked(True)
         self.fit_off = QCheckBox("Fit off (--fit off)")
@@ -544,6 +540,9 @@ class MainWindowUI(QMainWindow):
         r6 = QHBoxLayout()
         r6.addWidget(self.flash_attn)
         r6.addWidget(self.fit_off)
+        r6.addStretch(1)
+        r6.addWidget(self.save_preset_btn)
+        r6.addWidget(self.preset_status)
         launch.addLayout(r6)
 
         self.reasoning_mode = QComboBox()
