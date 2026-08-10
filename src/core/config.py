@@ -597,6 +597,40 @@ class ConfigManager:
         s.integration_target = ui.current_config_target()
         s.last_model_path = ui.model_combo.currentData() or s.last_model_path
 
+    def apply_values_to_ui(self, ui: Any, values: Dict[str, Any]) -> None:
+        """Apply parsed setting values to AppSettings and matching UI widgets."""
+        valid_fields = {f.name: f for f in fields(AppSettings)}
+        for field_name, raw_value in dict(values or {}).items():
+            field_def = valid_fields.get(field_name)
+            if field_def is None:
+                continue
+
+            value = raw_value
+            try:
+                if field_name == "extra_args":
+                    value = _sanitize_extra_args(value)
+                if field_def.type is bool:
+                    value = _coerce_bool(value)
+                elif field_def.type is int:
+                    value = int(value)
+                elif field_def.type is float:
+                    value = float(value)
+                elif field_name == "enable_thinking":
+                    value = _normalize_enable_thinking(value)
+                elif field_def.type is str:
+                    value = str(value)
+            except (TypeError, ValueError):
+                continue
+
+            setattr(self.settings, field_name, value)
+            widget_attr = _FIELD_WIDGET_MAP.get(field_name)
+            widget = getattr(ui, widget_attr, None) if widget_attr else None
+            if widget is not None:
+                try:
+                    _widget_set(widget, value)
+                except (TypeError, ValueError):
+                    pass
+
     def save_profile(self, name: str, ui: Any) -> None:
         """Сохранение текущих настроек как профиля."""
         self.read_from_ui(ui)

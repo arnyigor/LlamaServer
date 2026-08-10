@@ -842,14 +842,31 @@ class MainWindowUI(QMainWindow):
 
         # === 7. Preview CLI ===
         g_cli = QGroupBox("CLI Preview")
+        cli_layout = QVBoxLayout()
+        cli_controls = QHBoxLayout()
+        self.cli_manual_mode = QCheckBox("Edit CLI")
+        self.cli_manual_mode.setToolTip(
+            "Enable direct command editing. Apply CLI parses known flags back into UI and keeps unknown flags in Extra params."
+        )
+        self.cli_apply_btn = QPushButton("Apply CLI")
+        self.cli_apply_btn.setEnabled(False)
+        self.cli_apply_btn.setToolTip(
+            "Parse the edited command: known flags update UI controls, unknown flags go to Extra params."
+        )
+        self.cli_status = QLabel("Generated from UI")
+        self.cli_status.setStyleSheet("color: #888;")
+        cli_controls.addWidget(self.cli_manual_mode)
+        cli_controls.addWidget(self.cli_apply_btn)
+        cli_controls.addWidget(self.cli_status, 1)
         self.cli_preview = QLineEdit(
             placeholderText="Command will be displayed here...", readOnly=True
         )
         self.cli_preview.setStyleSheet(
             "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
         )
-        g_cli.setLayout(QVBoxLayout())
-        g_cli.layout().addWidget(self.cli_preview)
+        g_cli.setLayout(cli_layout)
+        cli_layout.addLayout(cli_controls)
+        cli_layout.addWidget(self.cli_preview)
 
         # === 8. Итоговый порядок блоков ===
         lay.addWidget(self.paths_panel)
@@ -914,6 +931,8 @@ class MainWindowUI(QMainWindow):
             self.bench_prompt,
             self.bench_gen,
             self.save_preset_btn,
+            self.cli_manual_mode,
+            self.cli_apply_btn,
         ]
         self._runtime_lockable.extend(getattr(self, "ctx_quick_buttons", []))
 

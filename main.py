@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
+from src.core.cli_parser import parse_llama_server_command
 from src.core.config import ConfigManager
 from src.core.constants import (
     MAX_ACTIVE_TIME_DT,
@@ -236,6 +237,8 @@ class LlamaGUI:
         u.exe_path.textChanged.connect(self.auto_detect_bench)
         u.exe_path.textChanged.connect(self.update_cli_preview)
         u.copy_model_btn.clicked.connect(self._copy_model_path)
+        u.cli_manual_mode.toggled.connect(self._on_cli_manual_mode_toggled)
+        u.cli_apply_btn.clicked.connect(self.apply_cli_preview)
         u._browse_exe_clicked = self.browse_exe
         u._browse_bench_clicked = self.browse_bench
         u._browse_model_dir_clicked = self.browse_model_dir
@@ -1892,7 +1895,11 @@ class LlamaGUI:
             self.ui.ctx_size.setValue(ctx_size)
 
     def on_ctx_changed(self, ctx_size):
-        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+        if (
+            getattr(self, "_loading_preset", False)
+            or getattr(self, "_applying_cli", False)
+            or self.ui.loading_profile
+        ):
             return
 
         self._autotune_best_applied = False
@@ -1940,7 +1947,11 @@ class LlamaGUI:
         self._mark_restart_needed()
 
     def _on_gpu_layers_changed(self, value):
-        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+        if (
+            getattr(self, "_loading_preset", False)
+            or getattr(self, "_applying_cli", False)
+            or self.ui.loading_profile
+        ):
             return
 
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
@@ -1952,7 +1963,11 @@ class LlamaGUI:
         self._mark_restart_needed()
 
     def _on_param_changed(self, _value=None):
-        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+        if (
+            getattr(self, "_loading_preset", False)
+            or getattr(self, "_applying_cli", False)
+            or self.ui.loading_profile
+        ):
             return
 
         self._autotune_best_applied = False
@@ -1964,12 +1979,96 @@ class LlamaGUI:
         self.update_cli_preview()
         self._mark_restart_needed()
 
-    def update_cli_preview(self):
+    def _cli_manual_enabled(self) -> bool:
+        return bool(
+            getattr(self.ui, "cli_manual_mode", None)
+            and self.ui.cli_manual_mode.isChecked()
+        )
+
+    def _on_cli_manual_mode_toggled(self, checked: bool):
+        self.ui.cli_preview.setReadOnly(not checked)
+        self.ui.cli_apply_btn.setEnabled(checked)
+        if checked:
+            self.ui.cli_status.setText("Manual CLI editing")
+            self.ui.cli_status.setStyleSheet("color: #FF9800;")
+            self.ui.cli_preview.setStyleSheet(
+                "background-color: #1f2933; color: #ffffff; font-family: Consolas; padding: 4px;"
+            )
+        else:
+            self.ui.cli_status.setText("Generated from UI")
+            self.ui.cli_status.setStyleSheet("color: #888;")
+            self.ui.cli_preview.setStyleSheet(
+                "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
+            )
+            self.update_cli_preview(force=True)
+
+    def _select_or_add_model_path(self, model_path: str):
+        path = str(model_path or "").strip()
+        if not path:
+            return
+        idx = self.ui.model_combo.findData(path)
+        if idx < 0:
+            name = Path(path).name or path
+            self.ui.model_combo.addItem(name, path)
+            self.ui.models_by_path.setdefault(path, {"path": path, "_model_path": path})
+            idx = self.ui.model_combo.findData(path)
+        if idx >= 0:
+            self.ui.model_combo.setCurrentIndex(idx)
+
+    def apply_cli_preview(self):
+        parsed = parse_llama_server_command(self.ui.cli_preview.text())
+        if parsed.warnings and not parsed.settings and not parsed.model_path:
+            self.ui.cli_status.setText("; ".join(parsed.warnings))
+            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            return
+
+        self._applying_cli = True
+        try:
+            if parsed.executable:
+                exe_path = Path(parsed.executable)
+                if exe_path.is_absolute() or "\\" in parsed.executable or "/" in parsed.executable:
+                    self.ui.exe_path.setText(parsed.executable)
+                    self._normalize_llamacpp_path_ui()
+
+            if parsed.model_path:
+                self._select_or_add_model_path(parsed.model_path)
+
+            settings = dict(parsed.settings)
+            settings["extra_args"] = parsed.extra_args
+            self.config.apply_values_to_ui(self.ui, settings)
+        finally:
+            self._applying_cli = False
+
+        self._autotune_best_applied = False
+        self._mark_preset_modified()
+        self.update_cli_preview(force=False)
+        self.save_settings()
+        self._mark_restart_needed()
+
+        if parsed.warnings:
+            status = "Applied with warnings: " + "; ".join(parsed.warnings)
+            color = "#FF9800"
+        else:
+            status = "CLI applied"
+            color = "#4CAF50"
+        self.ui.cli_status.setText(status)
+        self.ui.cli_status.setStyleSheet(f"color: {color};")
+        if parsed.extra_args:
+            self.log_mgr.append(f"CLI applied; extra params: {parsed.extra_args}")
+        else:
+            self.log_mgr.append("CLI applied")
+
+    def update_cli_preview(self, force: bool = False):
+        if self._cli_manual_enabled() and not force:
+            self._update_cuda_status()
+            return
         try:
             self.config.read_from_ui(self.ui)
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
             exe = self._resolve_llamacpp_executable("server") or "llama-server.exe"
-            self.ui.cli_preview.setText(f"{exe} {' '.join(args)}" if args else "")
+            self.ui.cli_preview.setText(
+                subprocess.list2cmdline([exe, *args]) if args else ""
+            )
         except Exception:
             self.ui.cli_preview.setText("")
         finally:
