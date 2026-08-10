@@ -152,11 +152,18 @@ class LogManager(QObject):
         self._buffer.clear()
         self._edit.clear()
         self._line_count = 0
-        self._pp_speed = None
-        self._tg_speed = None
-        self._pp_time = None
-        self._tg_time = None
-        self.speed_updated.emit("Speed: -")
+        self.reset_runtime_extractors()
+
+    def reset_runtime_extractors(
+        self, reset_speed: bool = True, reset_timing: bool = True
+    ) -> None:
+        if reset_speed:
+            self._pp_speed = None
+            self._tg_speed = None
+            self.speed_updated.emit("Speed: -")
+        if reset_timing:
+            self._pp_time = None
+            self._tg_time = None
 
     def stop(self) -> None:
         self._timer.stop()

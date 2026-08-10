@@ -30,6 +30,8 @@ def _make_gui() -> LlamaGUI:
     gui._slot_prompt_total = 0
     gui._slot_predicted_total = 0
     gui._slot_token_seen = {}
+    gui._last_slots = []
+    gui._request_token_base = {}
     gui._metrics_prompt_total = 0
     gui._metrics_predicted_total = 0
     gui._latest_prompt_total = 0
@@ -216,6 +218,20 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertAlmostEqual(gui._active_predicted_s, 20.0)
         text = gui.ui.request_tokens_label.setText.call_args[0][0]
         self.assertEqual(text, "Request: -")
+        gui.log_mgr.reset_runtime_extractors.assert_called_with(
+            reset_speed=False, reset_timing=True
+        )
+
+    def test_reset_task_keeps_stale_idle_request_hidden(self):
+        gui = _make_gui()
+        slot = _slot(0, prompt_processed=120, decoded=40, processing=False)
+        slot.n_prompt_tokens = 120
+        gui._on_slot_metrics_updated([slot])
+        gui.reset_task_tokens()
+        gui.ui.request_tokens_label.setText.reset_mock()
+        gui._on_slot_metrics_updated([slot])
+        text = gui.ui.request_tokens_label.setText.call_args[0][0]
+        self.assertEqual(text, "Request: -")
 
     def test_reset_session_zeroes_display_and_sticks(self):
         """Reset session обнуляет отображение total/task/времени; новые токены
@@ -227,6 +243,9 @@ class TestTokenAccumulation(unittest.TestCase):
         gui._active_prompt_s = 10.0
         gui._active_predicted_s = 20.0
         gui.reset_session()
+        gui.log_mgr.reset_runtime_extractors.assert_called_with(
+            reset_speed=True, reset_timing=True
+        )
         text = gui.ui.tokens_label.setText.call_args[0][0]
         self.assertNotIn("500", text)
         self.assertNotIn("700", text)

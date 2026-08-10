@@ -461,6 +461,10 @@ class MainWindowUI(QMainWindow):
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("Context Size (-c):"))
         r2.addWidget(self.ctx_size)
+        r2.addSpacing(10)
+        r2.addWidget(QLabel("CPU MoE (-ncmoe):"))
+        r2.addWidget(self.cpu_moe_layers)
+        r2.addSpacing(10)
 
         self.ctx_quick_buttons = []
         for label, value in [
@@ -541,12 +545,6 @@ class MainWindowUI(QMainWindow):
         r6.addWidget(self.flash_attn)
         r6.addWidget(self.fit_off)
         launch.addLayout(r6)
-
-        r_cpu = QHBoxLayout()
-        r_cpu.addWidget(QLabel("CPU MoE offload (-ncmoe):"))
-        r_cpu.addWidget(self.cpu_moe_layers)
-        r_cpu.addStretch(1)
-        lperf.addLayout(r_cpu)
 
         self.reasoning_mode = QComboBox()
         self.reasoning_mode.addItems(["off", "auto", "on"])

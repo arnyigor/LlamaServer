@@ -116,6 +116,8 @@ class LlamaGUI:
         self._slot_prompt_total = 0
         self._slot_predicted_total = 0
         self._slot_token_seen = {}
+        self._last_slots = []
+        self._request_token_base = {}
         # Кумулятивные значения из /metrics (с момента старта сервера).
         # Используются только для "догоняющей" синхронизации вверх, т.к.
         # llama.cpp обновляет их лишь по завершении запросов.
@@ -292,6 +294,8 @@ class LlamaGUI:
         self._slot_prompt_total = 0
         self._slot_predicted_total = 0
         self._slot_token_seen = {}
+        self._last_slots = []
+        self._request_token_base = {}
         self._metrics_prompt_total = 0
         self._metrics_predicted_total = 0
         self._session_base_prompt = 0
@@ -345,6 +349,45 @@ class LlamaGUI:
                 ]
             )
         )
+
+    def _sync_latest_token_totals(self):
+        slot_total = int(getattr(self, "_slot_prompt_total", 0) or 0) + int(
+            getattr(self, "_slot_predicted_total", 0) or 0
+        )
+        metrics_total = int(getattr(self, "_metrics_prompt_total", 0) or 0) + int(
+            getattr(self, "_metrics_predicted_total", 0) or 0
+        )
+        if slot_total <= 0 and metrics_total <= 0 and self._latest_token_total > 0:
+            return
+        self._apply_metrics_catch_up()
+        self._latest_prompt_total = self._slot_prompt_total
+        self._latest_predicted_total = self._slot_predicted_total
+        self._latest_token_total = (
+            self._latest_prompt_total + self._latest_predicted_total
+        )
+
+    def _reset_request_token_baseline(self):
+        self._request_token_base = {}
+        for slot in getattr(self, "_last_slots", []):
+            slot_id = int(getattr(slot, "id", 0) or 0)
+            self._request_token_base[slot_id] = (
+                int(getattr(slot, "n_prompt_tokens", 0) or 0),
+                int(getattr(slot, "n_decoded", 0) or 0),
+            )
+
+    def _request_counter_value(self, slot, attr_name: str, base_index: int) -> int:
+        slot_id = int(getattr(slot, "id", 0) or 0)
+        value = int(getattr(slot, attr_name, 0) or 0)
+        base = getattr(self, "_request_token_base", {}).get(slot_id)
+        if base is None:
+            return value
+        base_value = int(base[base_index] or 0)
+        if value < base_value:
+            base_values = list(base)
+            base_values[base_index] = 0
+            self._request_token_base[slot_id] = tuple(base_values)
+            return value
+        return max(value - base_value, 0)
 
     def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
         """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
@@ -451,15 +494,11 @@ class LlamaGUI:
             self._slot_prompt_total += max(prompt_delta, 0)
             self._slot_predicted_total += max(predicted_delta, 0)
             self._slot_token_seen[slot_id] = (prompt_tokens, predicted_tokens)
-        self._apply_metrics_catch_up()
-        self._latest_prompt_total = self._slot_prompt_total
-        self._latest_predicted_total = self._slot_predicted_total
-        self._latest_token_total = (
-            self._latest_prompt_total + self._latest_predicted_total
-        )
+        self._sync_latest_token_totals()
         self._refresh_token_label()
 
     def _on_slot_metrics_updated(self, slots):
+        self._last_slots = list(slots)
         # Активное время: интервалы опросов, пока хоть один слот обрабатывает.
         # Большой зазор между опросами (> MAX_ACTIVE_TIME_DT) — пауза/простой,
         # его не считаем: точный current приходит из логов llama_print_timings.
@@ -500,10 +539,11 @@ class LlamaGUI:
             for slot in visible
         )
         prompt_tokens = sum(
-            int(getattr(slot, "n_prompt_tokens", 0) or 0) for slot in visible
+            self._request_counter_value(slot, "n_prompt_tokens", 0)
+            for slot in visible
         )
         predicted_tokens = sum(
-            int(getattr(slot, "n_decoded", 0) or 0) for slot in visible
+            self._request_counter_value(slot, "n_decoded", 1) for slot in visible
         )
 
         parts = []
@@ -521,23 +561,26 @@ class LlamaGUI:
             self.ui.speed_label.setText(
                 "Speed: " + (stat_sep().join(parts) if parts else "-")
             )
-        self.ui.request_tokens_label.setText(
-            "Request: "
-            + stat_sep().join(
-                [
-                    stat_kv(
-                        "prompt",
-                        self._fmt_counter(prompt_tokens),
-                        STAT_COLOR_PROMPT,
-                    ),
-                    stat_kv(
-                        "generated",
-                        self._fmt_counter(predicted_tokens),
-                        STAT_COLOR_GENERATED,
-                    ),
-                ]
+        if prompt_tokens or predicted_tokens:
+            self.ui.request_tokens_label.setText(
+                "Request: "
+                + stat_sep().join(
+                    [
+                        stat_kv(
+                            "prompt",
+                            self._fmt_counter(prompt_tokens),
+                            STAT_COLOR_PROMPT,
+                        ),
+                        stat_kv(
+                            "generated",
+                            self._fmt_counter(predicted_tokens),
+                            STAT_COLOR_GENERATED,
+                        ),
+                    ]
+                )
             )
-        )
+        else:
+            self.ui.request_tokens_label.setText("Request: -")
         self._accumulate_slot_tokens(slots)
 
     def _on_server_metrics_updated(self, metrics):
@@ -554,11 +597,7 @@ class LlamaGUI:
         # НЕ используем llamacpp:prompt_tokens_seconds / predicted_tokens_seconds
         # из /metrics как длительность: это throughput (токены/сек), а не время.
         # Точное время PP/TG берём из логов llama_print_timings.
-        self._latest_prompt_total = self._slot_prompt_total
-        self._latest_predicted_total = self._slot_predicted_total
-        self._latest_token_total = (
-            self._latest_prompt_total + self._latest_predicted_total
-        )
+        self._sync_latest_token_totals()
         self._refresh_token_label()
 
     def reset_task_tokens(self):
@@ -567,12 +606,16 @@ class LlamaGUI:
         Обнуляет task-счётчик, Current time и Request. Total-токены и Active
         время (server-scope) не трогает — для них есть Reset session.
         """
+        self._sync_latest_token_totals()
         task_total = max(self._latest_token_total - self._token_baseline_total, 0)
         self._saved_token_total += task_total
         self._token_baseline_total = self._latest_token_total
+        self._reset_request_token_baseline()
         self._set_saved_label(last_total=task_total)
         self._cur_prompt_s = 0.0
         self._cur_predicted_s = 0.0
+        self._last_poll_time = time.monotonic()
+        self.log_mgr.reset_runtime_extractors(reset_speed=False, reset_timing=True)
         self._refresh_current_time_label()
         self.ui.request_tokens_label.setText("Request: -")
         self._refresh_token_label()
@@ -587,14 +630,18 @@ class LlamaGUI:
         Saved-история сохраняется. Реализовано через baseline-смещения,
         поэтому следующий опрос /metrics не вернёт старые значения на экран.
         """
+        self._sync_latest_token_totals()
         self._session_base_prompt = self._latest_prompt_total
         self._session_base_predicted = self._latest_predicted_total
         self._session_base_total = self._latest_token_total
         self._session_base_active_pp = self._active_prompt_s
         self._session_base_active_tg = self._active_predicted_s
         self._token_baseline_total = self._latest_token_total
+        self._reset_request_token_baseline()
         self._cur_prompt_s = 0.0
         self._cur_predicted_s = 0.0
+        self._last_poll_time = time.monotonic()
+        self.log_mgr.reset_runtime_extractors(reset_speed=True, reset_timing=True)
         self._refresh_token_label()
         self._refresh_active_time_label()
         self._refresh_current_time_label()
