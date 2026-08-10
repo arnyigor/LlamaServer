@@ -267,6 +267,17 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--top-p", args)
         self.assertIn("0.9", args)
 
+    def test_extra_args_unmanaged_mtp_values_are_preserved(self):
+        self.cfg.speculative_mtp = True
+        self.cfg.extra_args = "--spec-draft-n-min 1 --spec-draft-p-min 0.5"
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertIn("--spec-draft-n-min", args)
+        self.assertIn("1", args)
+        self.assertIn("--spec-draft-p-min", args)
+        self.assertIn("0.5", args)
+
     def test_extra_args_unmanaged_jinja_still_allowed(self):
         self.cfg.jinja = False
         self.cfg.extra_args = "--jinja"

@@ -415,12 +415,8 @@ def build_args(
                     "--model-draft",
                     "--spec-type",
                     "--spec-draft-n-max",
-                    "--spec-draft-n-min",
-                    "--spec-draft-p-min",
                     "--spec-draft-ngl",
                     "--spec-draft-device",
-                    "--spec-draft-type-k",
-                    "--spec-draft-type-v",
                 ]
             args.extend(_filter_duplicate_extra_args(extra, managed_args))
         except ValueError as e:
