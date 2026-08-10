@@ -153,7 +153,6 @@ class MainWindowUI(QMainWindow):
         )
         self.update_llama_btn = QPushButton("Update llama.cpp")
         self.update_status = QLabel("idle", wordWrap=True)
-        upd_row.addWidget(self.cuda_version_combo)
         upd_row.addWidget(self.update_llama_btn)
         upd_row.addWidget(self.update_status, 1)
         lp.addLayout(upd_row)
@@ -440,6 +439,18 @@ class MainWindowUI(QMainWindow):
         self.cpu_moe_layers.setRange(-1, 200)
         self.cpu_moe_layers.setValue(-1)
         self.cpu_moe_layers.setSpecialValueText("auto")
+
+        self.cuda_status_label = QLabel("CUDA build: not checked")
+        self.cuda_status_label.setWordWrap(True)
+        self.cuda_status_label.setStyleSheet("color: #666;")
+        self.cuda_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        r_cuda = QHBoxLayout()
+        r_cuda.addWidget(QLabel("CUDA build:"))
+        r_cuda.addWidget(self.cuda_version_combo)
+        r_cuda.addWidget(self.cuda_status_label, 1)
+        launch.addLayout(r_cuda)
 
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("GPU offload (-ngl):"))

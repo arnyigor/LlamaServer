@@ -142,6 +142,7 @@ class LlamaGUI:
         self.auto_detect_bench()
         self._connect_signals()
         self._setup_tray()
+        self._update_cuda_status()
         QTimer.singleShot(250, self.auto_scan_models)
         QTimer.singleShot(350, self._refresh_hf_partial_status)
 
@@ -716,6 +717,38 @@ class LlamaGUI:
 
     def _selected_cuda_version(self) -> str:
         return str(self.ui.cuda_version_combo.currentData() or "12")
+
+    def _update_cuda_status(self):
+        label = getattr(self.ui, "cuda_status_label", None)
+        if label is None:
+            return
+
+        cuda_ver = self._selected_cuda_version()
+        exe = self._resolve_llamacpp_executable("server")
+        raw_path = self.ui.exe_path.text().strip().strip('"')
+        model_path = self._current_model_path()
+
+        if exe:
+            build_name = Path(exe).parent.name
+            parts = [f"CUDA {cuda_ver}: {build_name}"]
+            color = "#4CAF50"
+        elif raw_path:
+            parts = [f"CUDA {cuda_ver}: build not found"]
+            color = "#FF9800"
+        else:
+            parts = [f"CUDA {cuda_ver}: select llama.cpp folder"]
+            color = "#888"
+
+        parts.append("model selected" if model_path else "select model")
+
+        if cuda_ver == "13":
+            note = "CUDA 13 requires NVIDIA driver 580+; best for RTX 50/Blackwell."
+        else:
+            note = "CUDA 12 is the safer default for RTX 30/40 and older stable builds."
+
+        label.setText(" | ".join(parts))
+        label.setToolTip(note)
+        label.setStyleSheet(f"color: {color};")
 
     def _llamacpp_cuda_major(self, path: Path) -> str:
         match = re.search(r"cuda-(\d+)(?:[.-]|$)", path.name.lower())
@@ -1924,6 +1957,8 @@ class LlamaGUI:
             self.ui.cli_preview.setText(f"{exe} {' '.join(args)}" if args else "")
         except Exception:
             self.ui.cli_preview.setText("")
+        finally:
+            self._update_cuda_status()
 
     def _mark_restart_needed(self):
         """Подсвечивает, что запущенному серверу нужен рестарт для новых параметров."""
