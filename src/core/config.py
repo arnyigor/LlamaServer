@@ -2,6 +2,7 @@
 """Менеджер конфигурации с автоматическим маппингом виджетов."""
 
 import json
+import logging
 import os
 import hashlib
 import shlex
@@ -17,7 +18,23 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
+from src.core.constants import (
+    AUTO_SENTINEL,
+    SAMPLING_AUTO_FLOAT,
+    SAMPLING_AUTO_INT,
+    SAMPLING_LAST_N_AUTO,
+    SAMPLING_PENALTY_AUTO,
+    SAMPLING_SEED_AUTO,
+    SERVER_DEFAULT_SENTINEL,
+)
+from src.core.param_registry import (
+    FIELD_WIDGET_MAP as _FIELD_WIDGET_MAP,
+    MANAGED_EXTRA_FLAGS as _MANAGED_EXTRA_FLAGS,
+    SAMPLING_EXTRA_FIELDS as _SAMPLING_EXTRA_FIELDS,
+)
 from src.utils.file_utils import write_json_file_safely
+
+logger = logging.getLogger("llamaserver.config")
 
 
 @dataclass
@@ -39,21 +56,21 @@ class AppSettings:
     mmproj_path: str = ""
     last_model_path: str = ""
     model_cache: list = field(default_factory=list)
-    temperature: float = -1.0
-    top_k: int = -1
-    top_p: float = -1.0
-    min_p: float = -1.0
-    typical_p: float = -1.0
-    repeat_penalty: float = -1.0
-    repeat_last_n: int = -2
-    presence_penalty: float = -3.0
-    frequency_penalty: float = -3.0
-    seed: int = -2
+    temperature: float = SAMPLING_AUTO_FLOAT
+    top_k: int = SAMPLING_AUTO_INT
+    top_p: float = SAMPLING_AUTO_FLOAT
+    min_p: float = SAMPLING_AUTO_FLOAT
+    typical_p: float = SAMPLING_AUTO_FLOAT
+    repeat_penalty: float = SAMPLING_AUTO_FLOAT
+    repeat_last_n: int = SAMPLING_LAST_N_AUTO
+    presence_penalty: float = SAMPLING_PENALTY_AUTO
+    frequency_penalty: float = SAMPLING_PENALTY_AUTO
+    seed: int = SAMPLING_SEED_AUTO
     gpu_auto: bool = True
     gpu_layers: int = 33
     gpu_layers_all: bool = False
-    cpu_moe_layers: int = -1
-    ctx_size: int = -1
+    cpu_moe_layers: int = AUTO_SENTINEL
+    ctx_size: int = AUTO_SENTINEL
     threads: int = 4
     threads_batch: int = 0
     port: int = 8080
@@ -61,7 +78,7 @@ class AppSettings:
     cuda_device: str = ""
     spec_draft_device: str = ""
     split_mode: str = ""
-    main_gpu: int = -1
+    main_gpu: int = AUTO_SENTINEL
     cuda_visible_devices: str = ""
     cuda_module_loading: str = "LAZY"
     flash_attn: bool = True
@@ -73,9 +90,9 @@ class AppSettings:
     log_timestamps: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
-    batch_size: int = -1
-    ubatch_size: int = -1
-    parallel_slots: int = -1
+    batch_size: int = AUTO_SENTINEL
+    ubatch_size: int = AUTO_SENTINEL
+    parallel_slots: int = AUTO_SENTINEL
     kv_unified: bool = False
     speculative_mtp: bool = False
     spec_draft_model_path: str = ""
@@ -84,8 +101,8 @@ class AppSettings:
     spec_draft_n_max: int = 8
     spec_draft_p_min: float = 0.8
     spec_draft_gpu_layers: str = "all"
-    ctx_checkpoints: int = -1
-    cache_ram: int = -2
+    ctx_checkpoints: int = AUTO_SENTINEL
+    cache_ram: int = SERVER_DEFAULT_SENTINEL
     cont_batching: bool = True
     cache_prompt: bool = True
     context_shift: bool = False
@@ -101,79 +118,9 @@ class AppSettings:
     hf_include_mmproj: bool = True
 
 
-# Явная таблица маппинга: поле -> атрибут виджета в UI
-# Формат: "settings_field": "ui_widget_attr"
-_FIELD_WIDGET_MAP: Dict[str, str] = {
-    "exe": "exe_path",
-    "bench": "bench_path",
-    "model_dir": "model_dir",
-    "opencode_config": "opencode_config_path",
-    "pi_config": "pi_config_path",
-    "claude_config": "claude_config_path",
-    "bench_prompt": "bench_prompt",
-    "bench_gen": "bench_gen",
-    "auto_params": "auto_params",
-    "use_mmproj": "use_mmproj",
-    "mmproj_offload": "mmproj_offload",
-    "gpu_auto": "gpu_auto",
-    "gpu_layers": "gpu_layers",
-    "gpu_layers_all": "gpu_layers_all",
-    "cpu_moe_layers": "cpu_moe_layers",
-    "ctx_size": "ctx_size",
-    "threads": "threads",
-    "threads_batch": "threads_batch",
-    "port": "port",
-    "host": "host",
-    "cuda_device": "cuda_device",
-    "spec_draft_device": "spec_draft_device",
-    "split_mode": "split_mode",
-    "main_gpu": "main_gpu",
-    "cuda_visible_devices": "cuda_visible_devices",
-    "cuda_module_loading": "cuda_module_loading",
-    "temperature": "temperature",
-    "top_k": "top_k",
-    "top_p": "top_p",
-    "min_p": "min_p",
-    "typical_p": "typical_p",
-    "repeat_penalty": "repeat_penalty",
-    "repeat_last_n": "repeat_last_n",
-    "presence_penalty": "presence_penalty",
-    "frequency_penalty": "frequency_penalty",
-    "seed": "seed",
-    "flash_attn": "flash_attn",
-    "fit_off": "fit_off",
-    "reasoning_mode": "reasoning_mode",
-    "use_mmap": "use_mmap",
-    "use_mlock": "use_mlock",
-    "verbose": "verbose",
-    "log_timestamps": "log_timestamps",
-    "cache_type_k": "cache_type_k",
-    "cache_type_v": "cache_type_v",
-    "batch_size": "batch_size",
-    "ubatch_size": "ubatch_size",
-    "parallel_slots": "parallel_slots",
-    "kv_unified": "kv_unified",
-    "speculative_mtp": "speculative_mtp",
-    "spec_draft_model_path": "spec_draft_model_path",
-    "spec_draft_n_max": "spec_draft_n_max",
-    "spec_draft_p_min": "spec_draft_p_min",
-    "spec_draft_gpu_layers": "spec_draft_gpu_layers",
-    "ctx_checkpoints": "ctx_checkpoints",
-    "cache_ram": "cache_ram",
-    "cont_batching": "cont_batching",
-    "cache_prompt": "cache_prompt",
-    "context_shift": "context_shift",
-    "no_webui": "no_webui",
-    "jinja": "jinja",
-    "use_chat_template": "use_chat_template",
-    "chat_template_file": "chat_template_file",
-    "extra_args": "extra_args",
-    "enable_thinking": "enable_thinking",
-    "cuda_version": "cuda_version_combo",
-    "hf_repo": "hf_repo",
-    "hf_quant_filter": "hf_quant_filter",
-    "hf_include_mmproj": "hf_include_mmproj",
-}
+# Таблица маппинга "поле настроек -> атрибут виджета UI" генерируется из
+# единого реестра параметров (src/core/param_registry.py); паритет со
+# старой ручной таблицей фиксирует tests/test_param_registry.py.
 
 _PERF_PRESETS_ROOT = "__perf_presets__"
 _PERF_DEFAULT_PRESET_NAME = "default"
@@ -258,93 +205,8 @@ _AUTOTUNE_PARAM_TO_SETTING = {
     "use_mmproj": "use_mmproj",
 }
 
-_MANAGED_EXTRA_FLAGS = {
-    "-m",
-    "--model",
-    "--port",
-    "--host",
-    "-ngl",
-    "--n-gpu-layers",
-    "-c",
-    "--ctx-size",
-    "--ctx-checkpoints",
-    "--cache-ram",
-    "--kv-unified",
-    "-kvu",
-    "--spec-type",
-    "--spec-draft-n-max",
-    "--spec-draft-p-min",
-    "--spec-draft-ngl",
-    "--spec-draft-device",
-    "-md",
-    "--model-draft",
-    "--jinja",
-    "--chat-template-file",
-    "--no-cache-prompt",
-    "--flash-attn",
-    "-fa",
-    "--fit",
-    "-rea",
-    "--reasoning",
-    "--temp",
-    "--temperature",
-    "--top-k",
-    "--top-p",
-    "--min-p",
-    "--typical",
-    "--typical-p",
-    "--repeat-penalty",
-    "--repeat-last-n",
-    "--presence-penalty",
-    "--frequency-penalty",
-    "-s",
-    "--seed",
-    "-ctk",
-    "--cache-type-k",
-    "-ctv",
-    "--cache-type-v",
-    "-b",
-    "--batch-size",
-    "-ub",
-    "--ubatch-size",
-    "-np",
-    "--parallel",
-    "-t",
-    "--threads",
-    "-tb",
-    "--threads-batch",
-    "-ncmoe",
-    "--n-cpu-moe",
-    "-mm",
-    "--mmproj",
-    "--no-mmproj",
-    "--no-mmproj-offload",
-    "--mmap",
-    "--no-mmap",
-    "--mlock",
-    "--verbose",
-    "--log-timestamps",
-    "--no-cont-batching",
-    "--context-shift",
-    "--no-webui",
-}
-
-_SAMPLING_EXTRA_FIELDS = {
-    "--temp": ("temperature", float),
-    "--temperature": ("temperature", float),
-    "--top-k": ("top_k", int),
-    "--top-p": ("top_p", float),
-    "--min-p": ("min_p", float),
-    "--typical": ("typical_p", float),
-    "--typical-p": ("typical_p", float),
-    "--repeat-penalty": ("repeat_penalty", float),
-    "--repeat-last-n": ("repeat_last_n", int),
-    "--presence-penalty": ("presence_penalty", float),
-    "--frequency-penalty": ("frequency_penalty", float),
-    "-s": ("seed", int),
-    "--seed": ("seed", int),
-}
-
+# Флаги, которыми управляют UI/AutoTune, и mapping sampling-полей тоже
+# приходят из реестра параметров.
 
 def _is_extra_value_token(arg: str) -> bool:
     if not str(arg).startswith("-"):
@@ -687,8 +549,13 @@ class ConfigManager:
                 continue
             try:
                 _widget_set(widget, value)
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "apply_to_ui: поле %s не применено к %s (%s)",
+                    field_name,
+                    widget_attr,
+                    exc,
+                )
 
         # Специальные случаи, не покрываемые универсальным маппингом
         idx = ui.integration_target.findData(s.integration_target)
@@ -727,8 +594,8 @@ class ConfigManager:
                     setattr(s, field_name, str(value))
                 else:
                     setattr(s, field_name, value)
-            except (TypeError, ValueError, AttributeError):
-                pass
+            except (TypeError, ValueError, AttributeError) as exc:
+                logger.debug("read_from_ui: поле %s пропущено (%s)", field_name, exc)
 
         # Специальные случаи
         s.integration_target = ui.current_config_target()
@@ -765,8 +632,12 @@ class ConfigManager:
             if widget is not None:
                 try:
                     _widget_set(widget, value)
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    logger.debug(
+                        "apply_values_to_ui: поле %s не применено (%s)",
+                        field_name,
+                        exc,
+                    )
 
     def save_profile(self, name: str, ui: Any) -> None:
         """Сохранение текущих настроек как профиля."""
@@ -949,9 +820,10 @@ class ConfigManager:
         if preset_name == _PERF_DEFAULT_PRESET_NAME:
             params["ctx_size"] = int(ctx_size)
         else:
-            params["ctx_size"] = int(
-                params.get("ctx_size", preset_obj.get("ctx_size", ctx_size))
-            )
+            raw_ctx = params.get("ctx_size", preset_obj.get("ctx_size", ctx_size))
+            if raw_ctx is None:
+                raw_ctx = ctx_size
+            params["ctx_size"] = int(raw_ctx)
         params = _normalize_perf_param_types(params)
 
         for field_name, value in params.items():
@@ -975,8 +847,12 @@ class ConfigManager:
 
             try:
                 _widget_set(widget, value)
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "load_perf_preset: поле %s не применено (%s)",
+                    field_name,
+                    exc,
+                )
 
         return True
 

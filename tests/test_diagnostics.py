@@ -19,7 +19,7 @@ class TestServerDiagnostics(unittest.TestCase):
             stop_requested=False,
         )
 
-        self.assertIn("Недостаточно памяти", result["cause"])
+        self.assertIn("Out of memory", result["cause"])
         self.assertIn("Context Size", result["action"])
 
     def test_reports_native_crash_during_model_unload(self):
@@ -30,7 +30,7 @@ class TestServerDiagnostics(unittest.TestCase):
             stop_requested=True,
         )
 
-        self.assertIn("Сбой при выгрузке модели", result["cause"])
+        self.assertIn("Failed to unload the model", result["cause"])
         self.assertIn("0xC0000005", result["cause"])
 
     def test_normal_requested_stop_has_no_failure(self):
@@ -70,7 +70,7 @@ class TestServerDiagnostics(unittest.TestCase):
 
         self.assertIn("llama-server.exe -m model.gguf --future-flag", report)
         self.assertIn("unknown argument", report)
-        self.assertIn("Полный отчёт", format_diagnostic_summary(result, str(path)))
+        self.assertIn("Full report", format_diagnostic_summary(result, str(path)))
 
 
 if __name__ == "__main__":

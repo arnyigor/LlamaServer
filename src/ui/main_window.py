@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QPushButton,
+    QToolButton,
     QComboBox,
     QLabel,
     QSpinBox,
@@ -19,6 +20,8 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QMessageBox,
     QListWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QDoubleSpinBox,
     QCheckBox,
     QProgressBar,
@@ -26,11 +29,31 @@ from PySide6.QtWidgets import (
     QSplitter,
     QGridLayout,
     QAbstractItemView,
+    QHeaderView,
+    QTabWidget,
+    QMenu,
 )
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QAction, QFont, QIcon
 
+from src.core.constants import (
+    AUTO_SENTINEL,
+    STATUS_COLOR_ERROR,
+    STATUS_COLOR_MUTED,
+    STATUS_COLOR_MUTED_DARK,
+    STATUS_COLOR_PENDING,
+    STATUS_COLOR_READY,
+    STATUS_COLOR_RUNNING,
+    STATUS_COLOR_WARNING,
+    SAMPLING_AUTO_FLOAT,
+    SAMPLING_AUTO_INT,
+    SAMPLING_LAST_N_AUTO,
+    SAMPLING_PENALTY_AUTO,
+    SAMPLING_SEED_AUTO,
+    SERVER_DEFAULT_SENTINEL,
+)
 from src.ui.widgets import CollapsiblePanel, NoWheelValueChangeFilter
+from src.ui.panels.paths_panel import PathsPanel
 from src.ui.mem_viz_widget import MemoryVisualizationWidget
 from src.ui.autotune_widget import AutoTuneWidget
 
@@ -39,8 +62,8 @@ class MainWindowUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Llama Server Studio")
-        self.setGeometry(100, 100, 1280, 720)
         self.setMinimumSize(1050, 560)
+        self._apply_initial_geometry()
         self._apply_app_icon()
 
         self.models = []
@@ -61,6 +84,20 @@ class MainWindowUI(QMainWindow):
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
+    def _apply_initial_geometry(self):
+        preferred_w = 1570
+        preferred_h = 820
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            width = min(preferred_w, max(1050, available.width() - 80))
+            height = min(preferred_h, max(560, available.height() - 80))
+            x = available.x() + max(0, (available.width() - width) // 2)
+            y = available.y() + max(0, (available.height() - height) // 2)
+            self.setGeometry(x, y, width, height)
+        else:
+            self.setGeometry(100, 100, preferred_w, preferred_h)
+
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -75,6 +112,7 @@ class MainWindowUI(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([820, 730])
+        self.main_splitter = splitter
         main_layout.addWidget(splitter)
 
     def _build_left_panel(self):
@@ -84,970 +122,26 @@ class MainWindowUI(QMainWindow):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(10)
 
-        # === 0. Кнопки управления (вверху, чтобы не скролить) ===
-        btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("Start Server")
-        self.start_btn.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.reload_btn = QPushButton("Restart", enabled=False)
-        self.reload_btn.setVisible(False)
-        self.reload_btn.setToolTip(
-            "Restart the running server and apply the current model parameters"
-        )
-        self.reload_btn.setStyleSheet(
-            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.stop_btn = QPushButton("Stop", enabled=False)
-        self.stop_btn.setStyleSheet(
-            "background-color: #f44336; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.force_stop_btn = QPushButton("Force Stop", enabled=True)
-        self.force_stop_btn.setToolTip(
-            "Immediately kills llama-server process tree if normal stop is stuck"
-        )
-        self.force_stop_btn.setStyleSheet(
-            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
-        )
-        btn_row.addWidget(self.start_btn)
-        btn_row.addWidget(self.reload_btn)
-        btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.force_stop_btn)
-        lay.addLayout(btn_row)
-
-        # === 1. Пути ===
-        g_paths = QGroupBox("Paths")
-        lp = QVBoxLayout(g_paths)
-        lp.setContentsMargins(12, 18, 12, 12)
-        lp.setSpacing(8)
-
-        self.exe_path = QLineEdit(placeholderText="Base folder with llama.cpp builds")
-        self.exe_path.setToolTip(
-            "Select the folder that contains version folders, e.g.\n"
-            "G:/AIModels/llamacpp/\n\n"
-            "Expected subfolders are auto-detected by CUDA version:\n"
-            "llama-win-cuda-12.4-x64 / llama-win-cuda-13.3-x64"
-        )
-        self.bench_path = QLineEdit(placeholderText="Auto-detected llama-bench.exe")
-        self.bench_path.setVisible(False)
-        self.model_dir = QLineEdit(placeholderText="Base folder with models")
-
-        for line, label, slot in [
-            (self.exe_path, "Llama.cpp:", "_browse_exe_clicked"),
-            (self.model_dir, "Models:", "_browse_model_dir_clicked"),
-        ]:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addWidget(line, 1)
-            btn = QPushButton("...")
-            btn.setFixedWidth(32)
-            btn.clicked.connect(lambda _checked=False, s=slot: getattr(self, s)())
-            row.addWidget(btn)
-            lp.addLayout(row)
-
-        upd_row = QHBoxLayout()
-        self.cuda_version_combo = QComboBox()
-        self.cuda_version_combo.addItem("CUDA 12", "12")
-        self.cuda_version_combo.addItem("CUDA 13", "13")
-        self.cuda_version_combo.setMaximumWidth(110)
-        self.cuda_version_combo.setToolTip(
-            "CUDA major version for llama.cpp builds.\n"
-            "CUDA 13 also downloads additional cudart DLLs.\n"
-            "Minor version (12.4 / 13.3) is auto-detected from release."
-        )
-        self.update_llama_btn = QPushButton("Update llama.cpp")
-        self.update_status = QLabel("idle", wordWrap=True)
-        upd_row.addWidget(self.update_llama_btn)
-        upd_row.addWidget(self.update_status, 1)
-        lp.addLayout(upd_row)
-
-        self.update_progress = QProgressBar(visible=False, minimum=0, maximum=100)
-        lp.addWidget(self.update_progress)
-        self.paths_panel = CollapsiblePanel("Advanced: Paths and llama.cpp")
-        self.paths_panel.add_widget(g_paths)
-
-        # === 2. Модель ===
-        g_model = QGroupBox("Model")
-        lm = QVBoxLayout(g_model)
-        lm.setContentsMargins(12, 18, 12, 12)
-        lm.setSpacing(8)
-
-        scan_row = QHBoxLayout()
-        self.scan_btn = QPushButton("Scan")
-        scan_row.addWidget(self.scan_btn)
-        lm.addLayout(scan_row)
-
-        self.scan_status = QLabel("Models not scanned")
-        self.scan_progress = QProgressBar(visible=False, minimum=0, maximum=0)
-        lm.addWidget(self.scan_status)
-        lm.addWidget(self.scan_progress)
-
-        self.model_combo = QComboBox()
-        self.model_combo.setEditable(False)
-        self.model_combo.setMinimumHeight(30)
-        self.model_combo.setMaxVisibleItems(25)
-        self.model_combo.setMinimumContentsLength(80)
-        self.model_combo.setStyleSheet(
-            "QComboBox { padding-left: 6px; padding-right: 34px; } "
-            "QComboBox::drop-down { width: 30px; }"
-        )
-
-        lm.addWidget(QLabel("Found GGUF:"))
-        lm.addWidget(self.model_combo)
-
-        self.auto_params = QCheckBox("Auto setup ctx/GPU/cache by GGUF")
-        self.auto_params.setChecked(True)
-        lm.addWidget(self.auto_params)
-
-        mmproj_row = QHBoxLayout()
-        self.use_mmproj = QCheckBox("Use mmproj")
-        self.use_mmproj.setChecked(True)
-        self.mmproj_offload = QCheckBox("mmproj offload")
-        self.mmproj_offload.setChecked(True)
-        mmproj_row.addWidget(self.use_mmproj)
-        mmproj_row.addWidget(self.mmproj_offload)
-        lm.addLayout(mmproj_row)
-
-        self.model_info = QLabel("Select model")
-        self.model_info.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.model_id_label = QLabel("")
-        self.model_id_label.setStyleSheet("color: #888; font-size: 10px;")
-        self.model_id_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.model_id_label.setWordWrap(True)
-        self.copy_model_btn = QPushButton("Copy model path")
-        self.copy_model_btn.setFixedHeight(22)
-        self.copy_model_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
-        mrow = QHBoxLayout()
-        mrow.addWidget(self.copy_model_btn)
-        mrow.addWidget(self.model_id_label, 1)
-        lm.addWidget(self.model_info)
-        lm.addLayout(mrow)
-        lay.addWidget(g_model)
-
-        # === 2a. Локальные модели + загрузка с Hugging Face ===
-        self.models_panel = CollapsiblePanel("Local model manager and download")
-        local = self.models_panel.content_layout
-
-        local_row = QHBoxLayout()
-        self.local_models_refresh_btn = QPushButton("Refresh local models")
-        self.local_models_delete_btn = QPushButton("Delete selected")
-        self.local_models_delete_btn.setEnabled(False)
-        self.local_models_delete_btn.setToolTip(
-            "Safely delete the selected model folder/file from the Models base folder."
-        )
-        local_row.addWidget(QLabel("All models under Models:"))
-        local_row.addStretch(1)
-        local_row.addWidget(self.local_models_refresh_btn)
-        local_row.addWidget(self.local_models_delete_btn)
-        local.addLayout(local_row)
-
-        self.local_models_list = QListWidget()
-        self.local_models_list.setMaximumHeight(130)
-        self.local_models_list.setToolTip(
-            "Shows every local model folder/file found under the Models path, not only HF downloads. "
-            "Projectors/MTP drafts are included in folder deletion but not shown as standalone models."
-        )
-        local.addWidget(self.local_models_list)
-
-        self.local_models_status = QLabel("Refresh to list local models")
-        self.local_models_status.setWordWrap(True)
-        local.addWidget(self.local_models_status)
-
-        # --- Подблок загрузки с Hugging Face (можно скрыть) ---
-        self.show_hf_download = QCheckBox("Show Hugging Face download")
-        self.show_hf_download.setChecked(True)
-        self.show_hf_download.setToolTip(
-            "Uncheck to hide the Hugging Face download section and keep the panel compact."
-        )
-        local.addWidget(self.show_hf_download)
-
-        self.hf_section = QWidget()
-        hf = QVBoxLayout(self.hf_section)
-        hf.setContentsMargins(0, 0, 0, 0)
-        hf.setSpacing(6)
-
-        self.hf_repo = QLineEdit(
-            placeholderText="repo or URL, e.g. unsloth/Qwen3.6-27B-MTP-GGUF"
-        )
-        self.hf_repo.setToolTip(
-            "Paste Hugging Face repo id or model URL. Files are saved as:\n"
-            "<Models>/<author>/<model>/<file>.gguf, compatible with LM Studio."
-        )
-        hf.addWidget(self.hf_repo)
-
-        hf_filter_row = QHBoxLayout()
-        self.hf_quant_filter = QLineEdit(placeholderText="filter: Q4_K_M or Q3-BF16")
-        self.hf_quant_filter.setToolTip(
-            "Optional filter. Examples: Q4_K_M, IQ4, Q3-BF16.\n"
-            "Q3-BF16 means show quants from Q3 up to BF16."
-        )
-        self.hf_scan_btn = QPushButton("Scan HF")
-        hf_filter_row.addWidget(self.hf_quant_filter, 1)
-        hf_filter_row.addWidget(self.hf_scan_btn)
-        hf.addLayout(hf_filter_row)
-
-        hf_opts_row = QHBoxLayout()
-        self.hf_include_mmproj = QCheckBox("also vision/mmproj")
-        self.hf_include_mmproj.setChecked(True)
-        self.hf_download_btn = QPushButton("Download selected models")
-        self.hf_download_btn.setEnabled(False)
-        self.hf_pause_btn = QPushButton("Pause selected")
-        self.hf_pause_btn.setEnabled(False)
-        self.hf_cancel_btn = QPushButton("Cancel selected")
-        self.hf_cancel_btn.setEnabled(False)
-        hf_opts_row.addWidget(self.hf_include_mmproj)
-        hf_opts_row.addWidget(self.hf_download_btn)
-        hf_opts_row.addWidget(self.hf_pause_btn)
-        hf_opts_row.addWidget(self.hf_cancel_btn)
-        hf_opts_row.addStretch(1)
-        hf.addLayout(hf_opts_row)
-
-        self.hf_files = QListWidget()
-        self.hf_files.setMaximumHeight(120)
-        self.hf_files.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self.hf_files.setToolTip(
-            "Select one or several GGUF files (Ctrl/Shift). Each file is downloaded "
-            "as an independent concurrent task. Vision projector is added once."
-        )
-        hf.addWidget(self.hf_files)
-
-        self.hf_status = QLabel("Paste repo and scan")
-        self.hf_status.setWordWrap(True)
-        self.hf_progress = QProgressBar(visible=False, minimum=0, maximum=100)
-        hf.addWidget(self.hf_status)
-        hf.addWidget(self.hf_progress)
-
-        hf.addWidget(QLabel("Downloads (select tasks to pause/cancel):"))
-        self.hf_downloads = QListWidget()
-        self.hf_downloads.setMaximumHeight(220)
-        self.hf_downloads.setWordWrap(True)
-        self.hf_downloads.setSpacing(3)
-        self.hf_downloads.setUniformItemSizes(False)
-        self.hf_downloads.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self.hf_downloads.setToolTip(
-            "Independent parallel downloads with downloaded/total size, remaining size, "
-            "speed and ETA. Select one or several tasks before Pause/Cancel."
-        )
-        hf.addWidget(self.hf_downloads)
-
-        hf_local_row = QHBoxLayout()
-        self.hf_refresh_local_btn = QPushButton("Refresh local")
-        self.hf_delete_local_folder_btn = QPushButton("Delete local folder")
-        self.hf_delete_local_folder_btn.setEnabled(False)
-        hf_local_row.addWidget(QLabel("Local files:"))
-        hf_local_row.addStretch(1)
-        hf_local_row.addWidget(self.hf_refresh_local_btn)
-        hf_local_row.addWidget(self.hf_delete_local_folder_btn)
-        hf.addLayout(hf_local_row)
-
-        self.hf_local_files = QListWidget()
-        self.hf_local_files.setMaximumHeight(90)
-        self.hf_local_files.setToolTip(
-            "Files already present in <Models>/<author>/<model>. Delete local folder removes the whole repo folder including mmproj/vision files."
-        )
-        hf.addWidget(self.hf_local_files)
-        local.addWidget(self.hf_section)
-        self.show_hf_download.toggled.connect(self.hf_section.setVisible)
-
-        self.runtime_stats_group = QGroupBox("Runtime stats")
-        stats = QGridLayout(self.runtime_stats_group)
-        stats.setContentsMargins(12, 18, 12, 12)
-        stats.setHorizontalSpacing(10)
-        stats.setVerticalSpacing(6)
-        self.speed_label = QLabel("Speed: -")
-        self.speed_label.setTextFormat(Qt.RichText)
-        self.speed_label.setStyleSheet(
-            "color: #1a1a1a; font-family: Consolas; font-weight: bold;"
-        )
-        self.tokens_label = QLabel("Tokens: total 0 | task 0")
-        self.tokens_label.setTextFormat(Qt.RichText)
-        self.tokens_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
-        self.request_tokens_label = QLabel("Request: -")
-        self.request_tokens_label.setTextFormat(Qt.RichText)
-        self.request_tokens_label.setStyleSheet(
-            "font-family: Consolas; color: #1a1a1a;"
-        )
-        self.tokens_saved_label = QLabel("Saved: 0")
-        self.tokens_saved_label.setTextFormat(Qt.RichText)
-        self.tokens_saved_label.setStyleSheet("color: #1a1a1a;")
-        self.active_time_label = QLabel("Active: 0:00 (PP 0:00 | TG 0:00)")
-        self.active_time_label.setTextFormat(Qt.RichText)
-        self.active_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
-        self.active_time_label.setToolTip(
-            "Active — суммарное время работы модели (prompt processing + "
-            "token generation) с момента старта сервера или последнего "
-            "Reset session. Простой и ожидание в очереди не считаются. "
-            "Сбрасывается при каждом старте сервера и по Reset session."
-        )
-        self.current_time_label = QLabel("Current: 0:00 (PP 0:00 | TG 0:00)")
-        self.current_time_label.setTextFormat(Qt.RichText)
-        self.current_time_label.setStyleSheet("font-family: Consolas; color: #1a1a1a;")
-        self.current_time_label.setToolTip(
-            "Current — время последнего запроса (prompt processing + "
-            "token generation). Точное значение приходит из llama_print_timings "
-            "по завершении запроса."
-        )
-        self.tokens_reset_btn = QPushButton("Save task & reset")
-        self.tokens_reset_btn.setToolTip(
-            "Save current task token count to Saved and start the next task from zero. "
-            "Resets the task counter, Current time and Request label."
-        )
-        self.export_stats_btn = QPushButton("Export stats")
-        self.export_stats_btn.setToolTip(
-            "Export current runtime counters to a JSON file."
-        )
-        self.copy_stats_md_btn = QPushButton("Copy stats MD")
-        self.copy_stats_md_btn.setToolTip(
-            "Copy current runtime counters to the clipboard as Markdown."
-        )
-        self.reset_session_btn = QPushButton("Reset session")
-        self.reset_session_btn.setToolTip(
-            "Zero all live runtime stats: total/task tokens, prompt/generated, "
-            "Active and Current time, Request label. Saved history is kept."
-        )
-        self.reset_saved_btn = QPushButton("Reset saved")
-        self.reset_saved_btn.setToolTip(
-            "Zero the accumulated Saved history (last and total)."
-        )
-        for btn in [
-            self.tokens_reset_btn,
-            self.export_stats_btn,
-            self.copy_stats_md_btn,
-            self.reset_session_btn,
-            self.reset_saved_btn,
-        ]:
-            btn.setMinimumWidth(120)
-            btn.setMaximumWidth(150)
-
-        stats.addWidget(self.speed_label, 0, 0, 1, 3)
-        stats.addWidget(self.tokens_label, 1, 0, 1, 2)
-        stats.addWidget(self.tokens_reset_btn, 1, 2)
-        stats.addWidget(self.request_tokens_label, 2, 0)
-        stats.addWidget(self.tokens_saved_label, 2, 1)
-        stats.addWidget(self.reset_saved_btn, 2, 2)
-        stats.addWidget(self.active_time_label, 3, 0, 1, 2)
-        stats.addWidget(self.reset_session_btn, 3, 2)
-        stats.addWidget(self.current_time_label, 4, 0, 1, 2)
-        stats.addWidget(self.export_stats_btn, 4, 2)
-        stats.addWidget(self.copy_stats_md_btn, 5, 2)
-        stats.setColumnStretch(1, 1)
-        lay.addWidget(self.runtime_stats_group)
-
-        # === 3. Производительность ===
-        g_launch = QGroupBox("Launch settings")
-        launch = QVBoxLayout(g_launch)
-        launch.setContentsMargins(12, 18, 12, 12)
-        launch.setSpacing(8)
-
-        self.adv_panel = CollapsiblePanel("Advanced: Performance, Memory and MTP")
-        lperf = self.adv_panel.content_layout
-        lperf.setContentsMargins(8, 6, 8, 6)
-        lperf.setSpacing(8)
-        self.sampling_panel = CollapsiblePanel("Generation: Sampling and Penalties")
-        sampling = self.sampling_panel.content_layout
-        sampling.setContentsMargins(8, 6, 8, 6)
-        sampling.setSpacing(8)
-        self.server_panel = CollapsiblePanel("Server, Templates and Diagnostics")
-        server_opts = self.server_panel.content_layout
-        server_opts.setContentsMargins(8, 6, 8, 6)
-        server_opts.setSpacing(8)
-        # Launch settings — видимый блок сразу за Model (runtime stats сейчас на индексе 2)
-        lay.insertWidget(2, g_launch)
-
-        self.gpu_layers = QSpinBox()
-        self.gpu_layers.setRange(0, 999)
-        self.gpu_layers.setValue(33)
-        self.gpu_auto = QCheckBox("auto")
-        self.gpu_auto.setChecked(True)
-        self.gpu_layers_all = QCheckBox("all")
-
-        def sync_gpu_layer_controls():
-            self.gpu_layers.setDisabled(
-                self.gpu_auto.isChecked() or self.gpu_layers_all.isChecked()
-            )
-            self.gpu_auto.setDisabled(self.gpu_layers_all.isChecked())
-
-        self.gpu_auto.toggled.connect(lambda _checked: sync_gpu_layer_controls())
-        self.gpu_layers_all.toggled.connect(lambda _checked: sync_gpu_layer_controls())
-        sync_gpu_layer_controls()
-        self.cpu_moe_layers = QSpinBox()
-        self.cpu_moe_layers.setRange(-1, 200)
-        self.cpu_moe_layers.setValue(-1)
-        self.cpu_moe_layers.setSpecialValueText("auto")
-
-        self.cuda_status_label = QLabel("CUDA build: not checked")
-        self.cuda_status_label.setWordWrap(True)
-        self.cuda_status_label.setStyleSheet("color: #666;")
-        self.cuda_status_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        r_cuda = QHBoxLayout()
-        r_cuda.addWidget(QLabel("CUDA build:"))
-        r_cuda.addWidget(self.cuda_version_combo)
-        r_cuda.addWidget(self.cuda_status_label, 1)
-        launch.addLayout(r_cuda)
-
-        r1 = QHBoxLayout()
-        r1.addWidget(QLabel("GPU offload (-ngl):"))
-        r1.addWidget(self.gpu_layers)
-        r1.addWidget(self.gpu_auto)
-        r1.addWidget(self.gpu_layers_all)
-        r1.addStretch(1)
-
-        self.ctx_size = QSpinBox()
-        self.ctx_size.setRange(-1, 1048576)
-        self.ctx_size.setSingleStep(512)
-        self.ctx_size.setValue(-1)
-        self.ctx_size.setSpecialValueText("auto")
-
-        self.preset_name_combo = QComboBox()
-        self.preset_name_combo.setEditable(False)
-        self.preset_name_combo.addItem("default")
-        self.preset_name_combo.setCurrentText("default")
-        self.preset_name_combo.setMinimumWidth(130)
-        self.preset_name_combo.setMaximumWidth(220)
-        self.preset_name_combo.setToolTip(
-            "Preset name for current model; use task names like coding or rag"
-        )
-
-        self.save_preset_btn = QPushButton("Save Preset")
-        self.save_preset_btn.setToolTip(
-            "Save parameters (ngl, ncmoe, etc.) under selected preset name"
-        )
-        self.add_preset_btn = QPushButton("Add")
-        self.add_preset_btn.setToolTip("Add a named preset for the selected model")
-        self.delete_preset_btn = QPushButton("Delete")
-        self.delete_preset_btn.setEnabled(False)
-        self.delete_preset_btn.setToolTip(
-            "Delete the selected named preset. The default preset cannot be deleted."
-        )
-
-        self.preset_status = QLabel("Preset: none")
-        self.preset_status.setStyleSheet("color: #888;")
-
-        r2 = QHBoxLayout()
-        r2.addWidget(QLabel("Context Size (-c):"))
-        r2.addWidget(self.ctx_size)
-        r2.addSpacing(10)
-        r2.addWidget(QLabel("CPU MoE (-ncmoe):"))
-        r2.addWidget(self.cpu_moe_layers)
-        r2.addSpacing(10)
-
-        self.ctx_quick_buttons = []
-        for label, value in [
-            ("8K", 8192),
-            ("16K", 16384),
-            ("24K", 24576),
-            ("32K", 32768),
-            ("41K", 40960),
-            ("65K", 65536),
-            ("128K", 131072),
-            ("256K", 262144),
-        ]:
-            btn = QPushButton(label)
-            btn.setFixedWidth(42 if len(label) <= 3 else 50)
-            btn.setFixedHeight(24)
-            btn.setToolTip(f"Set Context Size to {value}")
-            btn.setProperty("ctx_value", value)
-            self.ctx_quick_buttons.append(btn)
-            r2.addWidget(btn)
-
-        r2.addStretch(1)
-        launch.addLayout(r2)
-        launch.addLayout(r1)
-
-        self.batch_size = QSpinBox()
-        self.batch_size.setRange(-1, 32768)
-        self.batch_size.setSingleStep(128)
-        self.batch_size.setValue(-1)
-        self.batch_size.setSpecialValueText("auto")
-        self.ubatch_size = QSpinBox()
-        self.ubatch_size.setRange(-1, 8192)
-        self.ubatch_size.setSingleStep(64)
-        self.ubatch_size.setValue(-1)
-        self.ubatch_size.setSpecialValueText("auto")
-
-        self.cache_type_k = QComboBox()
-        self.cache_type_v = QComboBox()
-        for ct in ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]:
-            self.cache_type_k.addItem(ct)
-            self.cache_type_v.addItem(ct)
-
-        r3 = QHBoxLayout()
-        r3.addWidget(QLabel("Batch / UBatch:"))
-        r3.addWidget(self.batch_size)
-        r3.addWidget(self.ubatch_size)
-        r3.addSpacing(12)
-        r3.addWidget(QLabel("KV K / V:"))
-        r3.addWidget(self.cache_type_k)
-        r3.addWidget(self.cache_type_v)
-        r3.addStretch(1)
-        launch.addLayout(r3)
-
-        self.threads = QSpinBox()
-        self.threads.setRange(1, 64)
-        self.threads.setValue(os.cpu_count() or 4)
-        self.threads_batch = QSpinBox()
-        self.threads_batch.setRange(0, 64)
-        self.threads_batch.setSpecialValueText("same")
-        self.threads_batch.setValue(0)
-        r4 = QHBoxLayout()
-        r4.addWidget(QLabel("Threads gen / batch (-t / -tb):"))
-        r4.addWidget(self.threads)
-        r4.addWidget(self.threads_batch)
-        perf_header = QLabel("Performance and Memory:")
-        perf_header.setStyleSheet("font-weight: bold; color: #666;")
-        lperf.addWidget(perf_header)
-        lperf.addLayout(r4)
-
-        self.flash_attn = QCheckBox("Flash Attention (-fa)")
-        self.flash_attn.setChecked(True)
-        self.fit_off = QCheckBox("Fit off (--fit off)")
-        self.fit_off.setChecked(True)
-        r6 = QHBoxLayout()
-        r6.addWidget(self.flash_attn)
-        r6.addWidget(self.fit_off)
-        r6.addStretch(1)
-        r6.addWidget(QLabel("Preset:"))
-        r6.addWidget(self.preset_name_combo)
-        r6.addWidget(self.add_preset_btn)
-        r6.addWidget(self.delete_preset_btn)
-        r6.addWidget(self.save_preset_btn)
-        r6.addWidget(self.preset_status)
-        launch.addLayout(r6)
-
-        self.reasoning_mode = QComboBox()
-        self.reasoning_mode.addItems(["off", "auto", "on"])
-        self.reasoning_mode.setCurrentText("off")
-        self.enable_thinking = QComboBox()
-        self.enable_thinking.addItems(["off", "false", "true"])
-        self.enable_thinking.setCurrentText("off")
-        r7 = QHBoxLayout()
-        r7.addWidget(QLabel("Reasoning (--reasoning):"))
-        r7.addWidget(self.reasoning_mode)
-        r7.addSpacing(10)
-        r7.addWidget(QLabel("Thinking:"))
-        r7.addWidget(self.enable_thinking)
-        sampling.addLayout(r7)
-
-        self.host = QLineEdit(placeholderText="127.0.0.1")
-        self.host.setText("127.0.0.1")
-        self.host.setMaximumWidth(120)
-        self.port = QSpinBox()
-        self.port.setRange(1024, 65535)
-        self.port.setValue(8080)
-        self.parallel_slots = QSpinBox()
-        self.parallel_slots.setRange(-1, 16)
-        self.parallel_slots.setValue(-1)
-        self.parallel_slots.setSpecialValueText("auto")
-        r8 = QHBoxLayout()
-        r8.addWidget(QLabel("Host:"))
-        r8.addWidget(self.host)
-        r8.addWidget(QLabel("Port:"))
-        r8.addWidget(self.port)
-        r8.addSpacing(10)
-        r8.addWidget(QLabel("Slots (-np):"))
-        r8.addWidget(self.parallel_slots)
-        server_opts.addLayout(r8)
-
-        self.kv_unified = QCheckBox("KV unified (-kvu)")
-        self.speculative_mtp = QCheckBox("MTP speculative")
-        self.spec_draft_n_max = QSpinBox()
-        self.spec_draft_n_max.setRange(1, 32)
-        self.spec_draft_n_max.setValue(8)
-        self.spec_draft_n_max.setToolTip(
-            "Maximum speculative MTP tokens. Coding default: 8; conservative: 2-4; aggressive: 16."
-        )
-        self.spec_draft_p_min = QDoubleSpinBox()
-        self.spec_draft_p_min.setRange(0.0, 1.0)
-        self.spec_draft_p_min.setDecimals(2)
-        self.spec_draft_p_min.setSingleStep(0.05)
-        self.spec_draft_p_min.setValue(0.8)
-        self.spec_draft_p_min.setToolTip(
-            "Minimum MTP confidence. 0.8 avoids expensive long speculation when the draft head is uncertain."
-        )
-        self.spec_draft_gpu_layers = QLineEdit(placeholderText="all")
-        self.spec_draft_gpu_layers.setText("all")
-        self.spec_draft_gpu_layers.setMaximumWidth(60)
-        r8b = QHBoxLayout()
-        r8b.addWidget(self.kv_unified)
-        r8b.addWidget(self.speculative_mtp)
-        r8b.addSpacing(10)
-        r8b.addWidget(QLabel("MTP n-max / p-min / draft ngl:"))
-        r8b.addWidget(self.spec_draft_n_max)
-        r8b.addWidget(self.spec_draft_p_min)
-        r8b.addWidget(self.spec_draft_gpu_layers)
-        lperf.addLayout(r8b)
-
-        r8b2 = QHBoxLayout()
-        r8b2.addWidget(QLabel("MTP draft GGUF:"))
-        self.spec_draft_model_path = QLineEdit(
-            placeholderText="Auto-detected, or browse for separate MTP GGUF"
-        )
-        self.spec_draft_model_path.setToolTip(
-            "Optional separate MTP/draft GGUF. Gemma 4 packages often include it in an MTP folder; Qwen3.6 may require a separate file."
-        )
-        self.spec_draft_model_btn = QPushButton("...")
-        self.spec_draft_model_btn.setFixedWidth(32)
-        self.spec_draft_model_btn.clicked.connect(
-            lambda _checked=False: self._browse_mtp_draft_clicked()
-        )
-        r8b2.addWidget(self.spec_draft_model_path, 1)
-        r8b2.addWidget(self.spec_draft_model_btn)
-        lperf.addLayout(r8b2)
-
-        self.cuda_device = QLineEdit(placeholderText="CUDA0")
-        self.cuda_device.setMaximumWidth(80)
-        self.spec_draft_device = QLineEdit(placeholderText="CUDA0")
-        self.spec_draft_device.setMaximumWidth(80)
-        self.split_mode = QComboBox()
-        self.split_mode.addItems(["", "none", "layer", "row"])
-        self.main_gpu = QSpinBox()
-        self.main_gpu.setRange(-1, 16)
-        self.main_gpu.setSpecialValueText("auto")
-        self.main_gpu.setValue(-1)
-        r8c = QHBoxLayout()
-        r8c.addWidget(QLabel("Device:"))
-        r8c.addWidget(self.cuda_device)
-        r8c.addWidget(QLabel("Draft device:"))
-        r8c.addWidget(self.spec_draft_device)
-        r8c.addWidget(QLabel("Split:"))
-        r8c.addWidget(self.split_mode)
-        r8c.addWidget(QLabel("Main GPU:"))
-        r8c.addWidget(self.main_gpu)
-        lperf.addLayout(r8c)
-
-        self.ctx_checkpoints = QSpinBox()
-        self.ctx_checkpoints.setRange(-1, 128)
-        self.ctx_checkpoints.setSpecialValueText("default")
-        self.ctx_checkpoints.setValue(-1)
-        self.cache_ram = QSpinBox()
-        self.cache_ram.setRange(-2, 262144)
-        self.cache_ram.setSpecialValueText("default")
-        self.cache_ram.setValue(-2)
-        r9 = QHBoxLayout()
-        r9.addWidget(QLabel("Ctx Checkpoints:"))
-        r9.addWidget(self.ctx_checkpoints)
-        r9.addSpacing(10)
-        r9.addWidget(QLabel("Cache RAM (MiB):"))
-        r9.addWidget(self.cache_ram)
-        lperf.addLayout(r9)
-        # === 4. Generation / Sampling ===
-        self.temperature = QDoubleSpinBox()
-        self.temperature.setRange(-1.0, 2.0)
-        self.temperature.setSingleStep(0.1)
-        self.temperature.setValue(-1.0)
-        self.temperature.setDecimals(2)
-        self.temperature.setSpecialValueText("auto")
-        self.repeat_penalty = QDoubleSpinBox()
-        self.repeat_penalty.setRange(-1.0, 2.0)
-        self.repeat_penalty.setSingleStep(0.01)
-        self.repeat_penalty.setValue(-1.0)
-        self.repeat_penalty.setDecimals(2)
-        self.repeat_penalty.setSpecialValueText("auto")
-        self.top_k = QSpinBox()
-        self.top_k.setRange(-1, 10000)
-        self.top_k.setValue(-1)
-        self.top_k.setSpecialValueText("auto")
-        self.top_p = QDoubleSpinBox()
-        self.top_p.setRange(-1.0, 1.0)
-        self.top_p.setSingleStep(0.01)
-        self.top_p.setDecimals(3)
-        self.top_p.setValue(-1.0)
-        self.top_p.setSpecialValueText("auto")
-        self.min_p = QDoubleSpinBox()
-        self.min_p.setRange(-1.0, 1.0)
-        self.min_p.setSingleStep(0.01)
-        self.min_p.setDecimals(3)
-        self.min_p.setValue(-1.0)
-        self.min_p.setSpecialValueText("auto")
-        self.typical_p = QDoubleSpinBox()
-        self.typical_p.setRange(-1.0, 1.0)
-        self.typical_p.setSingleStep(0.01)
-        self.typical_p.setDecimals(3)
-        self.typical_p.setValue(-1.0)
-        self.typical_p.setSpecialValueText("auto")
-        self.repeat_last_n = QSpinBox()
-        self.repeat_last_n.setRange(-2, 1048576)
-        self.repeat_last_n.setValue(-2)
-        self.repeat_last_n.setSpecialValueText("auto")
-        self.presence_penalty = QDoubleSpinBox()
-        self.presence_penalty.setRange(-3.0, 2.0)
-        self.presence_penalty.setSingleStep(0.05)
-        self.presence_penalty.setDecimals(2)
-        self.presence_penalty.setValue(-3.0)
-        self.presence_penalty.setSpecialValueText("auto")
-        self.frequency_penalty = QDoubleSpinBox()
-        self.frequency_penalty.setRange(-3.0, 2.0)
-        self.frequency_penalty.setSingleStep(0.05)
-        self.frequency_penalty.setDecimals(2)
-        self.frequency_penalty.setValue(-3.0)
-        self.frequency_penalty.setSpecialValueText("auto")
-        self.seed = QSpinBox()
-        self.seed.setRange(-2, 2147483647)
-        self.seed.setValue(-2)
-        self.seed.setSpecialValueText("auto")
-
-        sampling_grid = QGridLayout()
-        sampling_grid.setHorizontalSpacing(10)
-        sampling_grid.setVerticalSpacing(6)
-        sampling_fields = [
-            ("Temperature (--temp):", self.temperature),
-            ("Top K (--top-k):", self.top_k),
-            ("Top P (--top-p):", self.top_p),
-            ("Min P (--min-p):", self.min_p),
-            ("Typical P (--typical):", self.typical_p),
-            ("Seed (--seed):", self.seed),
-            ("Repeat penalty:", self.repeat_penalty),
-            ("Repeat last N:", self.repeat_last_n),
-            ("Presence penalty:", self.presence_penalty),
-            ("Frequency penalty:", self.frequency_penalty),
-        ]
-        for index, (label, widget) in enumerate(sampling_fields):
-            row, column = divmod(index, 2)
-            sampling_grid.addWidget(QLabel(label), row, column * 2)
-            sampling_grid.addWidget(widget, row, column * 2 + 1)
-        sampling_help = {
-            self.temperature: "Randomness. auto keeps the llama-server default.",
-            self.top_k: "Keep K most likely tokens; 0 disables Top-K.",
-            self.top_p: "Nucleus sampling threshold; 1.0 disables Top-P.",
-            self.min_p: "Minimum probability relative to the best token; 0 disables Min-P.",
-            self.typical_p: "Locally typical sampling; 1.0 disables it.",
-            self.seed: "RNG seed. -1 requests a random seed; auto omits the flag.",
-            self.repeat_penalty: "Penalty for repeated token sequences; 1.0 disables it.",
-            self.repeat_last_n: "How many recent tokens are penalized; -1 means full context.",
-            self.presence_penalty: "Penalty based on whether a token already appeared; 0 disables it.",
-            self.frequency_penalty: "Penalty based on token repetition count; 0 disables it.",
-        }
-        for widget, help_text in sampling_help.items():
-            widget.setToolTip(help_text)
-        sampling.addLayout(sampling_grid)
-
-        self.use_mmap = QCheckBox("mmap")
-        self.use_mmap.setChecked(True)
-        self.use_mlock = QCheckBox("mlock")
-        self.verbose = QCheckBox("verbose")
-        self.log_timestamps = QCheckBox("log timestamps")
-        memory_flags = QHBoxLayout()
-        memory_flags.addWidget(self.use_mmap)
-        memory_flags.addWidget(self.use_mlock)
-        memory_flags.addStretch(1)
-        lperf.addLayout(memory_flags)
-        diagnostics_flags = QHBoxLayout()
-        diagnostics_flags.addWidget(self.verbose)
-        diagnostics_flags.addWidget(self.log_timestamps)
-        diagnostics_flags.addStretch(1)
-        server_opts.addLayout(diagnostics_flags)
-
-        self.cuda_visible_devices = QLineEdit(placeholderText="CUDA_VISIBLE_DEVICES")
-        self.cuda_visible_devices.setMaximumWidth(120)
-        self.cuda_module_loading = QLineEdit(placeholderText="CUDA_MODULE_LOADING")
-        self.cuda_module_loading.setText("LAZY")
-        self.cuda_module_loading.setMaximumWidth(80)
-        s_cuda = QHBoxLayout()
-        s_cuda.addWidget(QLabel("CUDA env:"))
-        s_cuda.addWidget(self.cuda_visible_devices)
-        s_cuda.addWidget(self.cuda_module_loading)
-        s_cuda.addStretch(1)
-        lperf.addLayout(s_cuda)
-
-        self.cont_batching = QCheckBox("cont batching")
-        self.cont_batching.setChecked(True)
-        self.cache_prompt = QCheckBox("cache prompt")
-        self.cache_prompt.setChecked(True)
-        self.context_shift = QCheckBox("context shift")
-        self.no_webui = QCheckBox("no webui")
-        self.jinja = QCheckBox("jinja")
-        s3 = QHBoxLayout()
-        for w in [
-            self.cont_batching,
-            self.cache_prompt,
-            self.context_shift,
-            self.no_webui,
-            self.jinja,
-        ]:
-            s3.addWidget(w)
-        server_opts.addLayout(s3)
-
-        s_tpl = QHBoxLayout()
-        self.use_chat_template = QCheckBox("--chat-template-file")
-        self.chat_template_file = QLineEdit(
-            placeholderText="Path to .jinja chat template"
-        )
-        self.chat_template_file.setToolTip(
-            "Override the model's built-in chat template with an external .jinja file. "
-            "Required for Qwen3.6 tool calls when using the relaxed template."
-        )
-        self.chat_template_btn = QPushButton("...")
-        self.chat_template_btn.setFixedWidth(32)
-        self.chat_template_btn.clicked.connect(
-            lambda _checked=False: self._browse_chat_template_clicked()
-        )
-        s_tpl.addWidget(self.use_chat_template)
-        s_tpl.addWidget(self.chat_template_file, 1)
-        s_tpl.addWidget(self.chat_template_btn)
-        server_opts.addLayout(s_tpl)
-
-        server_opts.addWidget(QLabel("Extra params (only uncommon llama-server flags):"))
-        self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
-        self.extra_args.setPlaceholderText("--dry-multiplier 0.8 --xtc-probability 0.1 ...")
-        server_opts.addWidget(self.extra_args)
-
-        # === 5. Интеграция ===
-        self.int_panel = CollapsiblePanel("Integration (OpenCode / PI / Claude Code)")
-
-        oc_layout = QHBoxLayout()
-        oc_layout.addWidget(QLabel("OpenCode JSON:"))
-        self.opencode_config_path = QLineEdit(placeholderText="Path to opencode.json")
-        oc_btn = QPushButton("...")
-        oc_btn.clicked.connect(self._browse_opencode_clicked)
-        oc_layout.addWidget(self.opencode_config_path)
-        oc_layout.addWidget(oc_btn)
-        self.int_panel.add_layout(oc_layout)
-
-        pi_layout = QHBoxLayout()
-        pi_layout.addWidget(QLabel("PI JSON:"))
-        self.pi_config_path = QLineEdit(placeholderText="Path to PI config.json")
-        pi_btn = QPushButton("...")
-        pi_btn.clicked.connect(self._browse_pi_clicked)
-        pi_layout.addWidget(self.pi_config_path)
-        pi_layout.addWidget(pi_btn)
-        self.int_panel.add_layout(pi_layout)
-
-        claude_layout = QHBoxLayout()
-        claude_layout.addWidget(QLabel("Claude settings JSON:"))
-        self.claude_config_path = QLineEdit(
-            placeholderText="Path to ~/.claude/settings.json"
-        )
-        claude_btn = QPushButton("...")
-        claude_btn.clicked.connect(self._browse_claude_clicked)
-        claude_layout.addWidget(self.claude_config_path)
-        claude_layout.addWidget(claude_btn)
-        self.int_panel.add_layout(claude_layout)
-
-        tgt_layout = QHBoxLayout()
-        tgt_layout.addWidget(QLabel("Target:"))
-        self.integration_target = QComboBox()
-        self.integration_target.addItem("OpenCode", "opencode")
-        self.integration_target.addItem("PI", "pi")
-        self.integration_target.addItem("Claude Code", "claude")
-        tgt_layout.addWidget(self.integration_target)
-        self.integration_check_btn = QPushButton("Check")
-        tgt_layout.addWidget(self.integration_check_btn)
-        self.int_panel.add_layout(tgt_layout)
-
-        self.integration_model_label = QLabel(
-            "Model to add: not selected", wordWrap=True
-        )
-        self.int_panel.add_widget(self.integration_model_label)
-
-        self.integration_models_list = QListWidget()
-        self.integration_models_list.setMinimumHeight(80)
-        self.int_panel.add_widget(self.integration_models_list)
-
-        act_layout = QHBoxLayout()
-        self.integration_add_btn = QPushButton("Add")
-        self.integration_remove_btn = QPushButton("Remove")
-        act_layout.addWidget(self.integration_add_btn)
-        act_layout.addWidget(self.integration_remove_btn)
-        self.int_panel.add_layout(act_layout)
-
-        self.integration_status = QLabel(
-            "Specify config path and click Check", wordWrap=True
-        )
-        self.int_panel.add_widget(self.integration_status)
-
-        # === 6. Бенчмарк ===
-        self.bench_panel = CollapsiblePanel("Benchmark")
-        bp_layout = QHBoxLayout()
-        bp_layout.addWidget(QLabel("Prompt (-p):"))
-        self.bench_prompt = QSpinBox()
-        self.bench_prompt.setRange(16, 4096)
-        self.bench_prompt.setValue(128)
-        self.bench_prompt.setSingleStep(64)
-        bp_layout.addWidget(self.bench_prompt)
-        bp_layout.addSpacing(10)
-        bp_layout.addWidget(QLabel("Gen (-n):"))
-        self.bench_gen = QSpinBox()
-        self.bench_gen.setRange(16, 4096)
-        self.bench_gen.setValue(256)
-        self.bench_gen.setSingleStep(64)
-        bp_layout.addWidget(self.bench_gen)
-        self.bench_panel.add_layout(bp_layout)
-
-        bench_buttons = QHBoxLayout()
-        self.test_btn = QPushButton("Test Speed")
-        self.test_btn.setStyleSheet(
-            "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
-        )
-        self.autotune_btn = QPushButton("AutoTune...")
-        self.autotune_btn.setToolTip(
-            "Open AutoTune, build candidates from current model/context, then run automatic benchmark"
-        )
-        self.autotune_btn.setStyleSheet(
-            "background-color: #673AB7; color: white; font-weight: bold; padding: 6px;"
-        )
-        bench_buttons.addWidget(self.test_btn)
-        bench_buttons.addWidget(self.autotune_btn)
-        self.bench_panel.add_layout(bench_buttons)
-
-        self.autotune = AutoTuneWidget()
-        self.bench_panel.add_widget(self.autotune)
-
-        # === 7. Preview CLI ===
-        g_cli = QGroupBox("CLI Preview")
-        cli_layout = QVBoxLayout()
-        cli_controls = QHBoxLayout()
-        self.cli_manual_mode = QCheckBox("Edit CLI")
-        self.cli_manual_mode.setToolTip(
-            "Enable direct command editing. Apply CLI parses known flags back into UI and keeps unknown flags in Extra params."
-        )
-        self.cli_apply_btn = QPushButton("Apply CLI")
-        self.cli_apply_btn.setEnabled(False)
-        self.cli_apply_btn.setToolTip(
-            "Parse the edited command: known flags update UI controls, unknown flags go to Extra params."
-        )
-        self.cli_copy_btn = QPushButton("Copy CLI")
-        self.cli_copy_btn.setToolTip("Copy the current generated command line.")
-        self.cli_import_btn = QPushButton("Import CLI")
-        self.cli_import_btn.setToolTip(
-            "Read a llama-server command line from the clipboard and apply it to settings."
-        )
-        self.cli_status = QLabel("Generated from UI")
-        self.cli_status.setStyleSheet("color: #888;")
-        cli_controls.addWidget(self.cli_manual_mode)
-        cli_controls.addWidget(self.cli_apply_btn)
-        cli_controls.addWidget(self.cli_copy_btn)
-        cli_controls.addWidget(self.cli_import_btn)
-        cli_controls.addWidget(self.cli_status, 1)
-        self.cli_preview = QLineEdit(
-            placeholderText="Command will be displayed here...", readOnly=True
-        )
-        self.cli_preview.setStyleSheet(
-            "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
-        )
-        g_cli.setLayout(cli_layout)
-        cli_layout.addLayout(cli_controls)
-        cli_layout.addWidget(self.cli_preview)
-
-        # === 8. Итоговый порядок блоков ===
-        lay.addWidget(self.paths_panel)
-        lay.addWidget(self.adv_panel)
-        lay.addWidget(self.sampling_panel)
-        lay.addWidget(self.server_panel)
-        lay.addWidget(self.models_panel)
-        lay.addWidget(self.int_panel)
-        lay.addWidget(self.bench_panel)
-        lay.addWidget(g_cli)
-        lay.addStretch()
+    def _build_left_panel(self):
+        panel = QWidget()
+        panel.setMinimumWidth(720)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(10)
+
+        # Секции собираются отдельными методами (Этап 3.1); порядок
+        # добавления панелей задаёт _assemble_left_sections.
+        self._build_launch_controls_section(lay)
+        self._build_paths_section()
+        self._build_model_section(lay)
+        self._build_hf_models_section(lay)
+        self._build_performance_section(lay)
+        self._build_sampling_section()
+        self._build_integration_section()
+        self._build_benchmark_section()
+        self._build_cli_section(lay)
+        self._assemble_left_sections(lay)
+        self._apply_advanced_mode(self.advanced_mode_chk.isChecked())
 
         # Collect all widgets that must be locked while server/bench/autotune runs
         self._runtime_lockable = [
@@ -1130,17 +224,1175 @@ class MainWindowUI(QMainWindow):
         scroll.setMaximumWidth(940)
         return scroll
 
+    def _build_launch_controls_section(self, lay):
+        # === 0. Кнопки управления (вверху, чтобы не скролить) ===
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton(self.tr("Start Server"))
+        self.start_btn.setStyleSheet(
+            "background-color: " + STATUS_COLOR_RUNNING + "; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.reload_btn = QPushButton(self.tr("Restart"), enabled=False)
+        self.reload_btn.setVisible(False)
+        self.reload_btn.setToolTip(
+            "Restart the running server and apply the current model parameters"
+        )
+        self.reload_btn.setStyleSheet(
+            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.stop_btn = QPushButton(self.tr("Stop"), enabled=False)
+        self.stop_btn.setStyleSheet(
+            "background-color: " + STATUS_COLOR_ERROR + "; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.force_stop_btn = QPushButton(self.tr("Force Stop"), enabled=True)
+        self.force_stop_btn.setToolTip(
+            "Immediately kills llama-server process tree if normal stop is stuck"
+        )
+        self.force_stop_btn.setStyleSheet(
+            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.force_stop_btn.setVisible(False)
+        self.more_actions_btn = QPushButton(self.tr("..."))
+        self.more_actions_btn.setFixedWidth(38)
+        self.more_actions_btn.setToolTip("More server actions")
+        self.more_actions_menu = QMenu(self.more_actions_btn)
+        self.force_stop_action = QAction("Force Stop", self.more_actions_menu)
+        self.force_stop_action.setToolTip(
+            "Immediately kills llama-server process tree if normal stop is stuck"
+        )
+        self.more_actions_menu.addAction(self.force_stop_action)
+        self.more_actions_btn.setMenu(self.more_actions_menu)
+
+        # Basic/Advanced (Этап 3.2): скрывает продвинутые панели разом.
+        self.advanced_mode_chk = QCheckBox(self.tr("Advanced settings"))
+        self.advanced_mode_chk.setChecked(
+            self.ui_settings.value("advancedMode", True, type=bool)
+        )
+        self.advanced_mode_chk.setToolTip(
+            "Show advanced panels: Paths, Performance/MTP, Sampling, "
+            "Server/Diagnostics. Basic mode keeps model selection, launch "
+            "controls and Runtime stats."
+        )
+        self.advanced_mode_chk.toggled.connect(self._apply_advanced_mode)
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.reload_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.more_actions_btn)
+        btn_row.addWidget(self.advanced_mode_chk)
+        lay.addLayout(btn_row)
+
+    def _apply_advanced_mode(self, advanced: bool):
+        """Basic mode: спрятать продвинутые панели, оставить Model + Launch."""
+        for panel in self._advanced_panels():
+            panel.setVisible(bool(advanced))
+        self.ui_settings.setValue("advancedMode", bool(advanced))
+
+    def _advanced_panels(self):
+        return [
+            panel
+            for panel in (
+                getattr(self, "paths_panel", None),
+                getattr(self, "adv_panel", None),
+                getattr(self, "sampling_panel", None),
+                getattr(self, "server_panel", None),
+            )
+            if panel is not None
+        ]
+
+
+    def _build_paths_section(self):
+        # === 1. Пути === отдельный виджет (src/ui/panels/paths_panel.py);
+        # атрибуты реэкспортируются, чтобы config/main.py работали как раньше.
+        self.paths_panel = PathsPanel()
+        self.paths_panel.browse_exe_requested.connect(self._browse_exe_clicked)
+        self.paths_panel.browse_models_requested.connect(self._browse_model_dir_clicked)
+        self.exe_path = self.paths_panel.exe_path
+        self.bench_path = self.paths_panel.bench_path
+        self.model_dir = self.paths_panel.model_dir
+        self.cuda_version_combo = self.paths_panel.cuda_version_combo
+        self.update_llama_btn = self.paths_panel.update_llama_btn
+        self.update_status = self.paths_panel.update_status
+        self.update_progress = self.paths_panel.update_progress
+        self.language_combo = self.paths_panel.language_combo
+
+    def _save_language(self, index: int):
+        lang = str(self.language_combo.itemData(index) or "en")
+        self.ui_settings.setValue("language", lang)
+
+
+    def _build_model_section(self, lay):
+        # === 2. Модель ===
+        g_model = QGroupBox(self.tr("Model"))
+        lm = QVBoxLayout(g_model)
+        lm.setContentsMargins(12, 18, 12, 12)
+        lm.setSpacing(8)
+
+        scan_row = QHBoxLayout()
+        self.scan_btn = QPushButton(self.tr("Scan"))
+        scan_row.addWidget(self.scan_btn)
+        lm.addLayout(scan_row)
+
+        self.scan_status = QLabel(self.tr("Models not scanned"))
+        self.scan_progress = QProgressBar(visible=False, minimum=0, maximum=0)
+        lm.addWidget(self.scan_status)
+        lm.addWidget(self.scan_progress)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(False)
+        self.model_combo.setMinimumHeight(30)
+        self.model_combo.setMaxVisibleItems(25)
+        self.model_combo.setMinimumContentsLength(80)
+        self.model_combo.setStyleSheet(
+            "QComboBox { padding-left: 6px; padding-right: 34px; } "
+            "QComboBox::drop-down { width: 30px; }"
+        )
+
+        lm.addWidget(QLabel(self.tr("Found GGUF:")))
+        lm.addWidget(self.model_combo)
+
+        self.auto_params = QCheckBox(self.tr("Auto setup ctx/GPU/cache by GGUF"))
+        self.auto_params.setChecked(True)
+        lm.addWidget(self.auto_params)
+
+        mmproj_row = QHBoxLayout()
+        self.use_mmproj = QCheckBox(self.tr("Use mmproj"))
+        self.use_mmproj.setChecked(True)
+        self.mmproj_offload = QCheckBox(self.tr("mmproj offload"))
+        self.mmproj_offload.setChecked(True)
+        mmproj_row.addWidget(self.use_mmproj)
+        mmproj_row.addWidget(self.mmproj_offload)
+        lm.addLayout(mmproj_row)
+
+        self.model_info = QLabel(self.tr("Select model"))
+        self.model_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.model_id_label = QLabel(self.tr(""))
+        self.model_id_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.model_id_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.model_id_label.setWordWrap(True)
+        self.copy_model_btn = QPushButton(self.tr("Copy model path"))
+        self.copy_model_btn.setFixedHeight(22)
+        self.copy_model_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        mrow = QHBoxLayout()
+        mrow.addWidget(self.copy_model_btn)
+        mrow.addWidget(self.model_id_label, 1)
+        lm.addWidget(self.model_info)
+        lm.addLayout(mrow)
+        lay.addWidget(g_model)
+
+
+    def _build_hf_models_section(self, lay):
+        # === 2a. Локальные модели + загрузка с Hugging Face ===
+        self.models_panel = CollapsiblePanel(self.tr("Local model manager and download"))
+        local = self.models_panel.content_layout
+
+        local_row = QHBoxLayout()
+        self.local_models_refresh_btn = QPushButton(self.tr("Refresh local models"))
+        self.local_models_delete_btn = QPushButton(self.tr("Delete selected"))
+        self.local_models_delete_btn.setEnabled(False)
+        self.local_models_delete_btn.setToolTip(
+            "Safely delete the selected model folder/file from the Models base folder."
+        )
+        local_row.addWidget(QLabel(self.tr("All models under Models:")))
+        local_row.addStretch(1)
+        local_row.addWidget(self.local_models_refresh_btn)
+        local_row.addWidget(self.local_models_delete_btn)
+        local.addLayout(local_row)
+
+        self.local_models_list = QTableWidget(0, 5)
+        self.local_models_list.setHorizontalHeaderLabels(
+            ["Name", "Type", "GGUF", "Size", "Examples"]
+        )
+        self.local_models_list.setMaximumHeight(130)
+        self.local_models_list.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.local_models_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.local_models_list.horizontalHeader().setStretchLastSection(True)
+        self.local_models_list.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.local_models_list.setToolTip(
+            "Shows every local model folder/file found under the Models path, not only HF downloads. "
+            "Projectors/MTP drafts are included in folder deletion but not shown as standalone models."
+        )
+        local.addWidget(self.local_models_list)
+
+        self.local_models_status = QLabel(self.tr("Refresh to list local models"))
+        self.local_models_status.setWordWrap(True)
+        local.addWidget(self.local_models_status)
+
+        # --- Подблок загрузки с Hugging Face (можно скрыть) ---
+        self.show_hf_download = QCheckBox(self.tr("Show Hugging Face download"))
+        self.show_hf_download.setChecked(True)
+        self.show_hf_download.setToolTip(
+            "Uncheck to hide the Hugging Face download section and keep the panel compact."
+        )
+        local.addWidget(self.show_hf_download)
+
+        self.hf_section = QWidget()
+        hf = QVBoxLayout(self.hf_section)
+        hf.setContentsMargins(0, 0, 0, 0)
+        hf.setSpacing(6)
+
+        self.hf_repo = QLineEdit(
+            placeholderText="repo or URL, e.g. unsloth/Qwen3.6-27B-MTP-GGUF"
+        )
+        self.hf_repo.setToolTip(
+            "Paste Hugging Face repo id or model URL. Files are saved as:\n"
+            "<Models>/<author>/<model>/<file>.gguf, compatible with LM Studio."
+        )
+        hf.addWidget(self.hf_repo)
+
+        hf_filter_row = QHBoxLayout()
+        self.hf_quant_filter = QLineEdit(placeholderText="filter: Q4_K_M or Q3-BF16")
+        self.hf_quant_filter.setToolTip(
+            "Optional filter. Examples: Q4_K_M, IQ4, Q3-BF16.\n"
+            "Q3-BF16 means show quants from Q3 up to BF16."
+        )
+        self.hf_scan_btn = QPushButton(self.tr("Scan HF"))
+        hf_filter_row.addWidget(self.hf_quant_filter, 1)
+        hf_filter_row.addWidget(self.hf_scan_btn)
+        hf.addLayout(hf_filter_row)
+
+        hf_opts_row = QHBoxLayout()
+        self.hf_include_mmproj = QCheckBox(self.tr("also vision/mmproj"))
+        self.hf_include_mmproj.setChecked(True)
+        self.hf_download_btn = QPushButton(self.tr("Download selected models"))
+        self.hf_download_btn.setEnabled(False)
+        self.hf_pause_btn = QPushButton(self.tr("Pause selected"))
+        self.hf_pause_btn.setEnabled(False)
+        self.hf_cancel_btn = QPushButton(self.tr("Cancel selected"))
+        self.hf_cancel_btn.setEnabled(False)
+        hf_opts_row.addWidget(self.hf_include_mmproj)
+        hf_opts_row.addWidget(self.hf_download_btn)
+        hf_opts_row.addWidget(self.hf_pause_btn)
+        hf_opts_row.addWidget(self.hf_cancel_btn)
+        hf_opts_row.addStretch(1)
+        hf.addLayout(hf_opts_row)
+
+        self.hf_files = QTableWidget(0, 4)
+        self.hf_files.setHorizontalHeaderLabels(["Name", "Quant", "Size", "Progress"])
+        self.hf_files.setMaximumHeight(120)
+        self.hf_files.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.hf_files.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.hf_files.horizontalHeader().setStretchLastSection(True)
+        self.hf_files.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hf_files.setToolTip(
+            "Select one or several GGUF files (Ctrl/Shift). Each file is downloaded "
+            "as an independent concurrent task. Vision projector is added once."
+        )
+        hf.addWidget(self.hf_files)
+
+        self.hf_status = QLabel(self.tr("Paste repo and scan"))
+        self.hf_status.setWordWrap(True)
+        self.hf_progress = QProgressBar(visible=False, minimum=0, maximum=100)
+        hf.addWidget(self.hf_status)
+        hf.addWidget(self.hf_progress)
+
+        hf.addWidget(QLabel(self.tr("Downloads (select tasks to pause/cancel):")))
+        self.hf_downloads = QTableWidget(0, 6)
+        self.hf_downloads.setHorizontalHeaderLabels(
+            ["Name", "Status", "Progress", "Size", "Speed", "ETA"]
+        )
+        self.hf_downloads.setMaximumHeight(220)
+        self.hf_downloads.setWordWrap(False)
+        self.hf_downloads.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.hf_downloads.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.hf_downloads.horizontalHeader().setStretchLastSection(True)
+        self.hf_downloads.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hf_downloads.setToolTip(
+            "Independent parallel downloads with downloaded/total size, remaining size, "
+            "speed and ETA. Select one or several tasks before Pause/Cancel."
+        )
+        hf.addWidget(self.hf_downloads)
+
+        hf_local_row = QHBoxLayout()
+        self.hf_refresh_local_btn = QPushButton(self.tr("Refresh local"))
+        self.hf_delete_local_folder_btn = QPushButton(self.tr("Delete local folder"))
+        self.hf_delete_local_folder_btn.setEnabled(False)
+        hf_local_row.addWidget(QLabel(self.tr("Local files:")))
+        hf_local_row.addStretch(1)
+        hf_local_row.addWidget(self.hf_refresh_local_btn)
+        hf_local_row.addWidget(self.hf_delete_local_folder_btn)
+        hf.addLayout(hf_local_row)
+
+        self.hf_local_files = QTableWidget(0, 3)
+        self.hf_local_files.setHorizontalHeaderLabels(["Name", "Status", "Size"])
+        self.hf_local_files.setMaximumHeight(90)
+        self.hf_local_files.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.hf_local_files.horizontalHeader().setStretchLastSection(True)
+        self.hf_local_files.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hf_local_files.setToolTip(
+            "Files already present in <Models>/<author>/<model>. Delete local folder removes the whole repo folder including mmproj/vision files."
+        )
+        hf.addWidget(self.hf_local_files)
+        local.addWidget(self.hf_section)
+        self.show_hf_download.toggled.connect(self.hf_section.setVisible)
+
+        self.runtime_stats_group = QGroupBox(self.tr("Runtime stats"))
+        stats = QGridLayout(self.runtime_stats_group)
+        stats.setContentsMargins(12, 18, 12, 12)
+        stats.setHorizontalSpacing(10)
+        stats.setVerticalSpacing(6)
+        self.speed_label = QLabel(self.tr("Speed: -"))
+        self.speed_label.setTextFormat(Qt.RichText)
+        self.speed_label.setProperty("class", "mono")
+        self.tokens_label = QLabel(self.tr("Tokens: total 0 | task 0"))
+        self.tokens_label.setTextFormat(Qt.RichText)
+        self.tokens_label.setProperty("class", "mono")
+        self.request_tokens_label = QLabel(self.tr("Request: -"))
+        self.request_tokens_label.setTextFormat(Qt.RichText)
+        self.request_tokens_label.setProperty("class", "mono")
+        self.tokens_saved_label = QLabel(self.tr("Saved: 0"))
+        self.tokens_saved_label.setTextFormat(Qt.RichText)
+        self.tokens_saved_label.setProperty("class", "mono")
+        self.active_time_label = QLabel(self.tr("Active: 0:00 (PP 0:00 | TG 0:00)"))
+        self.active_time_label.setTextFormat(Qt.RichText)
+        self.active_time_label.setProperty("class", "mono")
+        self.active_time_label.setToolTip(
+            "Active — суммарное время работы модели (prompt processing + "
+            "token generation) с момента старта сервера или последнего "
+            "Reset session. Простой и ожидание в очереди не считаются. "
+            "Сбрасывается при каждом старте сервера и по Reset session."
+        )
+        self.current_time_label = QLabel(self.tr("Current: 0:00 (PP 0:00 | TG 0:00)"))
+        self.current_time_label.setTextFormat(Qt.RichText)
+        self.current_time_label.setProperty("class", "mono")
+        self.current_time_label.setToolTip(
+            "Current — время последнего запроса (prompt processing + "
+            "token generation). Точное значение приходит из llama_print_timings "
+            "по завершении запроса."
+        )
+        self.tokens_reset_btn = QPushButton(self.tr("Save task & reset"))
+        self.tokens_reset_btn.setToolTip(
+            "Save current task token count to Saved and start the next task from zero. "
+            "Resets the task counter, Current time and Request label."
+        )
+        self.export_stats_btn = QPushButton(self.tr("Export stats"))
+        self.export_stats_btn.setToolTip(
+            "Export current runtime counters to a JSON file."
+        )
+        self.copy_stats_md_btn = QPushButton(self.tr("Copy stats MD"))
+        self.copy_stats_md_btn.setToolTip(
+            "Copy current runtime counters to the clipboard as Markdown."
+        )
+        self.reset_session_btn = QPushButton(self.tr("Reset session"))
+        self.reset_session_btn.setToolTip(
+            "Zero all live runtime stats: total/task tokens, prompt/generated, "
+            "Active and Current time, Request label. Saved history is kept."
+        )
+        self.reset_saved_btn = QPushButton(self.tr("Reset saved"))
+        self.reset_saved_btn.setToolTip(
+            "Zero the accumulated Saved history (last and total)."
+        )
+        for btn in [
+            self.tokens_reset_btn,
+            self.export_stats_btn,
+            self.copy_stats_md_btn,
+            self.reset_session_btn,
+            self.reset_saved_btn,
+        ]:
+            btn.setMinimumWidth(120)
+            btn.setMaximumWidth(150)
+
+        stats.addWidget(self.speed_label, 0, 0, 1, 3)
+        stats.addWidget(self.tokens_label, 1, 0, 1, 2)
+        stats.addWidget(self.tokens_reset_btn, 1, 2)
+        stats.addWidget(self.request_tokens_label, 2, 0)
+        stats.addWidget(self.tokens_saved_label, 2, 1)
+        stats.addWidget(self.reset_saved_btn, 2, 2)
+        stats.addWidget(self.active_time_label, 3, 0, 1, 2)
+        stats.addWidget(self.reset_session_btn, 3, 2)
+        stats.addWidget(self.current_time_label, 4, 0, 1, 2)
+        stats.addWidget(self.export_stats_btn, 4, 2)
+        stats.addWidget(self.copy_stats_md_btn, 5, 2)
+        stats.setColumnStretch(1, 1)
+        lay.addWidget(self.runtime_stats_group)
+
+
+    def _build_performance_section(self, lay):
+        # === 3. Производительность ===
+        g_launch = QGroupBox(self.tr("Launch settings"))
+        launch = QVBoxLayout(g_launch)
+        launch.setContentsMargins(12, 18, 12, 12)
+        launch.setSpacing(8)
+
+        self.adv_panel = CollapsiblePanel(self.tr("Advanced: Performance, Memory and MTP"))
+        lperf = self.adv_panel.content_layout
+        lperf.setContentsMargins(8, 6, 8, 6)
+        lperf.setSpacing(8)
+        self.sampling_panel = CollapsiblePanel(self.tr("Generation: Sampling and Penalties"))
+        sampling = self.sampling_panel.content_layout
+        sampling.setContentsMargins(8, 6, 8, 6)
+        sampling.setSpacing(8)
+        self.server_panel = CollapsiblePanel(self.tr("Server, Templates and Diagnostics"))
+        server_opts = self.server_panel.content_layout
+        server_opts.setContentsMargins(8, 6, 8, 6)
+        server_opts.setSpacing(8)
+        # Launch settings stays directly under Model; advanced controls remain collapsed below.
+        lay.insertWidget(1, g_launch)
+
+        self.launch_summary_group = QGroupBox(self.tr("Launch preflight"))
+        launch_summary = QVBoxLayout(self.launch_summary_group)
+        launch_summary.setContentsMargins(12, 18, 12, 12)
+        launch_summary.setSpacing(6)
+        self.preflight_status = QLabel(self.tr("Select a model to estimate launch readiness"))
+        self.preflight_status.setWordWrap(True)
+        self.preflight_status.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+        self.preflight_model = QLabel(self.tr("Model: -"))
+        self.preflight_context = QLabel(self.tr("Context: -"))
+        self.preflight_kv = QLabel(self.tr("KV: -"))
+        self.preflight_gpu = QLabel(self.tr("GPU offload: -"))
+        self.preflight_mtp = QLabel(self.tr("MTP: -"))
+        self.preflight_endpoint = QLabel(self.tr("Endpoint: -"))
+        self.preflight_vram_label = QLabel(self.tr("Estimated VRAM: -"))
+        self.preflight_vram_bar = QProgressBar(minimum=0, maximum=100)
+        self.preflight_vram_bar.setTextVisible(True)
+        self.preflight_warning = QLabel(self.tr(""))
+        self.preflight_warning.setWordWrap(True)
+        self.preflight_warning.setStyleSheet("color: " + STATUS_COLOR_PENDING + ";")
+        for label in [
+            self.preflight_model,
+            self.preflight_context,
+            self.preflight_kv,
+            self.preflight_gpu,
+            self.preflight_mtp,
+            self.preflight_endpoint,
+            self.preflight_vram_label,
+        ]:
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            launch_summary.addWidget(label)
+        launch_summary.addWidget(self.preflight_vram_bar)
+        launch_summary.addWidget(self.preflight_warning)
+        lay.insertWidget(2, self.launch_summary_group)
+
+        self.gpu_layers = QSpinBox()
+        self.gpu_layers.setRange(0, 999)
+        self.gpu_layers.setValue(33)
+        self.gpu_auto = QCheckBox(self.tr("auto"))
+        self.gpu_auto.setChecked(True)
+        self.gpu_layers_all = QCheckBox(self.tr("all"))
+
+        def sync_gpu_layer_controls():
+            self.gpu_layers.setDisabled(
+                self.gpu_auto.isChecked() or self.gpu_layers_all.isChecked()
+            )
+            self.gpu_auto.setDisabled(self.gpu_layers_all.isChecked())
+
+        self.gpu_auto.toggled.connect(lambda _checked: sync_gpu_layer_controls())
+        self.gpu_layers_all.toggled.connect(lambda _checked: sync_gpu_layer_controls())
+        sync_gpu_layer_controls()
+        self.cpu_moe_layers = QSpinBox()
+        self.cpu_moe_layers.setRange(AUTO_SENTINEL, 200)
+        self.cpu_moe_layers.setValue(AUTO_SENTINEL)
+        self.cpu_moe_layers.setSpecialValueText("auto")
+
+        self.cuda_status_label = QLabel(self.tr("CUDA build: not checked"))
+        self.cuda_status_label.setWordWrap(True)
+        self.cuda_status_label.setStyleSheet("color: " + STATUS_COLOR_MUTED_DARK + ";")
+        self.cuda_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        r_cuda = QHBoxLayout()
+        r_cuda.addWidget(QLabel(self.tr("CUDA build:")))
+        r_cuda.addWidget(self.cuda_version_combo)
+        r_cuda.addWidget(self.cuda_status_label, 1)
+        launch.addLayout(r_cuda)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel(self.tr("GPU offload (-ngl):")))
+        r1.addWidget(self.gpu_layers)
+        r1.addWidget(self.gpu_auto)
+        r1.addWidget(self.gpu_layers_all)
+        r1.addStretch(1)
+
+        self.ctx_size = QSpinBox()
+        self.ctx_size.setRange(AUTO_SENTINEL, 1048576)
+        self.ctx_size.setSingleStep(512)
+        self.ctx_size.setValue(AUTO_SENTINEL)
+        self.ctx_size.setSpecialValueText("auto")
+
+        self.preset_name_combo = QComboBox()
+        self.preset_name_combo.setEditable(False)
+        self.preset_name_combo.addItem("default")
+        self.preset_name_combo.setCurrentText("default")
+        self.preset_name_combo.setMinimumWidth(130)
+        self.preset_name_combo.setMaximumWidth(220)
+        self.preset_name_combo.setToolTip(
+            "Preset name for current model; use task names like coding or rag"
+        )
+
+        self.save_preset_btn = QPushButton(self.tr("Save Preset"))
+        self.save_preset_btn.setToolTip(
+            "Save parameters (ngl, ncmoe, etc.) under selected preset name"
+        )
+        self.add_preset_btn = QPushButton(self.tr("Add"))
+        self.add_preset_btn.setToolTip("Add a named preset for the selected model")
+        self.delete_preset_btn = QPushButton(self.tr("Delete"))
+        self.delete_preset_btn.setEnabled(False)
+        self.delete_preset_btn.setToolTip(
+            "Delete the selected named preset. The default preset cannot be deleted."
+        )
+
+        self.preset_status = QLabel(self.tr("Preset: none"))
+        self.preset_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel(self.tr("Context Size (-c):")))
+        r2.addWidget(self.ctx_size)
+        self.ctx_help_btn = QToolButton()
+        self.ctx_help_btn.setText("?")
+        self.ctx_help_btn.setToolTip("Open detailed context/VRAM guidance")
+        r2.addWidget(self.ctx_help_btn)
+        r2.addSpacing(10)
+        r2.addWidget(QLabel(self.tr("CPU MoE (-ncmoe):")))
+        r2.addWidget(self.cpu_moe_layers)
+        self.ncmoe_help_btn = QToolButton()
+        self.ncmoe_help_btn.setText("?")
+        self.ncmoe_help_btn.setToolTip("Open detailed CPU MoE/VRAM guidance")
+        r2.addWidget(self.ncmoe_help_btn)
+        r2.addSpacing(10)
+
+        self.ctx_quick_buttons = []
+        for label, value in [
+            ("8K", 8192),
+            ("16K", 16384),
+            ("24K", 24576),
+            ("32K", 32768),
+            ("41K", 40960),
+            ("65K", 65536),
+            ("128K", 131072),
+            ("256K", 262144),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(42 if len(label) <= 3 else 50)
+            btn.setFixedHeight(24)
+            btn.setToolTip(f"Set Context Size to {value}")
+            btn.setProperty("ctx_value", value)
+            self.ctx_quick_buttons.append(btn)
+            r2.addWidget(btn)
+
+        r2.addStretch(1)
+        launch.addLayout(r2)
+        launch.addLayout(r1)
+
+        self.batch_size = QSpinBox()
+        self.batch_size.setRange(AUTO_SENTINEL, 32768)
+        self.batch_size.setSingleStep(128)
+        self.batch_size.setValue(AUTO_SENTINEL)
+        self.batch_size.setSpecialValueText("auto")
+        self.ubatch_size = QSpinBox()
+        self.ubatch_size.setRange(AUTO_SENTINEL, 8192)
+        self.ubatch_size.setSingleStep(64)
+        self.ubatch_size.setValue(AUTO_SENTINEL)
+        self.ubatch_size.setSpecialValueText("auto")
+
+        self.cache_type_k = QComboBox()
+        self.cache_type_v = QComboBox()
+        for ct in ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]:
+            self.cache_type_k.addItem(ct)
+            self.cache_type_v.addItem(ct)
+
+        r3 = QHBoxLayout()
+        r3.addWidget(QLabel(self.tr("Batch / UBatch:")))
+        r3.addWidget(self.batch_size)
+        r3.addWidget(self.ubatch_size)
+        r3.addSpacing(12)
+        r3.addWidget(QLabel(self.tr("KV K / V:")))
+        r3.addWidget(self.cache_type_k)
+        r3.addWidget(self.cache_type_v)
+        r3.addStretch(1)
+        launch.addLayout(r3)
+
+        self.threads = QSpinBox()
+        self.threads.setRange(1, 64)
+        self.threads.setValue(os.cpu_count() or 4)
+        self.threads_batch = QSpinBox()
+        self.threads_batch.setRange(0, 64)
+        self.threads_batch.setSpecialValueText("same")
+        self.threads_batch.setValue(0)
+        r4 = QHBoxLayout()
+        r4.addWidget(QLabel(self.tr("Threads gen / batch (-t / -tb):")))
+        r4.addWidget(self.threads)
+        r4.addWidget(self.threads_batch)
+        perf_header = QLabel(self.tr("Performance and Memory:"))
+        perf_header.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+        lperf.addWidget(perf_header)
+        lperf.addLayout(r4)
+
+        self.flash_attn = QCheckBox(self.tr("Flash Attention (-fa)"))
+        self.flash_attn.setChecked(True)
+        self.fit_off = QCheckBox(self.tr("Fit off (--fit off)"))
+        self.fit_off.setChecked(True)
+        r6 = QHBoxLayout()
+        r6.addWidget(self.flash_attn)
+        r6.addWidget(self.fit_off)
+        r6.addStretch(1)
+        r6.addWidget(QLabel(self.tr("Preset:")))
+        r6.addWidget(self.preset_name_combo)
+        r6.addWidget(self.add_preset_btn)
+        r6.addWidget(self.delete_preset_btn)
+        r6.addWidget(self.save_preset_btn)
+        r6.addWidget(self.preset_status)
+        launch.addLayout(r6)
+
+        self.reasoning_mode = QComboBox()
+        self.reasoning_mode.addItems(["off", "auto", "on"])
+        self.reasoning_mode.setCurrentText("off")
+        self.enable_thinking = QComboBox()
+        self.enable_thinking.addItems(["off", "false", "true"])
+        self.enable_thinking.setCurrentText("off")
+        r7 = QHBoxLayout()
+        r7.addWidget(QLabel(self.tr("Reasoning (--reasoning):")))
+        r7.addWidget(self.reasoning_mode)
+        r7.addSpacing(10)
+        r7.addWidget(QLabel(self.tr("Thinking:")))
+        r7.addWidget(self.enable_thinking)
+        sampling.addLayout(r7)
+
+        self.host = QLineEdit(placeholderText="127.0.0.1")
+        self.host.setText("127.0.0.1")
+        self.host.setMaximumWidth(120)
+        self.port = QSpinBox()
+        self.port.setRange(1024, 65535)
+        self.port.setValue(8080)
+        self.parallel_slots = QSpinBox()
+        self.parallel_slots.setRange(AUTO_SENTINEL, 16)
+        self.parallel_slots.setValue(AUTO_SENTINEL)
+        self.parallel_slots.setSpecialValueText("auto")
+        r8 = QHBoxLayout()
+        r8.addWidget(QLabel(self.tr("Host:")))
+        r8.addWidget(self.host)
+        r8.addWidget(QLabel(self.tr("Port:")))
+        r8.addWidget(self.port)
+        r8.addSpacing(10)
+        r8.addWidget(QLabel(self.tr("Slots (-np):")))
+        r8.addWidget(self.parallel_slots)
+        server_opts.addLayout(r8)
+
+        self.kv_unified = QCheckBox(self.tr("KV unified (-kvu)"))
+        self.speculative_mtp = QCheckBox(self.tr("MTP speculative"))
+        self.spec_draft_n_max = QSpinBox()
+        self.spec_draft_n_max.setRange(1, 32)
+        self.spec_draft_n_max.setValue(8)
+        self.spec_draft_n_max.setToolTip(
+            "Maximum speculative MTP tokens. Coding default: 8; conservative: 2-4; aggressive: 16."
+        )
+        self.spec_draft_p_min = QDoubleSpinBox()
+        self.spec_draft_p_min.setRange(0.0, 1.0)
+        self.spec_draft_p_min.setDecimals(2)
+        self.spec_draft_p_min.setSingleStep(0.05)
+        self.spec_draft_p_min.setValue(0.8)
+        self.spec_draft_p_min.setToolTip(
+            "Minimum MTP confidence. 0.8 avoids expensive long speculation when the draft head is uncertain."
+        )
+        self.spec_draft_gpu_layers = QLineEdit(placeholderText="all")
+        self.spec_draft_gpu_layers.setText("all")
+        self.spec_draft_gpu_layers.setMaximumWidth(60)
+        r8b = QHBoxLayout()
+        r8b.addWidget(self.kv_unified)
+        r8b.addWidget(self.speculative_mtp)
+        r8b.addSpacing(10)
+        r8b.addWidget(QLabel(self.tr("MTP n-max / p-min / draft ngl:")))
+        r8b.addWidget(self.spec_draft_n_max)
+        r8b.addWidget(self.spec_draft_p_min)
+        r8b.addWidget(self.spec_draft_gpu_layers)
+        lperf.addLayout(r8b)
+
+        r8b2 = QHBoxLayout()
+        r8b2.addWidget(QLabel(self.tr("MTP draft GGUF:")))
+        self.spec_draft_model_path = QLineEdit(
+            placeholderText="Auto-detected, or browse for separate MTP GGUF"
+        )
+        self.spec_draft_model_path.setToolTip(
+            "Optional separate MTP/draft GGUF. Gemma 4 packages often include it in an MTP folder; Qwen3.6 may require a separate file."
+        )
+        self.spec_draft_model_btn = QPushButton(self.tr("..."))
+        self.spec_draft_model_btn.setFixedWidth(32)
+        self.spec_draft_model_btn.clicked.connect(
+            lambda _checked=False: self._browse_mtp_draft_clicked()
+        )
+        r8b2.addWidget(self.spec_draft_model_path, 1)
+        r8b2.addWidget(self.spec_draft_model_btn)
+        lperf.addLayout(r8b2)
+
+        self.cuda_device = QLineEdit(placeholderText="CUDA0")
+        self.cuda_device.setMaximumWidth(80)
+        self.spec_draft_device = QLineEdit(placeholderText="CUDA0")
+        self.spec_draft_device.setMaximumWidth(80)
+        self.split_mode = QComboBox()
+        self.split_mode.addItems(["", "none", "layer", "row"])
+        self.main_gpu = QSpinBox()
+        self.main_gpu.setRange(AUTO_SENTINEL, 16)
+        self.main_gpu.setSpecialValueText("auto")
+        self.main_gpu.setValue(AUTO_SENTINEL)
+        r8c = QHBoxLayout()
+        r8c.addWidget(QLabel(self.tr("Device:")))
+        r8c.addWidget(self.cuda_device)
+        r8c.addWidget(QLabel(self.tr("Draft device:")))
+        r8c.addWidget(self.spec_draft_device)
+        r8c.addWidget(QLabel(self.tr("Split:")))
+        r8c.addWidget(self.split_mode)
+        r8c.addWidget(QLabel(self.tr("Main GPU:")))
+        r8c.addWidget(self.main_gpu)
+        lperf.addLayout(r8c)
+
+        self.ctx_checkpoints = QSpinBox()
+        self.ctx_checkpoints.setRange(AUTO_SENTINEL, 128)
+        self.ctx_checkpoints.setSpecialValueText("default")
+        self.ctx_checkpoints.setValue(AUTO_SENTINEL)
+        self.cache_ram = QSpinBox()
+        self.cache_ram.setRange(SERVER_DEFAULT_SENTINEL, 262144)
+        self.cache_ram.setSpecialValueText("default")
+        self.cache_ram.setValue(SERVER_DEFAULT_SENTINEL)
+        r9 = QHBoxLayout()
+        r9.addWidget(QLabel(self.tr("Ctx Checkpoints:")))
+        r9.addWidget(self.ctx_checkpoints)
+        r9.addSpacing(10)
+        r9.addWidget(QLabel(self.tr("Cache RAM (MiB):")))
+        r9.addWidget(self.cache_ram)
+        lperf.addLayout(r9)
+
+    def _build_sampling_section(self):
+        # === 4. Generation / Sampling ===
+        # Layout-объекты панелей создаются в performance-секции; здесь и
+        # ниже (server/diagnostics-часть) используем те же самые объекты.
+        lperf = self.adv_panel.content_layout
+        sampling = self.sampling_panel.content_layout
+        server_opts = self.server_panel.content_layout
+        self.temperature = QDoubleSpinBox()
+        self.temperature.setRange(SAMPLING_AUTO_FLOAT, 2.0)
+        self.temperature.setSingleStep(0.1)
+        self.temperature.setValue(SAMPLING_AUTO_FLOAT)
+        self.temperature.setDecimals(2)
+        self.temperature.setSpecialValueText("auto")
+        self.repeat_penalty = QDoubleSpinBox()
+        self.repeat_penalty.setRange(SAMPLING_AUTO_FLOAT, 2.0)
+        self.repeat_penalty.setSingleStep(0.01)
+        self.repeat_penalty.setValue(SAMPLING_AUTO_FLOAT)
+        self.repeat_penalty.setDecimals(2)
+        self.repeat_penalty.setSpecialValueText("auto")
+        self.top_k = QSpinBox()
+        self.top_k.setRange(SAMPLING_AUTO_INT, 10000)
+        self.top_k.setValue(SAMPLING_AUTO_INT)
+        self.top_k.setSpecialValueText("auto")
+        self.top_p = QDoubleSpinBox()
+        self.top_p.setRange(SAMPLING_AUTO_FLOAT, 1.0)
+        self.top_p.setSingleStep(0.01)
+        self.top_p.setDecimals(3)
+        self.top_p.setValue(SAMPLING_AUTO_FLOAT)
+        self.top_p.setSpecialValueText("auto")
+        self.min_p = QDoubleSpinBox()
+        self.min_p.setRange(SAMPLING_AUTO_FLOAT, 1.0)
+        self.min_p.setSingleStep(0.01)
+        self.min_p.setDecimals(3)
+        self.min_p.setValue(SAMPLING_AUTO_FLOAT)
+        self.min_p.setSpecialValueText("auto")
+        self.typical_p = QDoubleSpinBox()
+        self.typical_p.setRange(SAMPLING_AUTO_FLOAT, 1.0)
+        self.typical_p.setSingleStep(0.01)
+        self.typical_p.setDecimals(3)
+        self.typical_p.setValue(SAMPLING_AUTO_FLOAT)
+        self.typical_p.setSpecialValueText("auto")
+        self.repeat_last_n = QSpinBox()
+        self.repeat_last_n.setRange(SAMPLING_LAST_N_AUTO, 1048576)
+        self.repeat_last_n.setValue(SAMPLING_LAST_N_AUTO)
+        self.repeat_last_n.setSpecialValueText("auto")
+        self.presence_penalty = QDoubleSpinBox()
+        self.presence_penalty.setRange(SAMPLING_PENALTY_AUTO, 2.0)
+        self.presence_penalty.setSingleStep(0.05)
+        self.presence_penalty.setDecimals(2)
+        self.presence_penalty.setValue(SAMPLING_PENALTY_AUTO)
+        self.presence_penalty.setSpecialValueText("auto")
+        self.frequency_penalty = QDoubleSpinBox()
+        self.frequency_penalty.setRange(SAMPLING_PENALTY_AUTO, 2.0)
+        self.frequency_penalty.setSingleStep(0.05)
+        self.frequency_penalty.setDecimals(2)
+        self.frequency_penalty.setValue(SAMPLING_PENALTY_AUTO)
+        self.frequency_penalty.setSpecialValueText("auto")
+        self.seed = QSpinBox()
+        self.seed.setRange(SAMPLING_SEED_AUTO, 2147483647)
+        self.seed.setValue(SAMPLING_SEED_AUTO)
+        self.seed.setSpecialValueText("auto")
+
+        sampling_grid = QGridLayout()
+        sampling_grid.setHorizontalSpacing(10)
+        sampling_grid.setVerticalSpacing(6)
+        sampling_fields = [
+            ("Temperature (--temp):", self.temperature),
+            ("Top K (--top-k):", self.top_k),
+            ("Top P (--top-p):", self.top_p),
+            ("Min P (--min-p):", self.min_p),
+            ("Typical P (--typical):", self.typical_p),
+            ("Seed (--seed):", self.seed),
+            ("Repeat penalty:", self.repeat_penalty),
+            ("Repeat last N:", self.repeat_last_n),
+            ("Presence penalty:", self.presence_penalty),
+            ("Frequency penalty:", self.frequency_penalty),
+        ]
+        for index, (label, widget) in enumerate(sampling_fields):
+            row, column = divmod(index, 2)
+            sampling_grid.addWidget(QLabel(label), row, column * 2)
+            sampling_grid.addWidget(widget, row, column * 2 + 1)
+        sampling_help = {
+            self.temperature: "Randomness. auto keeps the llama-server default.",
+            self.top_k: "Keep K most likely tokens; 0 disables Top-K.",
+            self.top_p: "Nucleus sampling threshold; 1.0 disables Top-P.",
+            self.min_p: "Minimum probability relative to the best token; 0 disables Min-P.",
+            self.typical_p: "Locally typical sampling; 1.0 disables it.",
+            self.seed: "RNG seed. -1 requests a random seed; auto omits the flag.",
+            self.repeat_penalty: "Penalty for repeated token sequences; 1.0 disables it.",
+            self.repeat_last_n: "How many recent tokens are penalized; -1 means full context.",
+            self.presence_penalty: "Penalty based on whether a token already appeared; 0 disables it.",
+            self.frequency_penalty: "Penalty based on token repetition count; 0 disables it.",
+        }
+        for widget, help_text in sampling_help.items():
+            widget.setToolTip(help_text)
+        sampling.addLayout(sampling_grid)
+
+        self.use_mmap = QCheckBox(self.tr("mmap"))
+        self.use_mmap.setChecked(True)
+        self.use_mlock = QCheckBox(self.tr("mlock"))
+        self.verbose = QCheckBox(self.tr("verbose"))
+        self.log_timestamps = QCheckBox(self.tr("log timestamps"))
+        memory_flags = QHBoxLayout()
+        memory_flags.addWidget(self.use_mmap)
+        memory_flags.addWidget(self.use_mlock)
+        memory_flags.addStretch(1)
+        lperf.addLayout(memory_flags)
+        diagnostics_flags = QHBoxLayout()
+        diagnostics_flags.addWidget(self.verbose)
+        diagnostics_flags.addWidget(self.log_timestamps)
+        diagnostics_flags.addStretch(1)
+        server_opts.addLayout(diagnostics_flags)
+
+        self.cuda_visible_devices = QLineEdit(placeholderText="CUDA_VISIBLE_DEVICES")
+        self.cuda_visible_devices.setMaximumWidth(120)
+        self.cuda_module_loading = QLineEdit(placeholderText="CUDA_MODULE_LOADING")
+        self.cuda_module_loading.setText("LAZY")
+        self.cuda_module_loading.setMaximumWidth(80)
+        s_cuda = QHBoxLayout()
+        s_cuda.addWidget(QLabel(self.tr("CUDA env:")))
+        s_cuda.addWidget(self.cuda_visible_devices)
+        s_cuda.addWidget(self.cuda_module_loading)
+        s_cuda.addStretch(1)
+        lperf.addLayout(s_cuda)
+
+        self.cont_batching = QCheckBox(self.tr("cont batching"))
+        self.cont_batching.setChecked(True)
+        self.cache_prompt = QCheckBox(self.tr("cache prompt"))
+        self.cache_prompt.setChecked(True)
+        self.context_shift = QCheckBox(self.tr("context shift"))
+        self.no_webui = QCheckBox(self.tr("no webui"))
+        self.jinja = QCheckBox(self.tr("jinja"))
+        s3 = QHBoxLayout()
+        for w in [
+            self.cont_batching,
+            self.cache_prompt,
+            self.context_shift,
+            self.no_webui,
+            self.jinja,
+        ]:
+            s3.addWidget(w)
+        server_opts.addLayout(s3)
+
+        s_tpl = QHBoxLayout()
+        self.use_chat_template = QCheckBox(self.tr("--chat-template-file"))
+        self.chat_template_file = QLineEdit(
+            placeholderText="Path to .jinja chat template"
+        )
+        self.chat_template_file.setToolTip(
+            "Override the model's built-in chat template with an external .jinja file. "
+            "Required for Qwen3.6 tool calls when using the relaxed template."
+        )
+        self.chat_template_btn = QPushButton(self.tr("..."))
+        self.chat_template_btn.setFixedWidth(32)
+        self.chat_template_btn.clicked.connect(
+            lambda _checked=False: self._browse_chat_template_clicked()
+        )
+        s_tpl.addWidget(self.use_chat_template)
+        s_tpl.addWidget(self.chat_template_file, 1)
+        s_tpl.addWidget(self.chat_template_btn)
+        server_opts.addLayout(s_tpl)
+
+        server_opts.addWidget(QLabel(self.tr("Extra params (only uncommon llama-server flags):")))
+        self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
+        self.extra_args.setPlaceholderText("--dry-multiplier 0.8 --xtc-probability 0.1 ...")
+        server_opts.addWidget(self.extra_args)
+
+
+    def _build_integration_section(self):
+        # === 5. Интеграция ===
+        self.int_panel = CollapsiblePanel(self.tr("Integration (OpenCode / PI / Claude Code)"))
+
+        oc_layout = QHBoxLayout()
+        oc_layout.addWidget(QLabel(self.tr("OpenCode JSON:")))
+        self.opencode_config_path = QLineEdit(placeholderText="Path to opencode.json")
+        oc_btn = QPushButton(self.tr("..."))
+        oc_btn.clicked.connect(self._browse_opencode_clicked)
+        oc_layout.addWidget(self.opencode_config_path)
+        oc_layout.addWidget(oc_btn)
+        self.int_panel.add_layout(oc_layout)
+
+        pi_layout = QHBoxLayout()
+        pi_layout.addWidget(QLabel(self.tr("PI JSON:")))
+        self.pi_config_path = QLineEdit(placeholderText="Path to PI config.json")
+        pi_btn = QPushButton(self.tr("..."))
+        pi_btn.clicked.connect(self._browse_pi_clicked)
+        pi_layout.addWidget(self.pi_config_path)
+        pi_layout.addWidget(pi_btn)
+        self.int_panel.add_layout(pi_layout)
+
+        claude_layout = QHBoxLayout()
+        claude_layout.addWidget(QLabel(self.tr("Claude settings JSON:")))
+        self.claude_config_path = QLineEdit(
+            placeholderText="Path to ~/.claude/settings.json"
+        )
+        claude_btn = QPushButton(self.tr("..."))
+        claude_btn.clicked.connect(self._browse_claude_clicked)
+        claude_layout.addWidget(self.claude_config_path)
+        claude_layout.addWidget(claude_btn)
+        self.int_panel.add_layout(claude_layout)
+
+        tgt_layout = QHBoxLayout()
+        tgt_layout.addWidget(QLabel(self.tr("Target:")))
+        self.integration_target = QComboBox()
+        self.integration_target.addItem("OpenCode", "opencode")
+        self.integration_target.addItem("PI", "pi")
+        self.integration_target.addItem("Claude Code", "claude")
+        tgt_layout.addWidget(self.integration_target)
+        self.integration_check_btn = QPushButton(self.tr("Check"))
+        tgt_layout.addWidget(self.integration_check_btn)
+        self.int_panel.add_layout(tgt_layout)
+
+        self.integration_model_label = QLabel(
+            "Model to add: not selected", wordWrap=True
+        )
+        self.int_panel.add_widget(self.integration_model_label)
+
+        self.integration_models_list = QListWidget()
+        self.integration_models_list.setMinimumHeight(80)
+        self.int_panel.add_widget(self.integration_models_list)
+
+        act_layout = QHBoxLayout()
+        self.integration_add_btn = QPushButton(self.tr("Add"))
+        self.integration_remove_btn = QPushButton(self.tr("Remove"))
+        act_layout.addWidget(self.integration_add_btn)
+        act_layout.addWidget(self.integration_remove_btn)
+        self.int_panel.add_layout(act_layout)
+
+        self.integration_status = QLabel(
+            "Specify config path and click Check", wordWrap=True
+        )
+        self.int_panel.add_widget(self.integration_status)
+
+
+    def _build_benchmark_section(self):
+        # === 6. Бенчмарк ===
+        self.bench_panel = CollapsiblePanel(self.tr("Benchmark"))
+        bp_layout = QHBoxLayout()
+        bp_layout.addWidget(QLabel(self.tr("Prompt (-p):")))
+        self.bench_prompt = QSpinBox()
+        self.bench_prompt.setRange(16, 4096)
+        self.bench_prompt.setValue(128)
+        self.bench_prompt.setSingleStep(64)
+        bp_layout.addWidget(self.bench_prompt)
+        bp_layout.addSpacing(10)
+        bp_layout.addWidget(QLabel(self.tr("Gen (-n):")))
+        self.bench_gen = QSpinBox()
+        self.bench_gen.setRange(16, 4096)
+        self.bench_gen.setValue(256)
+        self.bench_gen.setSingleStep(64)
+        bp_layout.addWidget(self.bench_gen)
+        self.bench_panel.add_layout(bp_layout)
+
+        bench_buttons = QHBoxLayout()
+        self.test_btn = QPushButton(self.tr("Test Speed"))
+        self.test_btn.setStyleSheet(
+            "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.autotune_btn = QPushButton(self.tr("AutoTune..."))
+        self.autotune_btn.setToolTip(
+            "Open AutoTune, build candidates from current model/context, then run automatic benchmark"
+        )
+        self.autotune_btn.setStyleSheet(
+            "background-color: #673AB7; color: white; font-weight: bold; padding: 6px;"
+        )
+        bench_buttons.addWidget(self.test_btn)
+        bench_buttons.addWidget(self.autotune_btn)
+        self.bench_panel.add_layout(bench_buttons)
+
+
+    def _build_cli_section(self, lay):
+        # === 7. Preview CLI ===
+        self.cli_group = QGroupBox(self.tr("CLI Preview"))
+        g_cli = self.cli_group
+        cli_layout = QVBoxLayout()
+        cli_controls = QHBoxLayout()
+        self.cli_manual_mode = QCheckBox(self.tr("Edit CLI"))
+        self.cli_manual_mode.setToolTip(
+            "Enable direct command editing. Apply CLI parses known flags back into UI and keeps unknown flags in Extra params."
+        )
+        self.cli_apply_btn = QPushButton(self.tr("Apply CLI"))
+        self.cli_apply_btn.setEnabled(False)
+        self.cli_apply_btn.setToolTip(
+            "Parse the edited command: known flags update UI controls, unknown flags go to Extra params."
+        )
+        self.cli_copy_btn = QPushButton(self.tr("Copy CLI"))
+        self.cli_copy_btn.setToolTip("Copy the current generated command line.")
+        self.cli_import_btn = QPushButton(self.tr("Import CLI"))
+        self.cli_import_btn.setToolTip(
+            "Read a llama-server command line from the clipboard and apply it to settings."
+        )
+        self.cli_status = QLabel(self.tr("Generated from UI"))
+        self.cli_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
+        cli_controls.addWidget(self.cli_manual_mode)
+        cli_controls.addWidget(self.cli_apply_btn)
+        cli_controls.addWidget(self.cli_copy_btn)
+        cli_controls.addWidget(self.cli_import_btn)
+        cli_controls.addWidget(self.cli_status, 1)
+        self.cli_preview = QLineEdit(
+            placeholderText="Command will be displayed here...", readOnly=True
+        )
+        self.cli_preview.setStyleSheet(
+            "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
+        )
+        g_cli.setLayout(cli_layout)
+        cli_layout.addLayout(cli_controls)
+        cli_layout.addWidget(self.cli_preview)
+
+
+    def _assemble_left_sections(self, lay):
+        # === 8. Итоговый порядок блоков ===
+        lay.addWidget(self.paths_panel)
+        lay.addWidget(self.adv_panel)
+        lay.addWidget(self.sampling_panel)
+        lay.addWidget(self.server_panel)
+        lay.addWidget(self.models_panel)
+        lay.addWidget(self.int_panel)
+        lay.addWidget(self.bench_panel)
+        lay.addWidget(self.cli_group)
+        lay.addStretch()
+
+
+
     def _build_right_panel(self):
         panel = QWidget()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(4, 4, 4, 4)
 
-        # Вкладки: логи и AutoTune. MemoryVisualizationWidget остаётся скрытым
-        # техническим виджетом для совместимости с существующим парсером логов;
-        # пользовательские данные по памяти выводятся в Logs.
-        from PySide6.QtWidgets import QTabWidget
-
         self.tabs = QTabWidget()
+
+        # Overview: compact operational dashboard for the running server.
+        overview_tab = QWidget()
+        self.overview_tab = overview_tab
+        overview = QVBoxLayout(overview_tab)
+        overview.setContentsMargins(8, 8, 8, 8)
+        overview.setSpacing(10)
+
+        self.overview_status = QLabel(self.tr("○ Server stopped"))
+        self.overview_status.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.overview_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        overview.addWidget(self.overview_status)
+
+        self.overview_model = QLabel(self.tr("No model selected"))
+        self.overview_model.setWordWrap(True)
+        self.overview_model.setStyleSheet("color: #555;")
+        self.overview_model.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        overview.addWidget(self.overview_model)
+
+        def make_metric_card(title: str, value: str = "-", detail: str = ""):
+            card = QGroupBox(title)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 16, 10, 10)
+            value_label = QLabel(value)
+            value_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            detail_label = QLabel(detail)
+            detail_label.setWordWrap(True)
+            detail_label.setStyleSheet("color: " + STATUS_COLOR_MUTED_DARK + ";")
+            detail_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            card_layout.addWidget(value_label)
+            card_layout.addWidget(detail_label)
+            return card, value_label, detail_label
+
+        metric_grid = QGridLayout()
+        metric_grid.setHorizontalSpacing(10)
+        metric_grid.setVerticalSpacing(10)
+        card, self.overview_speed_value, self.overview_speed_detail = make_metric_card(
+            "Generation", "-", "PP / TG speed"
+        )
+        metric_grid.addWidget(card, 0, 0)
+        card, self.overview_vram_value, self.overview_vram_detail = make_metric_card(
+            "Memory", "-", "VRAM"
+        )
+        metric_grid.addWidget(card, 0, 1)
+        card, self.overview_request_value, self.overview_request_detail = make_metric_card(
+            "Request", "-", "Current tokens"
+        )
+        metric_grid.addWidget(card, 0, 2)
+        card, self.overview_context_value, self.overview_context_detail = make_metric_card(
+            "Context", "-", "Configured window"
+        )
+        metric_grid.addWidget(card, 1, 0)
+        card, self.overview_active_value, self.overview_active_detail = make_metric_card(
+            "Active", "0:00", "Model work time"
+        )
+        metric_grid.addWidget(card, 1, 1)
+        card, self.overview_endpoint_value, self.overview_endpoint_detail = make_metric_card(
+            "Endpoint", "-", "OpenAI-compatible base URL"
+        )
+        metric_grid.addWidget(card, 1, 2)
+        overview.addLayout(metric_grid)
+
+        self.overview_settings = QLabel(self.tr("Settings: -"))
+        self.overview_settings.setWordWrap(True)
+        self.overview_settings.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        overview.addWidget(self.overview_settings)
+        self.overview_memory_note = QLabel(self.tr(""))
+        self.overview_memory_note.setWordWrap(True)
+        self.overview_memory_note.setStyleSheet("color: #777;")
+        overview.addWidget(self.overview_memory_note)
+        overview.addStretch(1)
+        self.tabs.addTab(overview_tab, "Overview")
+
+        # Monitor: visible memory visualization with its own graceful empty/fallback state.
+        monitor_tab = QWidget()
+        monitor_layout = QVBoxLayout(monitor_tab)
+        monitor_layout.setContentsMargins(0, 0, 0, 0)
+        self.mem_viz = MemoryVisualizationWidget()
+        self.mem_viz.setVisible(True)
+        monitor_layout.addWidget(self.mem_viz)
+        self.tabs.addTab(monitor_tab, "Monitor")
 
         # Вкладка логов
         log_tab = QWidget()
@@ -1148,28 +1400,26 @@ class MainWindowUI(QMainWindow):
         log_layout = QVBoxLayout(log_tab)
         log_layout.setContentsMargins(0, 0, 0, 0)
         hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("Logs:"))
-        self.autoscroll_logs = QCheckBox("Auto-scroll", checked=True)
+        hdr.addWidget(QLabel(self.tr("Logs:")))
+        self.autoscroll_logs = QCheckBox(self.tr("Auto-scroll"), checked=True)
         hdr.addWidget(self.autoscroll_logs)
         hdr.addStretch(1)
-        self.copy_last_error_btn = QPushButton("Copy last error")
+        self.copy_last_error_btn = QPushButton(self.tr("Copy last error"))
         self.copy_last_error_btn.setEnabled(False)
-        self.open_diagnostics_btn = QPushButton("Open diagnostics")
+        self.open_diagnostics_btn = QPushButton(self.tr("Open diagnostics"))
         hdr.addWidget(self.copy_last_error_btn)
         hdr.addWidget(self.open_diagnostics_btn)
         log_layout.addLayout(hdr)
         self.logs = QTextEdit(readOnly=True, font=QFont("Consolas", 9))
         self.logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         log_layout.addWidget(self.logs)
-        clr = QPushButton("Clear")
+        clr = QPushButton(self.tr("Clear"))
         clr.clicked.connect(self.logs.clear)
         log_layout.addWidget(clr)
         self.tabs.addTab(log_tab, "Logs")
 
-        # Скрытая визуализация памяти: не добавляем вкладку, чтобы не показывать
-        # пустой экран "Модель не выбрана" на сборках llama.cpp без buffer logs.
-        self.mem_viz = MemoryVisualizationWidget()
-        self.mem_viz.setVisible(False)
+        self.autotune = AutoTuneWidget()
+        self.tabs.addTab(self.autotune, "AutoTune")
 
         lay.addWidget(self.tabs)
         return panel
@@ -1212,10 +1462,23 @@ class MainWindowUI(QMainWindow):
         state = self.ui_settings.value("windowState")
         if state:
             self.restoreState(state)
+        splitter_state = self.ui_settings.value("mainSplitterState")
+        if splitter_state and hasattr(self, "main_splitter"):
+            self.main_splitter.restoreState(splitter_state)
+        active_tab = self.ui_settings.value("rightTabIndex")
+        if active_tab is not None and hasattr(self, "tabs"):
+            try:
+                self.tabs.setCurrentIndex(int(active_tab))
+            except (TypeError, ValueError):
+                pass
 
     def save_ui_state(self):
         self.ui_settings.setValue("geometry", self.saveGeometry())
         self.ui_settings.setValue("windowState", self.saveState())
+        if hasattr(self, "main_splitter"):
+            self.ui_settings.setValue("mainSplitterState", self.main_splitter.saveState())
+        if hasattr(self, "tabs"):
+            self.ui_settings.setValue("rightTabIndex", self.tabs.currentIndex())
 
     # === Placeholders ===
     def _browse_exe_clicked(self):

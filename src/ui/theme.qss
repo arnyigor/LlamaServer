@@ -1,0 +1,42 @@
+/* Глобальная тема LlamaServer GUI (Этап 3.3 плана).
+   Точечные setStyleSheet у конкретных виджетов приоритетнее QSS, поэтому
+   файл задаёт базовую типографику и цвета нестилизованных элементов. */
+
+QToolTip {
+    color: #1a1a1a;
+    background-color: #ffffe0;
+    border: 1px solid #666;
+    padding: 3px;
+}
+
+QStatusBar {
+    color: #666;
+}
+
+QTableWidget {
+    alternate-background-color: #f5f5f5;
+}
+
+QHeaderView::section {
+    background-color: #efefef;
+    color: #1a1a1a;
+    border: 1px solid #d0d0d0;
+    padding: 3px 6px;
+}
+
+QProgressBar {
+    border: 1px solid #bbb;
+    border-radius: 3px;
+    background: #f0f0f0;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background: #4CAF50;
+}
+
+/* Runtime stats: моноширинные подписи (speed/tokens/request/saved/time). */
+QLabel[class="mono"] {
+    font-family: Consolas, monospace;
+    color: #1a1a1a;
+}

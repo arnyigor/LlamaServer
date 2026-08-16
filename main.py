@@ -1,6 +1,7 @@
 """LlamaServer GUI - точка входа."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,15 +13,29 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QtMsgType, qInstallMessageHandler
+from PySide6.QtCore import (
+    QItemSelectionModel,
+    QSettings,
+    Qt,
+    QTimer,
+    QtMsgType,
+    QTranslator,
+    qInstallMessageHandler,
+)
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QMessageBox,
     QInputDialog,
+    QProgressBar,
     QSystemTrayIcon,
     QMenu,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
 )
 
 from src.core.benchmark_plan import build_autotune_plan
@@ -38,7 +53,14 @@ from src.core.diagnostics import (
     write_server_report,
 )
 from src.core.constants import (
-    MAX_ACTIVE_TIME_DT,
+    STATUS_COLOR_BENCH,
+    STATUS_COLOR_ERROR,
+    STATUS_COLOR_MUTED,
+    STATUS_COLOR_MUTED_DARK,
+    STATUS_COLOR_PENDING,
+    STATUS_COLOR_READY,
+    STATUS_COLOR_RUNNING,
+    STATUS_COLOR_WARNING,
     STAT_COLOR_CAPTION,
     STAT_COLOR_GENERATED,
     STAT_COLOR_PROMPT,
@@ -53,10 +75,18 @@ from src.core.constants import (
 )
 from src.core.gguf_parser import extract_model_info, is_mtp_draft_file
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
+from src.core.mtp_fallback import (
+    MtpFallbackController,
+    MtpModelRules,
+    strip_mtp_args,
+)
 from src.core.metrics_poller import MetricsPoller
+from src.core.runtime_stats import RuntimeStatsController, format_runtime_stats_markdown
+from src.core.server_launch import ServerLaunchController
 from src.core.server_manager import ServerManager
 from src.core.vram_estimator import full_vram_estimate
 from src.services.autotune_manager import AutoTuneManager
+from src.services.hf_download_coordinator import HfDownloadCoordinator
 from src.services.integration_manager import IntegrationManager
 from src.services.hf_downloader import (
     HfModelDownloader,
@@ -71,6 +101,7 @@ from src.services.hf_downloader import (
     partial_download_info,
 )
 from src.services.threads import ModelScanner, LlamaCppUpdater
+from src.ui.dialogs import confirm_destructive_action
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
 from src.ui.tooltips import build_ncmoe_tooltip, build_ctx_tooltip
@@ -85,7 +116,11 @@ class LlamaGUI:
         self.scanner = None
         self.updater = None
         self.hf_scanner = None
-        self.hf_downloaders = {}
+        self.hf = HfDownloadCoordinator()
+        self.hf.task_changed.connect(self._set_hf_task_display)
+        self.hf.percent_changed.connect(lambda _key: self._refresh_hf_download_summary())
+        self.hf.task_completed.connect(self._on_hf_task_completed)
+        self.hf.task_finished.connect(self._on_hf_task_finished)
         self.hf_scan_result = None
         self.autotune = None
         self.autotune_plan = None
@@ -93,15 +128,14 @@ class LlamaGUI:
         self.autotune_best_result = None
         self._autotune_best_applied = False
         self._autotune_running = False
-        self._restart_pending = False
-        self._pending_restart_launch = None
-        self._restart_needed = False
+        self._autotune_plan_signature = None
+        # Координация запуска (отложенные рестарты, env) — в контроллере.
+        self.launcher = ServerLaunchController()
         self._pending_server_verify = None
-        self._last_server_launch = None
-        self._mtp_draft_error_seen = False
-        self._mtp_failure_reason = ""
-        self._mtp_fallback_attempted = False
-        self._mtp_auto_abort_requested = False
+        self._last_force_stop_confirmed_at = 0.0
+        # Состояние MTP-fallback (детекция ошибок draft, retry без MTP) —
+        # в контроллере; GUI-обёртки делегируют ему.
+        self.mtp = MtpFallbackController()
         self._memory_summary_logged = False
         self._shutting_down = False
         self.last_diagnostic_path = ""
@@ -118,42 +152,10 @@ class LlamaGUI:
         self.metrics = MetricsPoller(poll_interval_ms=250)
         self.metrics.slot_metrics_updated.connect(self._on_slot_metrics_updated)
         self.metrics.server_metrics_updated.connect(self._on_server_metrics_updated)
-        self._latest_token_total = 0
-        self._latest_prompt_total = 0
-        self._latest_predicted_total = 0
-        self._token_baseline_total = 0
-        self._saved_token_total = 0
-        self._saved_last_total = 0
-        # Baseline-смещения "сессии": total/task токены и активное время
-        # отображаются относительно точки Reset session, поэтому следующий
-        # опрос /metrics не вернёт старые значения на экран.
-        self._session_base_prompt = 0
-        self._session_base_predicted = 0
-        self._session_base_total = 0
-        self._session_base_active_pp = 0.0
-        self._session_base_active_tg = 0.0
-        self._slot_prompt_total = 0
-        self._slot_predicted_total = 0
-        self._slot_token_seen = {}
-        self._last_slots = []
-        self._request_token_base = {}
-        # Кумулятивные значения из /metrics (с момента старта сервера).
-        # Используются только для "догоняющей" синхронизации вверх, т.к.
-        # llama.cpp обновляет их лишь по завершении запросов.
-        self._metrics_prompt_total = 0
-        self._metrics_predicted_total = 0
-        # Активное время работы модели (секунды PP/TG).
-        #   _active_*    — total: сумма интервалов /slots за запуск сервера;
-        #   _cur_*       — current: время текущего/последнего запроса
-        #                  (точное значение приходит из llama_print_timings).
-        # /metrics для времени не годится (его *tokens_seconds — это
-        # throughput, а не длительность).
-        self._active_prompt_s = 0.0
-        self._active_predicted_s = 0.0
-        self._cur_prompt_s = 0.0
-        self._cur_predicted_s = 0.0
-        self._was_processing = False
-        self._last_poll_time = None
+        # Накопление runtime-статистики вынесено в контроллер; лейблы
+        # обновляются через сигналы (см. _connect_stats_signals).
+        self.stats = RuntimeStatsController()
+        self._connect_stats_signals()
 
         self.config.load()
         self.config.apply_to_ui(self.ui)
@@ -162,8 +164,31 @@ class LlamaGUI:
         self._connect_signals()
         self._setup_tray()
         self._update_cuda_status()
+        self._refresh_overview()
         QTimer.singleShot(250, self.auto_scan_models)
         QTimer.singleShot(350, self._refresh_hf_partial_status)
+
+    @property
+    def _mtp_draft_error_seen(self) -> bool:
+        return self.mtp.draft_error_seen
+
+    @property
+    def _mtp_failure_reason(self) -> str:
+        return self.mtp.failure_reason
+
+    @property
+    def _mtp_fallback_attempted(self) -> bool:
+        return self.mtp.fallback_attempted
+
+    @property
+    def _last_server_launch(self):
+        return self.mtp.last_launch
+
+    def _connect_stats_signals(self):
+        self.stats.tokens_changed.connect(self._render_tokens_label)
+        self.stats.active_time_changed.connect(self._render_active_time_label)
+        self.stats.current_time_changed.connect(self._render_current_time_label)
+        self.stats.saved_changed.connect(self._render_saved_label)
 
     def _connect_signals(self):
         u = self.ui
@@ -171,6 +196,7 @@ class LlamaGUI:
         u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
         u.force_stop_btn.clicked.connect(self.force_stop_server)
+        u.force_stop_action.triggered.connect(self.force_stop_server)
         u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
         u.export_stats_btn.clicked.connect(self.export_runtime_stats)
         u.copy_stats_md_btn.clicked.connect(self.copy_runtime_stats_markdown)
@@ -295,9 +321,20 @@ class LlamaGUI:
         u.autotune.start_requested.connect(self.start_autotune)
         u.autotune.cancel_requested.connect(self.cancel_autotune)
         u.autotune.apply_best_requested.connect(self.apply_autotune_best)
+        u.autotune.apply_selected_requested.connect(self.apply_autotune_selected)
         u.autotune.save_best_requested.connect(self.save_autotune_best_preset)
         u.autotune.export_report_requested.connect(self.show_autotune_report_path)
         u.autotune.open_results_requested.connect(self.open_autotune_results_folder)
+        u.ctx_help_btn.clicked.connect(
+            lambda: self._show_parameter_help(
+                "Context Size Help", getattr(self, "_ctx_help_text", "")
+            )
+        )
+        u.ncmoe_help_btn.clicked.connect(
+            lambda: self._show_parameter_help(
+                "CPU MoE Help", getattr(self, "_ncmoe_help_text", "")
+            )
+        )
 
         self.server.log_received.connect(
             lambda text, level: self.log_mgr.append(text, level)
@@ -307,6 +344,11 @@ class LlamaGUI:
 
         # Парсинг логов для визуализации памяти
         self._mem_data = MemoryData()
+        self._mem_viz_dirty = False
+        self._mem_viz_timer = QTimer(self.ui)
+        self._mem_viz_timer.setInterval(100)
+        self._mem_viz_timer.setSingleShot(True)
+        self._mem_viz_timer.timeout.connect(self._flush_mem_viz)
         self.server.log_received.connect(self._on_log_for_mem_viz)
         self.server.server_stopped.connect(self._on_server_stopped)
         self.server.bench_finished.connect(self._on_bench_finished)
@@ -321,140 +363,359 @@ class LlamaGUI:
             host = "127.0.0.1"
         return f"http://{host}:{self.ui.port.value()}"
 
+    def _tooltip_summary(self, text: str, max_lines: int = 4) -> str:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        if len(lines) <= max_lines:
+            return "\n".join(lines)
+        return "\n".join(lines[:max_lines]) + "\n\nClick ? for the full table."
+
+    def _set_ctx_help_text(self, text: str) -> None:
+        self._ctx_help_text = text
+        self.ui.ctx_size.setToolTip(self._tooltip_summary(text))
+        self.ui.ctx_help_btn.setEnabled(bool(text))
+
+    def _set_ncmoe_help_text(self, text: str) -> None:
+        self._ncmoe_help_text = text
+        self.ui.cpu_moe_layers.setToolTip(self._tooltip_summary(text))
+        self.ui.ncmoe_help_btn.setEnabled(bool(text))
+
+    def _show_parameter_help(self, title: str, text: str) -> None:
+        if not text:
+            QMessageBox.information(self.ui, title, "No model-specific help available")
+            return
+        dialog = QDialog(self.ui)
+        dialog.setWindowTitle(title)
+        dialog.resize(760, 620)
+        layout = QVBoxLayout(dialog)
+        viewer = QTextEdit(readOnly=True)
+        viewer.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        viewer.setPlainText(text)
+        viewer.setStyleSheet("font-family: Consolas, monospace; font-size: 10pt;")
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(viewer)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _set_table_item(
+        self,
+        table,
+        row: int,
+        col: int,
+        text: object,
+        data: object | None = None,
+        tooltip: str = "",
+    ) -> QTableWidgetItem:
+        item = QTableWidgetItem(str(text))
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if data is not None:
+            item.setData(Qt.ItemDataRole.UserRole, data)
+        if tooltip:
+            item.setToolTip(tooltip)
+        table.setItem(row, col, item)
+        return item
+
+    def _selected_table_rows(self, table) -> list[int]:
+        model = table.selectionModel()
+        if not model:
+            return []
+        rows = sorted({index.row() for index in model.selectedRows()})
+        if rows:
+            return rows
+        current = table.currentRow()
+        return [current] if current >= 0 else []
+
+    def _table_row_data(self, table, row: int):
+        item = table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _selected_table_data(self, table) -> list:
+        return [
+            data
+            for row in self._selected_table_rows(table)
+            if (data := self._table_row_data(table, row))
+        ]
+
+    def _launch_preview(self) -> dict:
+        model_path = self._current_model_path()
+        info = self.ui.models_by_path.get(model_path) if model_path else {}
+        if model_path and not info:
+            try:
+                info = extract_model_info(model_path)
+                self.ui.models_by_path[model_path] = info
+            except Exception:
+                info = {}
+
+        block_count = int((info or {}).get("block_count") or 0)
+        ctx_value = int(self.ui.ctx_size.value() or 0)
+        if ctx_value <= 0:
+            ctx_value = int(
+                (info or {}).get("recommended_ctx")
+                or (info or {}).get("context_length")
+                or 4096
+            )
+            ctx_text = f"auto -> {ctx_value:,}"
+        else:
+            ctx_text = f"{ctx_value:,}"
+
+        if self.ui.gpu_layers_all.isChecked():
+            gpu_layers = block_count or 999
+            gpu_text = "all"
+        elif self.ui.gpu_auto.isChecked():
+            gpu_layers = block_count or 999
+            resolved = str(block_count) if block_count else "all"
+            gpu_text = f"auto -> {resolved}"
+        else:
+            gpu_layers = int(self.ui.gpu_layers.value() or 0)
+            gpu_text = str(gpu_layers)
+
+        slots_value = int(self.ui.parallel_slots.value() or 0)
+        slots = max(slots_value, 1)
+        slots_text = f"auto -> {slots}" if slots_value <= 0 else str(slots)
+        ncmoe = max(int(self.ui.cpu_moe_layers.value() or 0), 0)
+        mtp_on = bool(self.ui.speculative_mtp.isChecked())
+        mtp_text = (
+            f"ON · n={self.ui.spec_draft_n_max.value()} · p={self.ui.spec_draft_p_min.value():.2f}"
+            if mtp_on
+            else "off"
+        )
+        kv_text = f"{self.ui.cache_type_k.currentText()} / {self.ui.cache_type_v.currentText()}"
+        estimate = None
+        if model_path and info:
+            try:
+                estimate = full_vram_estimate(
+                    info,
+                    ctx_size=ctx_value,
+                    gpu_layers=gpu_layers,
+                    cache_type_k=self.ui.cache_type_k.currentText(),
+                    cache_type_v=self.ui.cache_type_v.currentText(),
+                    flash_attn=bool(self.ui.flash_attn.isChecked()),
+                    parallel_slots=slots,
+                    ncmoe=ncmoe,
+                )
+            except Exception:
+                estimate = None
+        return {
+            "model_path": model_path,
+            "model_name": self.ui.current_model_id() or "No model selected",
+            "ctx_value": ctx_value,
+            "ctx_text": ctx_text,
+            "gpu_text": gpu_text,
+            "kv_text": kv_text,
+            "slots_text": slots_text,
+            "mtp_text": mtp_text,
+            "endpoint": f"{self._server_metrics_url()}/v1",
+            "estimate": estimate,
+        }
+
+    def _refresh_overview(self):
+        overview_status = getattr(self.ui, "overview_status", None)
+        if (
+            overview_status is None
+            or type(overview_status).__module__.startswith("unittest.mock")
+        ):
+            return
+
+        preview = self._launch_preview()
+        running = self.server.is_server_running()
+        bench = self.server.is_bench_running()
+        if self.launcher.is_pending:
+            status_text = "◐ Restarting server..."
+            status_color = STATUS_COLOR_PENDING
+        elif running and getattr(self._mem_data, "server_ready", False):
+            status_text = f"● READY · {preview['endpoint']}"
+            status_color = STATUS_COLOR_READY
+        elif running:
+            status_text = f"◐ Loading · {preview['model_name']}"
+            status_color = STATUS_COLOR_PENDING
+        elif bench:
+            status_text = "◐ Benchmark running"
+            status_color = STATUS_COLOR_BENCH
+        else:
+            status_text = "○ Server stopped"
+            status_color = STATUS_COLOR_MUTED_DARK
+        self.ui.overview_status.setText(status_text)
+        self.ui.overview_status.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {status_color};"
+        )
+        self.ui.overview_model.setText(preview["model_name"])
+
+        snapshot = self.runtime_stats_snapshot()
+        labels = snapshot.get("labels", {})
+        speed = labels.get("speed", "Speed: -").replace("Speed:", "").strip() or "-"
+        request = (
+            labels.get("request", "Request: -").replace("Request:", "").strip() or "-"
+        )
+        active = (
+            labels.get("active_time", "Active: 0:00")
+            .replace("Active:", "")
+            .strip()
+            or "0:00"
+        )
+        tokens = snapshot.get("tokens", {})
+
+        vram_total = self._mem_data.total("VRAM")
+        vram_cap = self._mem_data.system_memory.get("VRAM")
+        estimate = preview["estimate"]
+        if vram_total > 0:
+            if vram_cap:
+                vram_text = f"{fmt_mem(vram_total, short=True)} / {fmt_mem(vram_cap, short=True)}"
+                vram_detail = f"{self._mem_data.utilization('VRAM'):.1f}% VRAM"
+            else:
+                vram_text = fmt_mem(vram_total, short=True)
+                vram_detail = "measured from llama.cpp/process counters"
+        elif estimate:
+            vram_text = f"{estimate.total_gib:.2f} GiB"
+            vram_detail = "estimated before launch"
+        else:
+            vram_text = "-"
+            vram_detail = "waiting for model or memory data"
+
+        self.ui.overview_speed_value.setText(speed)
+        self.ui.overview_speed_detail.setText("PP/TG from /slots or timings log")
+        self.ui.overview_request_value.setText(request)
+        self.ui.overview_request_detail.setText(
+            f"task {tokens.get('task', 0)} · total {tokens.get('total', 0)}"
+        )
+        self.ui.overview_active_value.setText(active)
+        self.ui.overview_active_detail.setText("PP + TG active time")
+        self.ui.overview_vram_value.setText(vram_text)
+        self.ui.overview_vram_detail.setText(vram_detail)
+        self.ui.overview_context_value.setText(preview["ctx_text"])
+        self.ui.overview_context_detail.setText(
+            f"KV {preview['kv_text']} · slots {preview['slots_text']}"
+        )
+        self.ui.overview_endpoint_value.setText(preview["endpoint"])
+        self.ui.overview_endpoint_detail.setText("OpenAI-compatible API")
+        self.ui.overview_settings.setText(
+            "Settings: "
+            f"GPU {preview['gpu_text']} · MTP {preview['mtp_text']} · "
+            f"KV {preview['kv_text']}"
+        )
+
+        detailed = self._parsed_memory_without_process_fallback() > 0
+        if vram_total <= 0 and not estimate:
+            note = "Monitor will show detailed or fallback memory data after launch."
+        elif detailed:
+            note = "Monitor is using detailed llama.cpp buffer breakdown."
+        elif vram_total > 0:
+            note = (
+                "Detailed memory breakdown unavailable for this llama.cpp build; "
+                "showing process/system fallback."
+            )
+        else:
+            note = "Preflight uses heuristic VRAM estimation; measured data appears after launch."
+        self.ui.overview_memory_note.setText(note)
+
+        self.ui.preflight_model.setText(f"Model: {preview['model_name']}")
+        self.ui.preflight_context.setText(f"Context: {preview['ctx_text']}")
+        self.ui.preflight_kv.setText(f"KV: {preview['kv_text']}")
+        self.ui.preflight_gpu.setText(f"GPU offload: {preview['gpu_text']}")
+        self.ui.preflight_mtp.setText(f"MTP: {preview['mtp_text']}")
+        self.ui.preflight_endpoint.setText(f"Endpoint: {preview['endpoint']}")
+        if not preview["model_path"]:
+            self.ui.preflight_status.setText("Select a model to estimate launch readiness")
+            self.ui.preflight_vram_label.setText("Estimated VRAM: -")
+            self.ui.preflight_vram_bar.setValue(0)
+            self.ui.preflight_vram_bar.setFormat("-")
+            self.ui.preflight_warning.setText("")
+            return
+        if estimate:
+            self.ui.preflight_vram_label.setText(
+                "Estimated VRAM: "
+                f"{estimate.total_gib:.2f} GiB "
+                f"(weights {estimate.model_vram_gib:.2f}, KV {estimate.kv_cache_gib:.2f})"
+            )
+            cap_mib = vram_cap or 0
+            if cap_mib:
+                pct = min(100, int((estimate.total_gib * 1024 / cap_mib) * 100))
+                self.ui.preflight_vram_bar.setValue(pct)
+                self.ui.preflight_vram_bar.setFormat(f"{pct}%")
+                margin_gib = cap_mib / 1024 - estimate.total_gib
+                if pct >= 95:
+                    self.ui.preflight_status.setText("⚠ Ready, but VRAM margin is low")
+                    self.ui.preflight_status.setStyleSheet(
+                        "font-weight: bold; color: " + STATUS_COLOR_PENDING + ";"
+                    )
+                    self.ui.preflight_warning.setText(
+                        f"Estimated margin: {margin_gib:.2f} GiB. Consider lower context or KV Q4."
+                    )
+                else:
+                    self.ui.preflight_status.setText("✓ Ready to launch")
+                    self.ui.preflight_status.setStyleSheet(
+                        "font-weight: bold; color: " + STATUS_COLOR_READY + ";"
+                    )
+                    self.ui.preflight_warning.setText(
+                        f"Estimated margin: {margin_gib:.2f} GiB"
+                    )
+            else:
+                self.ui.preflight_vram_bar.setValue(0)
+                self.ui.preflight_vram_bar.setFormat("capacity unknown")
+                self.ui.preflight_status.setText("Ready to launch")
+                self.ui.preflight_status.setStyleSheet(
+                    "font-weight: bold; color: " + STATUS_COLOR_READY + ";"
+                )
+                self.ui.preflight_warning.setText(
+                    "GPU capacity not available until llama.cpp reports it."
+                )
+        else:
+            self.ui.preflight_status.setText("Ready to launch")
+            self.ui.preflight_status.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+            self.ui.preflight_vram_label.setText("Estimated VRAM: unavailable")
+            self.ui.preflight_vram_bar.setValue(0)
+            self.ui.preflight_vram_bar.setFormat("-")
+            self.ui.preflight_warning.setText("Model metadata is incomplete.")
+
     def _on_log_speed_updated(self, text: str):
         # Скорость llama_print_timings из логов — приоритетный источник:
         # точный замер завершённого запроса. Дельты /slots занижают скорость
         # (теряют хвост генерации и включают время HTTP-опроса), поэтому
         # когда есть замер из логов — показываем именно его.
         self.ui.speed_label.setText(text)
+        self._refresh_overview()
 
     def _on_log_timing_updated(self, pp_seconds: float, tg_seconds: float):
-        # Точное время завершённого запроса из llama_print_timings — им
-        # заменяем current (живой подсчёт теряет первый интервал опроса).
-        # Total остаётся живой суммой интервалов /slots.
-        self._cur_prompt_s = pp_seconds
-        self._cur_predicted_s = tg_seconds
-        self._refresh_current_time_label()
+        self.stats.set_log_timing(pp_seconds, tg_seconds)
+        self._refresh_overview()
 
     def _start_metrics_polling(self):
         self.metrics.set_url(self._server_metrics_url())
-        self._slot_prompt_total = 0
-        self._slot_predicted_total = 0
-        self._slot_token_seen = {}
-        self._last_slots = []
-        self._request_token_base = {}
-        self._metrics_prompt_total = 0
-        self._metrics_predicted_total = 0
-        self._session_base_prompt = 0
-        self._session_base_predicted = 0
-        self._session_base_total = 0
-        self._session_base_active_pp = 0.0
-        self._session_base_active_tg = 0.0
-        self._token_baseline_total = 0
-        self._active_prompt_s = 0.0
-        self._active_predicted_s = 0.0
-        self._cur_prompt_s = 0.0
-        self._cur_predicted_s = 0.0
-        self._was_processing = False
-        self._last_poll_time = None
-        self._refresh_active_time_label()
-        self._refresh_current_time_label()
+        self.stats.reset_server_scope()
         self.metrics.start()
         self.ui.speed_label.setText("Speed: waiting for /slots...")
         self.ui.request_tokens_label.setText("Request: -")
+        self._refresh_overview()
 
     def _stop_metrics_polling(self):
         self.metrics.stop()
         self.ui.speed_label.setText("Speed: -")
         self.ui.request_tokens_label.setText("Request: -")
+        self._refresh_overview()
 
-    def _refresh_token_label(self):
-        total = max(self._latest_token_total - self._session_base_total, 0)
-        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
-        prompt = max(self._latest_prompt_total - self._session_base_prompt, 0)
-        generated = max(self._latest_predicted_total - self._session_base_predicted, 0)
+    def _render_tokens_label(self, display: dict):
         self.ui.tokens_label.setText(
             "Tokens: "
             + stat_sep().join(
                 [
                     stat_kv(
                         "total",
-                        self._fmt_counter(total),
+                        self._fmt_counter(display["total"]),
                         STAT_COLOR_TOTAL,
                     ),
-                    stat_kv("task", self._fmt_counter(task_total), STAT_COLOR_TASK),
+                    stat_kv("task", self._fmt_counter(display["task"]), STAT_COLOR_TASK),
                     stat_kv(
                         "prompt",
-                        self._fmt_counter(prompt),
+                        self._fmt_counter(display["prompt"]),
                         STAT_COLOR_PROMPT,
                     ),
                     stat_kv(
                         "generated",
-                        self._fmt_counter(generated),
+                        self._fmt_counter(display["generated"]),
                         STAT_COLOR_GENERATED,
                     ),
                 ]
             )
         )
-
-    def _sync_latest_token_totals(self):
-        slot_total = int(getattr(self, "_slot_prompt_total", 0) or 0) + int(
-            getattr(self, "_slot_predicted_total", 0) or 0
-        )
-        metrics_total = int(getattr(self, "_metrics_prompt_total", 0) or 0) + int(
-            getattr(self, "_metrics_predicted_total", 0) or 0
-        )
-        if slot_total <= 0 and metrics_total <= 0 and self._latest_token_total > 0:
-            return
-        self._apply_metrics_catch_up()
-        self._latest_prompt_total = self._slot_prompt_total
-        self._latest_predicted_total = self._slot_predicted_total
-        self._latest_token_total = (
-            self._latest_prompt_total + self._latest_predicted_total
-        )
-
-    def _reset_request_token_baseline(self):
-        self._request_token_base = {}
-        for slot in getattr(self, "_last_slots", []):
-            slot_id = int(getattr(slot, "id", 0) or 0)
-            self._request_token_base[slot_id] = (
-                int(getattr(slot, "n_prompt_tokens", 0) or 0),
-                int(getattr(slot, "n_decoded", 0) or 0),
-            )
-
-    def _request_counter_value(self, slot, attr_name: str, base_index: int) -> int:
-        slot_id = int(getattr(slot, "id", 0) or 0)
-        value = int(getattr(slot, attr_name, 0) or 0)
-        base = getattr(self, "_request_token_base", {}).get(slot_id)
-        if base is None:
-            return value
-        base_value = int(base[base_index] or 0)
-        if value < base_value:
-            base_values = list(base)
-            base_values[base_index] = 0
-            self._request_token_base[slot_id] = tuple(base_values)
-            return value
-        return max(value - base_value, 0)
-
-    def _current_request_token_counts(self) -> tuple[int, int]:
-        slots = list(getattr(self, "_last_slots", []) or [])
-        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
-        visible = active or [
-            slot
-            for slot in slots
-            if getattr(slot, "n_prompt_tokens", 0) or getattr(slot, "n_decoded", 0)
-        ]
-        if not visible:
-            return 0, 0
-
-        prompt = sum(
-            self._request_counter_value(slot, "n_prompt_tokens", 0)
-            for slot in visible
-        )
-        generated = sum(
-            self._request_counter_value(slot, "n_decoded", 1) for slot in visible
-        )
-        return max(int(prompt), 0), max(int(generated), 0)
 
     def _plain_label_text(self, label) -> str:
         text = str(label.text() if label is not None else "")
@@ -467,18 +728,7 @@ class LlamaGUI:
         )
 
     def runtime_stats_snapshot(self) -> dict:
-        self._sync_latest_token_totals()
-        request_prompt, request_generated = self._current_request_token_counts()
-        total = max(self._latest_token_total - self._session_base_total, 0)
-        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
-        prompt = max(self._latest_prompt_total - self._session_base_prompt, 0)
-        generated = max(
-            self._latest_predicted_total - self._session_base_predicted, 0
-        )
-        active_prompt_s = max(self._active_prompt_s - self._session_base_active_pp, 0.0)
-        active_generated_s = max(
-            self._active_predicted_s - self._session_base_active_tg, 0.0
-        )
+        stats = self.stats.stats_snapshot()
         model_path = self._current_model_path()
         return {
             "schema_version": 1,
@@ -491,24 +741,8 @@ class LlamaGUI:
                 "path": model_path,
                 "id": self.ui.current_model_id(),
             },
-            "tokens": {
-                "total": int(total),
-                "task": int(task_total),
-                "prompt": int(prompt),
-                "generated": int(generated),
-                "request_prompt": int(request_prompt),
-                "request_generated": int(request_generated),
-                "saved_last": int(getattr(self, "_saved_last_total", 0) or 0),
-                "saved_total": int(getattr(self, "_saved_token_total", 0) or 0),
-            },
-            "time_seconds": {
-                "active_total": active_prompt_s + active_generated_s,
-                "active_prompt": active_prompt_s,
-                "active_generated": active_generated_s,
-                "current_total": self._cur_prompt_s + self._cur_predicted_s,
-                "current_prompt": self._cur_prompt_s,
-                "current_generated": self._cur_predicted_s,
-            },
+            "tokens": stats["tokens"],
+            "time_seconds": stats["time_seconds"],
             "labels": {
                 "speed": self._plain_label_text(self.ui.speed_label),
                 "tokens": self._plain_label_text(self.ui.tokens_label),
@@ -520,45 +754,7 @@ class LlamaGUI:
         }
 
     def runtime_stats_markdown(self) -> str:
-        snapshot = self.runtime_stats_snapshot()
-        tokens = snapshot["tokens"]
-        times = snapshot["time_seconds"]
-        model = snapshot["model"]
-        server = snapshot["server"]
-        lines = [
-            "# LlamaServer Runtime Stats",
-            "",
-            f"- Exported: {snapshot['exported_at']}",
-            f"- Model: {model.get('id') or '-'}",
-            f"- Model path: {model.get('path') or '-'}",
-            f"- Server: {server.get('base_url') or '-'}",
-            f"- Running: {'yes' if server.get('running') else 'no'}",
-            "",
-            "## Tokens",
-            "",
-            "| Metric | Value |",
-            "|---|---:|",
-            f"| Total | {tokens['total']} |",
-            f"| Task | {tokens['task']} |",
-            f"| Prompt | {tokens['prompt']} |",
-            f"| Generated | {tokens['generated']} |",
-            f"| Request prompt | {tokens['request_prompt']} |",
-            f"| Request generated | {tokens['request_generated']} |",
-            f"| Saved last | {tokens['saved_last']} |",
-            f"| Saved total | {tokens['saved_total']} |",
-            "",
-            "## Time",
-            "",
-            "| Metric | Seconds | Formatted |",
-            "|---|---:|---:|",
-            f"| Active total | {times['active_total']:.3f} | {format_duration(times['active_total'])} |",
-            f"| Active prompt | {times['active_prompt']:.3f} | {format_duration(times['active_prompt'])} |",
-            f"| Active generated | {times['active_generated']:.3f} | {format_duration(times['active_generated'])} |",
-            f"| Current total | {times['current_total']:.3f} | {format_duration(times['current_total'])} |",
-            f"| Current prompt | {times['current_prompt']:.3f} | {format_duration(times['current_prompt'])} |",
-            f"| Current generated | {times['current_generated']:.3f} | {format_duration(times['current_generated'])} |",
-        ]
-        return "\n".join(lines) + "\n"
+        return format_runtime_stats_markdown(self.runtime_stats_snapshot())
 
     def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
         """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
@@ -575,176 +771,61 @@ class LlamaGUI:
         total = pp_s + tg_s
         return stat_kv(caption, format_duration(total), STAT_COLOR_TIME) + " " + inner
 
-    def _refresh_active_time_label(self):
+    def _render_active_time_label(self, pp_s: float, tg_s: float):
         """Отрисовка total активного времени (за текущую сессию)."""
-        pp = max(self._active_prompt_s - self._session_base_active_pp, 0.0)
-        tg = max(self._active_predicted_s - self._session_base_active_tg, 0.0)
-        self.ui.active_time_label.setText(self._time_row_html("Active", pp, tg))
+        self.ui.active_time_label.setText(self._time_row_html("Active", pp_s, tg_s))
+        self._refresh_overview()
 
-    def _refresh_current_time_label(self):
+    def _render_current_time_label(self, pp_s: float, tg_s: float):
         """Отрисовка времени текущего/последнего запроса."""
         self.ui.current_time_label.setText(
-            self._time_row_html("Current", self._cur_prompt_s, self._cur_predicted_s)
+            self._time_row_html("Current", pp_s, tg_s)
         )
-
-    def _accumulate_active_time(self, dt: float, active):
-        """Накопление активного времени по интервалу между опросами.
-
-        dt — время между двумя последовательными опросами /slots, когда
-        активен хотя бы один слот. Распределение между PP и TG — по долям
-        мгновенных скоростей; точную разбивку завершённого запроса потом
-        дают логи llama_print_timings (для current).
-        """
-        prompt_speed = sum(
-            max(float(getattr(slot, "prompt_per_second", 0.0) or 0.0), 0.0)
-            for slot in active
-        )
-        predicted_speed = sum(
-            max(float(getattr(slot, "predicted_per_second", 0.0) or 0.0), 0.0)
-            for slot in active
-        )
-        if prompt_speed > 0 and predicted_speed > 0:
-            total_speed = prompt_speed + predicted_speed
-            dt_pp = dt * prompt_speed / total_speed
-            dt_tg = dt * predicted_speed / total_speed
-        elif predicted_speed > 0:
-            dt_pp, dt_tg = 0.0, dt
-        elif prompt_speed > 0:
-            dt_pp, dt_tg = dt, 0.0
-        else:
-            # Скорость ещё не измерилась (первый опрос запроса): интервал
-            # пропускаем — current получит точное значение из логов.
-            return
-        self._active_prompt_s += dt_pp
-        self._active_predicted_s += dt_tg
-        self._cur_prompt_s += dt_pp
-        self._cur_predicted_s += dt_tg
-        self._refresh_active_time_label()
-        self._refresh_current_time_label()
-
-    def _apply_metrics_catch_up(self):
-        """Синхронизация счётчиков с /metrics — только вверх.
-
-        /metrics считает кумулятивно с момента старта сервера, но llama.cpp
-        обновляет его счётчики только по завершении запроса (см. вызовы
-        metrics.on_prediction / metrics.on_prompt_eval в server-context.cpp).
-        Поэтому /metrics не может быть единственным источником (во время
-        генерации числа замирают), а используется лишь как "догоняющий":
-        если сервер знает больше — подтягиваем суммы вверх.
-        """
-        if self._metrics_prompt_total > self._slot_prompt_total:
-            self._slot_prompt_total = self._metrics_prompt_total
-        if self._metrics_predicted_total > self._slot_predicted_total:
-            self._slot_predicted_total = self._metrics_predicted_total
-
-    def _accumulate_slot_tokens(self, slots):
-        """Накопление токенов из дельт /slots.
-
-        Слоты накапливаются всегда: счётчики n_prompt_tokens_processed /
-        n_decoded сохраняются у слота даже после завершения запроса
-        (сбрасываются только при старте следующего), поэтому дельты
-        покрывают и "быстрые" запросы, целиком уложившиеся между опросами.
-        """
-        for slot in slots:
-            slot_id = int(getattr(slot, "id", 0) or 0)
-            prompt_tokens = int(getattr(slot, "n_prompt_tokens_processed", 0) or 0)
-            predicted_tokens = int(getattr(slot, "n_decoded", 0) or 0)
-            previous_prompt, previous_predicted = self._slot_token_seen.get(
-                slot_id, (0, 0)
-            )
-            prompt_delta = (
-                prompt_tokens - previous_prompt
-                if prompt_tokens >= previous_prompt
-                else prompt_tokens
-            )
-            predicted_delta = (
-                predicted_tokens - previous_predicted
-                if predicted_tokens >= previous_predicted
-                else predicted_tokens
-            )
-            self._slot_prompt_total += max(prompt_delta, 0)
-            self._slot_predicted_total += max(predicted_delta, 0)
-            self._slot_token_seen[slot_id] = (prompt_tokens, predicted_tokens)
-        self._sync_latest_token_totals()
-        self._refresh_token_label()
+        self._refresh_overview()
 
     def _on_slot_metrics_updated(self, slots):
-        self._last_slots = list(slots)
-        # Активное время: интервалы опросов, пока хоть один слот обрабатывает.
-        # Большой зазор между опросами (> MAX_ACTIVE_TIME_DT) — пауза/простой,
-        # его не считаем: точный current приходит из логов llama_print_timings.
-        now = time.monotonic()
-        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
-        if active and not self._was_processing:
-            # Переход idle → processing: начался новый запрос, время текущего
-            # запроса обнуляется.
-            self._cur_prompt_s = 0.0
-            self._cur_predicted_s = 0.0
-            self._refresh_current_time_label()
-        self._was_processing = bool(active)
-        if self._last_poll_time is not None and active:
-            dt = max(now - self._last_poll_time, 0.0)
-            if dt <= MAX_ACTIVE_TIME_DT:
-                self._accumulate_active_time(dt, active)
-        self._last_poll_time = now
-
-        if not slots:
+        info = self.stats.update_slot_metrics(slots)
+        if info is None:
             return
-        visible = active or [
-            slot
-            for slot in slots
-            if getattr(slot, "n_prompt_tokens", 0) or getattr(slot, "n_decoded", 0)
-        ]
-        if not visible:
+        if not info["visible"]:
             if not self.log_mgr.has_speed:
                 self.ui.speed_label.setText("Speed: -")
             self.ui.request_tokens_label.setText("Request: -")
+            self._refresh_overview()
             return
 
-        prompt_speed = sum(
-            max(float(getattr(slot, "prompt_per_second", 0.0) or 0.0), 0.0)
-            for slot in visible
-        )
-        predicted_speed = sum(
-            max(float(getattr(slot, "predicted_per_second", 0.0) or 0.0), 0.0)
-            for slot in visible
-        )
-        prompt_tokens = sum(
-            self._request_counter_value(slot, "n_prompt_tokens", 0)
-            for slot in visible
-        )
-        predicted_tokens = sum(
-            self._request_counter_value(slot, "n_decoded", 1) for slot in visible
-        )
-
         parts = []
-        if prompt_speed > 0:
-            parts.append(
-                stat_kv("PP", f"{format_speed(prompt_speed)} tok/s", STAT_COLOR_PROMPT)
-            )
-        if predicted_speed > 0:
+        if info["prompt_speed"] > 0:
             parts.append(
                 stat_kv(
-                    "TG", f"{format_speed(predicted_speed)} tok/s", STAT_COLOR_GENERATED
+                    "PP", f"{format_speed(info['prompt_speed'])} tok/s", STAT_COLOR_PROMPT
+                )
+            )
+        if info["predicted_speed"] > 0:
+            parts.append(
+                stat_kv(
+                    "TG",
+                    f"{format_speed(info['predicted_speed'])} tok/s",
+                    STAT_COLOR_GENERATED,
                 )
             )
         if not self.log_mgr.has_speed:
             self.ui.speed_label.setText(
                 "Speed: " + (stat_sep().join(parts) if parts else "-")
             )
-        if prompt_tokens or predicted_tokens:
+        if info["prompt_tokens"] or info["predicted_tokens"]:
             self.ui.request_tokens_label.setText(
                 "Request: "
                 + stat_sep().join(
                     [
                         stat_kv(
                             "prompt",
-                            self._fmt_counter(prompt_tokens),
+                            self._fmt_counter(info["prompt_tokens"]),
                             STAT_COLOR_PROMPT,
                         ),
                         stat_kv(
                             "generated",
-                            self._fmt_counter(predicted_tokens),
+                            self._fmt_counter(info["predicted_tokens"]),
                             STAT_COLOR_GENERATED,
                         ),
                     ]
@@ -752,24 +833,9 @@ class LlamaGUI:
             )
         else:
             self.ui.request_tokens_label.setText("Request: -")
-        self._accumulate_slot_tokens(slots)
 
     def _on_server_metrics_updated(self, metrics):
-        prompt_total = int(getattr(metrics, "prompt_tokens_total", 0) or 0)
-        predicted_total = int(getattr(metrics, "tokens_predicted_total", 0) or 0)
-        total = prompt_total + predicted_total
-        if total <= 0:
-            return
-        self._metrics_prompt_total = prompt_total
-        self._metrics_predicted_total = predicted_total
-        if total < self._token_baseline_total:
-            self._token_baseline_total = 0
-        self._apply_metrics_catch_up()
-        # НЕ используем llamacpp:prompt_tokens_seconds / predicted_tokens_seconds
-        # из /metrics как длительность: это throughput (токены/сек), а не время.
-        # Точное время PP/TG берём из логов llama_print_timings.
-        self._sync_latest_token_totals()
-        self._refresh_token_label()
+        self.stats.update_server_metrics(metrics)
 
     def reset_task_tokens(self):
         """Сохранить текущую задачу в Saved и начать отсчёт новой с нуля.
@@ -777,19 +843,9 @@ class LlamaGUI:
         Обнуляет task-счётчик, Current time и Request. Total-токены и Active
         время (server-scope) не трогает — для них есть Reset session.
         """
-        self._sync_latest_token_totals()
-        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
-        self._saved_token_total += task_total
-        self._token_baseline_total = self._latest_token_total
-        self._reset_request_token_baseline()
-        self._set_saved_label(last_total=task_total)
-        self._cur_prompt_s = 0.0
-        self._cur_predicted_s = 0.0
-        self._last_poll_time = time.monotonic()
+        task_total = self.stats.reset_task()
         self.log_mgr.reset_runtime_extractors(reset_speed=False, reset_timing=True)
-        self._refresh_current_time_label()
         self.ui.request_tokens_label.setText("Request: -")
-        self._refresh_token_label()
         self.log_mgr.append(
             f"Token counter reset: saved {task_total} tokens, "
             "Current time and Request reset"
@@ -801,46 +857,27 @@ class LlamaGUI:
         Saved-история сохраняется. Реализовано через baseline-смещения,
         поэтому следующий опрос /metrics не вернёт старые значения на экран.
         """
-        self._sync_latest_token_totals()
-        self._session_base_prompt = self._latest_prompt_total
-        self._session_base_predicted = self._latest_predicted_total
-        self._session_base_total = self._latest_token_total
-        self._session_base_active_pp = self._active_prompt_s
-        self._session_base_active_tg = self._active_predicted_s
-        self._token_baseline_total = self._latest_token_total
-        self._reset_request_token_baseline()
-        self._cur_prompt_s = 0.0
-        self._cur_predicted_s = 0.0
-        self._last_poll_time = time.monotonic()
+        self.stats.reset_session()
         self.log_mgr.reset_runtime_extractors(reset_speed=True, reset_timing=True)
-        self._refresh_token_label()
-        self._refresh_active_time_label()
-        self._refresh_current_time_label()
         self.ui.request_tokens_label.setText("Request: -")
         self.log_mgr.append("Session reset: tokens and time zeroed")
 
     def reset_saved_total(self):
         """Обнулить накопленную Saved-историю (last и total)."""
-        self._saved_token_total = 0
-        self._set_saved_label()
+        self.stats.reset_saved()
         self.log_mgr.append("Saved history reset")
 
-    def _set_saved_label(self, last_total=None):
-        last = max(int(last_total or 0), 0)
-        self._saved_last_total = last
+    def _render_saved_label(self, last: int, total: int):
         self.ui.tokens_saved_label.setText(
             "Saved: "
             + stat_sep().join(
                 [
                     stat_kv("last", self._fmt_counter(last), STAT_COLOR_SAVED),
-                    stat_kv(
-                        "total",
-                        self._fmt_counter(self._saved_token_total),
-                        STAT_COLOR_SAVED,
-                    ),
+                    stat_kv("total", self._fmt_counter(total), STAT_COLOR_SAVED),
                 ]
             )
         )
+        self._refresh_overview()
 
     def export_runtime_stats(self):
         default_name = f"runtime-stats-{time.strftime('%Y%m%d-%H%M%S')}.json"
@@ -977,7 +1014,7 @@ class LlamaGUI:
 
     def _stop_hf_downloaders_for_shutdown(self):
         workers = []
-        for key, task in list(self.hf_downloaders.items()):
+        for key, task in list(self.hf.tasks().items()):
             worker = task.get("worker")
             if worker is None:
                 continue
@@ -1008,8 +1045,7 @@ class LlamaGUI:
         if self._shutting_down:
             return
         self._shutting_down = True
-        self._restart_pending = False
-        self._pending_restart_launch = None
+        self.launcher.cancel_pending()
         try:
             self.save_settings()
             self.ui.save_ui_state()
@@ -1062,13 +1098,13 @@ class LlamaGUI:
         if exe:
             build_name = Path(exe).parent.name
             parts = [f"CUDA {cuda_ver}: {build_name}"]
-            color = "#4CAF50"
+            color = STATUS_COLOR_RUNNING
         elif raw_path:
             parts = [f"CUDA {cuda_ver}: build not found"]
-            color = "#FF9800"
+            color = STATUS_COLOR_WARNING
         else:
             parts = [f"CUDA {cuda_ver}: select llama.cpp folder"]
-            color = "#888"
+            color = STATUS_COLOR_MUTED
 
         parts.append("model selected" if model_path else "select model")
 
@@ -1235,7 +1271,7 @@ class LlamaGUI:
 
         if hasattr(self.ui, "preset_status"):
             self.ui.preset_status.setText(f"Preset: none ({preset_name})")
-            self.ui.preset_status.setStyleSheet("color: #888;")
+            self.ui.preset_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
         self._update_preset_buttons()
 
     def add_preset(self):
@@ -1266,7 +1302,7 @@ class LlamaGUI:
         self._update_preset_buttons()
         if hasattr(self.ui, "preset_status"):
             self.ui.preset_status.setText(f"Preset: new {preset_name}, not saved")
-            self.ui.preset_status.setStyleSheet("color: #FF9800;")
+            self.ui.preset_status.setStyleSheet("color: " + STATUS_COLOR_WARNING + ";")
 
     def delete_preset(self):
         model_path = self._current_model_path()
@@ -1279,14 +1315,9 @@ class LlamaGUI:
             QMessageBox.warning(self.ui, "Error", "Default preset cannot be deleted")
             return
 
-        answer = QMessageBox.question(
-            self.ui,
-            "Delete preset",
-            f"Delete preset '{preset_name}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        if not confirm_destructive_action(
+            self.ui, "Delete preset", f"Delete preset '{preset_name}'?"
+        ):
             return
 
         if not self.config.delete_perf_preset(model_path, preset_name):
@@ -1299,7 +1330,7 @@ class LlamaGUI:
         self._refresh_perf_preset_names("default")
         if hasattr(self.ui, "preset_status"):
             self.ui.preset_status.setText(f"Preset: deleted {preset_name}")
-            self.ui.preset_status.setStyleSheet("color: #FF9800;")
+            self.ui.preset_status.setStyleSheet("color: " + STATUS_COLOR_WARNING + ";")
 
     def save_preset(self):
         model_path = self._current_model_path()
@@ -1353,7 +1384,7 @@ class LlamaGUI:
         self._refresh_perf_preset_names(preset_name)
         if hasattr(self.ui, "preset_status"):
             self.ui.preset_status.setText(f"Preset: saved {preset_name} | ctx={ctx:,}")
-            self.ui.preset_status.setStyleSheet("color: #4CAF50;")
+            self.ui.preset_status.setStyleSheet("color: " + STATUS_COLOR_RUNNING + ";")
         QMessageBox.information(
             self.ui,
             "Saved",
@@ -1399,7 +1430,7 @@ class LlamaGUI:
             self.ui.preset_status.setText(
                 f"Preset: loaded {preset_name} | ctx={loaded_ctx:,}"
             )
-            self.ui.preset_status.setStyleSheet("color: #4CAF50;")
+            self.ui.preset_status.setStyleSheet("color: " + STATUS_COLOR_RUNNING + ";")
 
         info = self.ui.models_by_path.get(model_path)
         if info:
@@ -1415,7 +1446,7 @@ class LlamaGUI:
         text = label.text()
         if text.startswith("Preset: loaded") or text.startswith("Preset: saved"):
             label.setText("Preset: modified")
-            label.setStyleSheet("color: #FF9800;")
+            label.setStyleSheet("color: " + STATUS_COLOR_WARNING + ";")
 
     def auto_detect_bench(self):
         bench = self._resolve_llamacpp_executable("bench")
@@ -1520,11 +1551,11 @@ class LlamaGUI:
 
     def _update_local_model_delete_button(self):
         self.ui.local_models_delete_btn.setEnabled(
-            bool(self.ui.local_models_list.selectedItems())
+            bool(self._selected_table_rows(self.ui.local_models_list))
         )
 
     def refresh_local_model_manager(self, silent=False):
-        self.ui.local_models_list.clear()
+        self.ui.local_models_list.setRowCount(0)
         model_dir = self.ui.model_dir.text().strip()
         if not model_dir or not os.path.exists(model_dir):
             self.ui.local_models_delete_btn.setEnabled(False)
@@ -1536,15 +1567,21 @@ class LlamaGUI:
         entries = info.get("entries") or []
         for entry in entries:
             examples = ", ".join(entry.get("examples") or [])
-            suffix = f" | {examples}" if examples else ""
-            item_text = (
-                f"{entry.get('relative')}  |  {entry.get('type')}  |  "
-                f"GGUF: {entry.get('gguf_count')}  |  {entry.get('size_text')}{suffix}"
+            row = self.ui.local_models_list.rowCount()
+            self.ui.local_models_list.insertRow(row)
+            tooltip = str(entry.get("path") or "")
+            self._set_table_item(
+                self.ui.local_models_list,
+                row,
+                0,
+                entry.get("relative") or "",
+                data=entry,
+                tooltip=tooltip,
             )
-            self.ui.local_models_list.addItem(item_text)
-            item = self.ui.local_models_list.item(self.ui.local_models_list.count() - 1)
-            item.setData(Qt.ItemDataRole.UserRole, entry)
-            item.setToolTip(str(entry.get("path") or ""))
+            self._set_table_item(self.ui.local_models_list, row, 1, entry.get("type") or "")
+            self._set_table_item(self.ui.local_models_list, row, 2, entry.get("gguf_count") or 0)
+            self._set_table_item(self.ui.local_models_list, row, 3, entry.get("size_text") or "")
+            self._set_table_item(self.ui.local_models_list, row, 4, examples)
 
         self.ui.local_models_delete_btn.setEnabled(False)
         if entries:
@@ -1557,10 +1594,10 @@ class LlamaGUI:
             )
 
     def _selected_local_model_entry(self):
-        selected = self.ui.local_models_list.selectedItems()
-        if not selected:
+        rows = self._selected_table_rows(self.ui.local_models_list)
+        if not rows:
             return None
-        return selected[0].data(Qt.ItemDataRole.UserRole)
+        return self._table_row_data(self.ui.local_models_list, rows[0])
 
     def _path_is_inside(self, path: Path, root: Path) -> bool:
         try:
@@ -1625,14 +1662,13 @@ class LlamaGUI:
             return
 
         delete_kind = "folder" if target.is_dir() else "file"
-        reply = QMessageBox.question(
+        if not confirm_destructive_action(
             self.ui,
             "Delete local model",
             f"Delete selected local model {delete_kind}?\n\n"
             f"{target}\n\n"
             "This cannot be undone. For folders, all GGUF/mmproj/.part files inside are removed.",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        ):
             return
 
         try:
@@ -1653,23 +1689,23 @@ class LlamaGUI:
     def scan_hf_repo(self):
         if self.hf_scanner and self.hf_scanner.isRunning():
             self.hf_scanner.requestInterruption()
-            self.ui.hf_status.setText("Отмена запроса Hugging Face...")
+            self.ui.hf_status.setText("Cancelling Hugging Face request...")
             return
 
         repo = self.ui.hf_repo.text().strip()
         if not repo:
             QMessageBox.warning(
-                self.ui, "Hugging Face", "Вставьте repo id или URL модели"
+                self.ui, "Hugging Face", "Paste a repo id or model URL"
             )
             return
 
         self.save_settings()
-        self.ui.hf_files.clear()
+        self.ui.hf_files.setRowCount(0)
         self.ui.hf_progress.setValue(0)
         self.ui.hf_download_btn.setEnabled(False)
         self.ui.hf_progress.setVisible(True)
         self.ui.hf_progress.setRange(0, 0)
-        self.ui.hf_status.setText("Сканирование Hugging Face...")
+        self.ui.hf_status.setText("Scanning Hugging Face...")
         self.ui.hf_scan_btn.setText("Cancel")
 
         self.hf_scanner = HfRepoScanner(repo, self.ui.hf_quant_filter.text().strip())
@@ -1691,7 +1727,7 @@ class LlamaGUI:
 
     def _on_hf_scan_completed(self, result):
         self.hf_scan_result = result
-        self.ui.hf_files.clear()
+        self.ui.hf_files.setRowCount(0)
         files = result.get("files") or []
         projectors = result.get("projectors") or []
         partial_count = 0
@@ -1705,14 +1741,10 @@ class LlamaGUI:
                     partial,
                     model_dir=self.ui.model_dir.text().strip(),
                 )
-            self.ui.hf_files.addItem(self._hf_file_display(file_info))
-            item = self.ui.hf_files.item(self.ui.hf_files.count() - 1)
-            item.setData(Qt.ItemDataRole.UserRole, file_info)
-            if partial:
-                item.setToolTip(f"Partial file: {partial.get('partial_path')}")
+            self._add_hf_file_row(file_info, partial)
 
         if files:
-            self.ui.hf_files.setCurrentRow(0)
+            self.ui.hf_files.setCurrentCell(0, 0)
 
         target_text = ""
         model_dir = self.ui.model_dir.text().strip()
@@ -1726,7 +1758,7 @@ class LlamaGUI:
         total_text = f", shown size: {format_bytes(total_size)}" if total_size else ""
         partial_text = f", partial/resumable: {partial_count}" if partial_count else ""
         self.ui.hf_status.setText(
-            f"Найдено GGUF: {len(files)} из {len(result.get('all_files') or [])}"
+            f"Found GGUF: {len(files)} of {len(result.get('all_files') or [])}"
             f"{total_text}, mmproj: {len(projectors)}{projector_text}"
             f"{partial_text}{target_text}"
         )
@@ -1749,6 +1781,28 @@ class LlamaGUI:
                 f"{partial.get('expected_size_text')}"
             )
         return "  |  ".join(parts)
+
+    def _add_hf_file_row(self, file_info, partial=None):
+        row = self.ui.hf_files.rowCount()
+        self.ui.hf_files.insertRow(row)
+        name = file_info.get("name") or file_info.get("rfilename") or ""
+        quant = str(file_info.get("quant") or "").strip()
+        size = int(file_info.get("size") or 0)
+        tooltip = f"Partial file: {partial.get('partial_path')}" if partial else ""
+        progress = ""
+        if partial:
+            progress = (
+                f"{partial.get('partial_size_text')} / "
+                f"{partial.get('expected_size_text')}"
+            )
+        self._set_table_item(
+            self.ui.hf_files, row, 0, name, data=file_info, tooltip=tooltip
+        )
+        self._set_table_item(self.ui.hf_files, row, 1, quant)
+        self._set_table_item(
+            self.ui.hf_files, row, 2, format_bytes(size) if size else "size unknown"
+        )
+        self._set_table_item(self.ui.hf_files, row, 3, progress)
 
     def _hf_partial_info(self, file_info):
         if not self.hf_scan_result:
@@ -1783,8 +1837,8 @@ class LlamaGUI:
             )
         total = sum(int(p.get("partial_size") or 0) for p in partials)
         self.ui.hf_status.setText(
-            f"Незавершённые загрузки: {len(partials)}, сохранено {format_bytes(total)}. "
-            "Они уже показаны в списке; Scan HF добавит полный размер и точный процент."
+            f"Unfinished downloads: {len(partials)}, saved {format_bytes(total)}. "
+            "They are already listed; Scan HF will add the full size and exact percent."
         )
         self._update_hf_download_button()
 
@@ -1800,7 +1854,7 @@ class LlamaGUI:
             return ""
 
     def refresh_hf_local_files(self, silent=False):
-        self.ui.hf_local_files.clear()
+        self.ui.hf_local_files.setRowCount(0)
         model_dir = self.ui.model_dir.text().strip()
         repo_id = self._current_hf_repo_id()
         if not model_dir or not repo_id:
@@ -1815,11 +1869,19 @@ class LlamaGUI:
         files = info.get("files") or []
         for file_info in files:
             marker = "partial" if file_info.get("is_partial") else "local"
-            self.ui.hf_local_files.addItem(
-                f"{file_info.get('relative')}  |  {marker}  |  {file_info.get('size_text')}"
+            row = self.ui.hf_local_files.rowCount()
+            self.ui.hf_local_files.insertRow(row)
+            tooltip = str(file_info.get("path") or "")
+            self._set_table_item(
+                self.ui.hf_local_files,
+                row,
+                0,
+                file_info.get("relative") or "",
+                tooltip=tooltip,
             )
-            self.ui.hf_local_files.item(self.ui.hf_local_files.count() - 1).setToolTip(
-                str(file_info.get("path") or "")
+            self._set_table_item(self.ui.hf_local_files, row, 1, marker)
+            self._set_table_item(
+                self.ui.hf_local_files, row, 2, file_info.get("size_text") or ""
             )
         self.ui.hf_delete_local_folder_btn.setEnabled(bool(info.get("exists")))
         if files:
@@ -1849,13 +1911,12 @@ class LlamaGUI:
         if not target_root.exists():
             self.refresh_hf_local_files(silent=True)
             return
-        reply = QMessageBox.question(
+        if not confirm_destructive_action(
             self.ui,
             "Delete local model folder",
-            "Удалить всю локальную папку модели, включая main GGUF, vision/mmproj и .part?\n\n"
+            "Delete the whole local model folder, including main GGUF, vision/mmproj and .part?\n\n"
             f"{target_root}",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        ):
             return
         try:
             shutil.rmtree(target_root)
@@ -1868,19 +1929,20 @@ class LlamaGUI:
         self.scan_models(silent=True)
 
     def _selected_hf_file_info(self):
-        selected = self.ui.hf_files.selectedItems()
+        selected = self._selected_table_data(self.ui.hf_files)
         if not selected:
             return None
-        return selected[0].data(Qt.ItemDataRole.UserRole)
+        return selected[0]
 
     def _selected_hf_partial_info(self):
         file_info = self._selected_hf_file_info()
         return self._hf_partial_info(file_info) if file_info else {}
 
     def _update_hf_download_button(self):
-        has_selection = bool(self.ui.hf_files.selectedItems())
+        selected_files = self._selected_table_data(self.ui.hf_files)
+        has_selection = bool(selected_files)
         has_partial = bool(self._selected_hf_partial_info())
-        count = len(self.ui.hf_files.selectedItems())
+        count = len(selected_files)
         self.ui.hf_download_btn.setText(
             f"{'Resume' if has_partial else 'Download'} selected models"
             + (f" ({count})" if count > 1 else "")
@@ -1888,11 +1950,7 @@ class LlamaGUI:
         self.ui.hf_download_btn.setEnabled(has_selection)
 
         selected_task_keys = self._selected_hf_task_keys()
-        selected_running = any(
-            self.hf_downloaders.get(key, {}).get("worker")
-            and self.hf_downloaders[key]["worker"].isRunning()
-            for key in selected_task_keys
-        )
+        selected_running = any(self.hf.is_running(key) for key in selected_task_keys)
         self.ui.hf_pause_btn.setEnabled(selected_running)
         self.ui.hf_cancel_btn.setEnabled(
             bool(selected_task_keys) or (has_partial and not selected_running)
@@ -1900,79 +1958,81 @@ class LlamaGUI:
 
     @staticmethod
     def _hf_task_key(repo_id, file_info):
-        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
-        return f"{repo_id}::{filename}"
+        return HfDownloadCoordinator.task_key(repo_id, file_info)
 
     def _selected_hf_task_keys(self):
-        return [
-            str(item.data(Qt.ItemDataRole.UserRole) or "")
-            for item in self.ui.hf_downloads.selectedItems()
-            if item.data(Qt.ItemDataRole.UserRole)
-        ]
+        return [str(data) for data in self._selected_table_data(self.ui.hf_downloads)]
 
     def _active_hf_downloads(self, repo_id=None):
-        active = []
-        for task in self.hf_downloaders.values():
-            worker = task.get("worker")
-            if worker and worker.isRunning() and (
-                repo_id is None or task.get("repo_id") == repo_id
-            ):
-                active.append(task)
-        return active
+        return self.hf.active(repo_id)
 
     def _set_hf_task_display(self, task_key):
-        task = self.hf_downloaders.get(task_key)
+        task = self.hf.task(task_key)
         if not task:
             return
-        item = task.get("item")
-        if item is None:
+        row = task.get("row")
+        if row is None or row < 0:
             return
         name = task.get("name") or task_key
         percent_value = task.get("percent")
-        percent = f"{int(percent_value):3d}%" if percent_value is not None else "  —%"
         status = task.get("status") or "queued"
         message = str(task.get("message") or "").strip()
-        headline = f"{name}  |  {percent}  |  {status}"
-        item.setText(f"{headline}\n{message}" if message else headline)
-        item.setToolTip(message)
+        parts = self._parse_hf_task_message(message)
+        size_text = parts.get("size") or ""
+        speed_text = parts.get("speed") or ""
+        eta_text = parts.get("eta") or ""
+        if not size_text and message:
+            size_text = message.splitlines()[0]
+        self._set_table_item(
+            self.ui.hf_downloads, row, 0, name, data=task_key, tooltip=message
+        )
+        self._set_table_item(self.ui.hf_downloads, row, 1, status, tooltip=message)
+        self._set_table_item(self.ui.hf_downloads, row, 3, size_text, tooltip=message)
+        self._set_table_item(self.ui.hf_downloads, row, 4, speed_text, tooltip=message)
+        self._set_table_item(self.ui.hf_downloads, row, 5, eta_text, tooltip=message)
+        progress = self.ui.hf_downloads.cellWidget(row, 2)
+        if not isinstance(progress, QProgressBar):
+            progress = QProgressBar()
+            progress.setTextVisible(True)
+            self.ui.hf_downloads.setCellWidget(row, 2, progress)
+        if percent_value is None:
+            progress.setRange(0, 0)
+            progress.setFormat("unknown")
+        else:
+            progress.setRange(0, 100)
+            progress.setValue(max(0, min(int(percent_value), 100)))
+            progress.setFormat(f"{int(percent_value)}%")
+
+    def _parse_hf_task_message(self, message: str) -> dict[str, str]:
+        text = str(message or "")
+        parts: dict[str, str] = {}
+        if m := re.search(r":\s*([^;]+?/\s*[^;,]+)", text):
+            parts["size"] = m.group(1).strip()
+        elif m := re.search(r"(?:Сохранено|Saved):\s*([^\n]+)", text):
+            parts["size"] = m.group(1).strip()
+        if m := re.search(r"(?:скорость|speed)\s+([^;\n,]+)", text, re.IGNORECASE):
+            parts["speed"] = m.group(1).strip()
+        if m := re.search(r"ETA\s+([^;\n,]+)", text, re.IGNORECASE):
+            parts["eta"] = m.group(1).strip()
+        return parts
 
     def _upsert_hf_partial_task(self, repo_id, file_info, partial, model_dir=None):
         """Show a saved .part immediately, even before its repository is scanned."""
-        if not repo_id or not file_info or not partial:
-            return
-        task_key = self._hf_task_key(repo_id, file_info)
-        previous = self.hf_downloaders.get(task_key, {})
-        worker = previous.get("worker")
-        if worker and worker.isRunning():
-            return
 
-        item = previous.get("item")
-        if item is None:
-            self.ui.hf_downloads.addItem("")
-            item = self.ui.hf_downloads.item(self.ui.hf_downloads.count() - 1)
-            item.setData(Qt.ItemDataRole.UserRole, task_key)
+        def ensure_row() -> int:
+            row = self.ui.hf_downloads.rowCount()
+            self.ui.hf_downloads.insertRow(row)
+            return row
 
-        saved = int(partial.get("partial_size") or 0)
-        expected = int(file_info.get("size") or partial.get("expected_size") or 0)
-        percent = min(99, int(saved * 100 / expected)) if expected else None
-        saved_text = partial.get("partial_size_text") or format_bytes(saved)
-        total_text = format_bytes(expected) if expected else "размер уточняется"
-        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
-        self.hf_downloaders[task_key] = {
-            "worker": None,
-            "repo_id": repo_id,
-            "file_info": dict(file_info),
-            "model_dir": model_dir or self.ui.model_dir.text().strip(),
-            "name": f"{repo_id} / {filename}",
-            "percent": percent,
-            "status": "paused / resumable",
-            "message": (
-                f"Сохранено: {saved_text} / {total_text}\n"
-                f"{partial.get('partial_path') or ''}"
-            ),
-            "item": item,
-        }
-        self._set_hf_task_display(task_key)
+        task_key = self.hf.upsert_partial(
+            repo_id,
+            file_info,
+            partial,
+            model_dir or self.ui.model_dir.text().strip(),
+            ensure_row=ensure_row,
+        )
+        if task_key:
+            self._set_hf_task_display(task_key)
 
     def _refresh_hf_download_summary(self):
         active = self._active_hf_downloads()
@@ -1982,9 +2042,9 @@ class LlamaGUI:
             self.ui.hf_progress.setValue(average)
             self.ui.hf_progress.setVisible(True)
             self.ui.hf_status.setText(
-                f"Параллельные загрузки: {len(active)} | общий прогресс ~{average}%"
+                f"Parallel downloads: {len(active)} | total progress ~{average}%"
             )
-        elif self.hf_downloaders:
+        elif self.hf.tasks():
             self.ui.hf_progress.setVisible(False)
         self._update_hf_download_button()
 
@@ -2015,21 +2075,21 @@ class LlamaGUI:
     def download_hf_selection(self):
         if not self.hf_scan_result:
             QMessageBox.warning(
-                self.ui, "Hugging Face", "Сначала просканируйте репозиторий"
+                self.ui, "Hugging Face", "Scan the repository first"
             )
             return
-        selected = self.ui.hf_files.selectedItems()
+        selected = self._selected_table_data(self.ui.hf_files)
         if not selected:
             QMessageBox.warning(
-                self.ui, "Hugging Face", "Выберите GGUF файл для скачивания"
+                self.ui, "Hugging Face", "Select a GGUF file to download"
             )
             return
         model_dir = self.ui.model_dir.text().strip()
         if not model_dir:
-            QMessageBox.warning(self.ui, "Hugging Face", "Укажите базовую папку Models")
+            QMessageBox.warning(self.ui, "Hugging Face", "Set the Models base folder")
             return
 
-        files = [item.data(Qt.ItemDataRole.UserRole) for item in selected]
+        files = list(selected)
         if self.ui.hf_include_mmproj.isChecked():
             projector = self._select_hf_projector()
             selected_names = {
@@ -2046,14 +2106,10 @@ class LlamaGUI:
         files = [
             file_info
             for file_info in files
-            if file_info
-            and not (
-                self.hf_downloaders.get(self._hf_task_key(repo_id, file_info), {}).get("worker")
-                and self.hf_downloaders[self._hf_task_key(repo_id, file_info)]["worker"].isRunning()
-            )
+            if file_info and not self.hf.is_running(self._hf_task_key(repo_id, file_info))
         ]
         if not files:
-            self.ui.hf_status.setText("Все выбранные файлы уже скачиваются")
+            self.ui.hf_status.setText("All selected files are already downloading")
             return
         target_root = lmstudio_repo_dir(Path(model_dir), repo_id)
         total_size = sum(int(f.get("size") or 0) for f in files)
@@ -2062,7 +2118,7 @@ class LlamaGUI:
         reply = QMessageBox.question(
             self.ui,
             "Download GGUF models",
-            f"Запустить {len(files)} параллельных загрузок в LM Studio-compatible папку:\n"
+            f"Start {len(files)} parallel downloads into the LM Studio-compatible folder:\n"
             f"{target_root}\n\n{names}{size_line}",
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -2074,102 +2130,50 @@ class LlamaGUI:
         self._refresh_hf_download_summary()
 
     def _start_hf_download_task(self, repo_id, file_info, model_dir):
-        task_key = self._hf_task_key(repo_id, file_info)
-        previous = self.hf_downloaders.get(task_key, {})
-        item = previous.get("item")
-        if item is None:
-            self.ui.hf_downloads.addItem("")
-            item = self.ui.hf_downloads.item(self.ui.hf_downloads.count() - 1)
-            item.setData(Qt.ItemDataRole.UserRole, task_key)
+        def ensure_row() -> int:
+            row = self.ui.hf_downloads.rowCount()
+            self.ui.hf_downloads.insertRow(row)
+            return row
 
-        worker = HfModelDownloader(repo_id, [file_info], model_dir)
-        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
-        self.hf_downloaders[task_key] = {
-            "worker": worker,
-            "repo_id": repo_id,
-            "file_info": file_info,
-            "model_dir": model_dir,
-            "name": filename,
-            "percent": 0,
-            "status": "starting",
-            "message": "",
-            "item": item,
-        }
-        item.setSelected(True)
+        task_key = self.hf.start(repo_id, file_info, model_dir, ensure_row=ensure_row)
         self._set_hf_task_display(task_key)
-        worker.progress.connect(
-            lambda message, key=task_key: self._on_hf_task_progress(key, message)
-        )
-        worker.percent.connect(
-            lambda percent, key=task_key: self._on_hf_task_percent(key, percent)
-        )
-        worker.completed.connect(
-            lambda ok, message, key=task_key: self._on_hf_task_completed(key, ok, message)
-        )
-        worker.finished.connect(lambda key=task_key: self._on_hf_task_finished(key))
-        worker.start()
-
-    def _on_hf_task_progress(self, task_key, message):
-        task = self.hf_downloaders.get(task_key)
-        if not task:
-            return
-        task["status"] = "downloading"
-        task["message"] = message
-        self._set_hf_task_display(task_key)
-
-    def _on_hf_task_percent(self, task_key, percent):
-        task = self.hf_downloaders.get(task_key)
-        if not task:
-            return
-        task["percent"] = int(percent)
-        self._set_hf_task_display(task_key)
-        self._refresh_hf_download_summary()
+        row = self.hf.task(task_key).get("row")
+        selection = self.ui.hf_downloads.selectionModel()
+        if selection:
+            selection.select(
+                self.ui.hf_downloads.model().index(row, 0),
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
 
     def pause_hf_download(self):
-        paused = 0
-        for key in self._selected_hf_task_keys():
-            task = self.hf_downloaders.get(key, {})
-            worker = task.get("worker")
-            if worker and worker.isRunning():
-                task["status"] = "pausing"
-                worker.pause()
-                self._set_hf_task_display(key)
-                paused += 1
+        paused = self.hf.pause(self._selected_hf_task_keys())
         if paused:
             self.ui.hf_status.setText(
-                f"Пауза {paused} загрузок: сохраняю .part для докачки..."
+                f"Pausing {paused} download(s): saving .part for resume..."
             )
 
     def cancel_hf_download(self):
         selected_keys = self._selected_hf_task_keys()
-        running_keys = [
-            key
-            for key in selected_keys
-            if self.hf_downloaders.get(key, {}).get("worker")
-            and self.hf_downloaders[key]["worker"].isRunning()
-        ]
+        running_keys = self.hf.running_keys(selected_keys)
         if running_keys:
-            reply = QMessageBox.question(
+            if not confirm_destructive_action(
                 self.ui,
                 "Cancel downloads",
-                f"Прервать выбранные загрузки ({len(running_keys)}) и удалить их .part?\n\n"
-                "Если хотите продолжить позже — нажмите Pause вместо Cancel.",
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+                f"Abort selected downloads ({len(running_keys)}) and delete their .part files?\n\n"
+                "Use Pause instead of Cancel to resume later.",
+            ):
                 return
             for key in running_keys:
-                task = self.hf_downloaders[key]
-                task["status"] = "cancelling"
-                task["worker"].cancel_and_delete()
-                self._set_hf_task_display(key)
+                self.hf.cancel_and_delete([key])
             self.ui.hf_status.setText(
-                f"Отмена {len(running_keys)} загрузок: удаляю частичные .part..."
+                f"Cancelling {len(running_keys)} download(s): deleting partial .part files..."
             )
             return
 
         saved_partials = []
         for key in selected_keys:
-            task = self.hf_downloaders.get(key, {})
+            task = self.hf.task(key) or {}
             file_info = task.get("file_info") or {}
             filename = str(
                 file_info.get("rfilename") or file_info.get("name") or ""
@@ -2185,22 +2189,17 @@ class LlamaGUI:
             if partial_info:
                 saved_partials.append((key, partial_info))
         if saved_partials:
-            reply = QMessageBox.question(
+            if not confirm_destructive_action(
                 self.ui,
                 "Delete partial downloads",
-                f"Удалить сохранённые .part выбранных задач ({len(saved_partials)})?",
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+                f"Delete saved .part files of the selected tasks ({len(saved_partials)})?",
+            ):
                 return
             for key, partial_info in saved_partials:
                 delete_file_safely(Path(partial_info.get("partial_path") or ""))
-                task = self.hf_downloaders.get(key, {})
-                task["status"] = "cancelled"
-                task["percent"] = 0
-                task["message"] = "Частичный .part удалён"
-                self._set_hf_task_display(key)
+                self.hf.mark_partial_deleted(key)
             self.ui.hf_status.setText(
-                f"Удалено частичных загрузок: {len(saved_partials)}"
+                f"Deleted partial downloads: {len(saved_partials)}"
             )
             self.refresh_hf_local_files(silent=True)
             self._update_hf_download_button()
@@ -2209,23 +2208,30 @@ class LlamaGUI:
         partial = self._selected_hf_partial_info()
         if not partial:
             return
-        reply = QMessageBox.question(
+        if not confirm_destructive_action(
             self.ui,
             "Cancel partial download",
-            "Удалить сохранённый .part и начать этот файл заново при следующей загрузке?\n\n"
+            "Delete the saved .part and restart this file on the next download?\n\n"
             f"{partial.get('partial_path')}\n"
             f"Saved: {partial.get('partial_size_text')}",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        ):
             return
         delete_file_safely(Path(partial.get("partial_path") or ""))
         item = self.ui.hf_files.currentItem()
         file_info = self._selected_hf_file_info()
-        if item and file_info:
-            item.setText(self._hf_file_display(file_info))
-            item.setToolTip("")
+        if file_info:
+            row = self.ui.hf_files.currentRow()
+            if row >= 0:
+                self._set_table_item(
+                    self.ui.hf_files,
+                    row,
+                    0,
+                    file_info.get("name") or file_info.get("rfilename") or "",
+                    data=file_info,
+                )
+                self._set_table_item(self.ui.hf_files, row, 3, "")
         self.ui.hf_status.setText(
-            "Частичный .part удалён. Следующая загрузка начнётся заново."
+            "Partial .part deleted. The next download will start from scratch."
         )
         self.refresh_hf_local_files(silent=True)
         self._update_hf_download_button()
@@ -2236,13 +2242,6 @@ class LlamaGUI:
         self._refresh_hf_download_summary()
 
     def _on_hf_task_completed(self, task_key, ok, message):
-        task = self.hf_downloaders.get(task_key)
-        if task:
-            task["status"] = "complete" if ok else "stopped"
-            task["message"] = message
-            if ok:
-                task["percent"] = 100
-            self._set_hf_task_display(task_key)
         self.log_mgr.append(message, "info" if ok else "error")
         self.refresh_hf_local_files(silent=True)
         self.refresh_local_model_manager(silent=True)
@@ -2278,6 +2277,7 @@ class LlamaGUI:
                 )
             else:
                 self.ui.model_info.setText("Select model")
+                self._refresh_overview()
                 return
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
         info.setdefault("path", path)
@@ -2437,9 +2437,9 @@ class LlamaGUI:
                 parallel_slots=self.ui.parallel_slots.value(),
                 current_ncmoe=self.ui.cpu_moe_layers.value(),
             )
-            self.ui.cpu_moe_layers.setToolTip(tooltip)
+            self._set_ncmoe_help_text(tooltip)
         else:
-            self.ui.cpu_moe_layers.setToolTip("Model is not MoE")
+            self._set_ncmoe_help_text("Model is not MoE")
 
         tooltip_ctx = build_ctx_tooltip(
             info=info,
@@ -2450,7 +2450,7 @@ class LlamaGUI:
             flash_attn=self.ui.flash_attn.isChecked(),
             parallel_slots=self.ui.parallel_slots.value(),
         )
-        self.ui.ctx_size.setToolTip(tooltip_ctx)
+        self._set_ctx_help_text(tooltip_ctx)
 
     def _is_mtp_model_info(self, info):
         if info.get("mtp_capable") or info.get("mtp_draft_path"):
@@ -2463,74 +2463,36 @@ class LlamaGUI:
 
     @staticmethod
     def _mtp_model_key(model_path):
+        return MtpModelRules.model_key(model_path)
+
+    def _mtp_model_key(model_path):
         text = str(model_path or "").strip()
         if not text:
             return ""
         return os.path.normcase(os.path.abspath(text))
 
     def _mtp_info_model_key(self, info=None):
-        info = info or {}
-        model_path = (
-            info.get("path")
-            or info.get("_model_path")
-            or self._current_model_path()
-        )
-        return self._mtp_model_key(model_path)
+        return MtpModelRules.info_model_key(info, self._current_model_path())
 
     def _is_mtp_draft_auto_disabled(self, info=None):
-        model_key = self._mtp_info_model_key(info)
-        disabled = getattr(
-            self.config.settings, "spec_draft_auto_disabled_models", []
+        return MtpModelRules.is_draft_auto_disabled(
+            self.config.settings, info, self._current_model_path()
         )
-        if not model_key or not isinstance(disabled, list):
-            return False
-        return model_key in {self._mtp_model_key(path) for path in disabled}
 
     def _set_mtp_draft_auto_disabled(self, disabled, info=None):
-        model_key = self._mtp_info_model_key(info)
-        if not model_key:
-            return
-        saved = getattr(
-            self.config.settings, "spec_draft_auto_disabled_models", []
+        MtpModelRules.set_draft_auto_disabled(
+            self.config.settings, disabled, info, self._current_model_path()
         )
-        saved = saved if isinstance(saved, list) else []
-        normalized = {
-            self._mtp_model_key(path) for path in saved if str(path or "").strip()
-        }
-        if disabled:
-            normalized.add(model_key)
-        else:
-            normalized.discard(model_key)
-        self.config.settings.spec_draft_auto_disabled_models = sorted(normalized)
 
     def _mtp_manual_draft_path(self, info=None):
-        model_key = self._mtp_info_model_key(info)
-        saved = getattr(self.config.settings, "spec_draft_manual_paths", {})
-        if not model_key or not isinstance(saved, dict):
-            return ""
-        for saved_model, draft_path in saved.items():
-            if self._mtp_model_key(saved_model) == model_key:
-                return str(draft_path or "").strip()
-        return ""
+        return MtpModelRules.manual_draft_path(
+            self.config.settings, info, self._current_model_path()
+        )
 
     def _set_mtp_manual_draft_path(self, draft_path, info=None):
-        model_key = self._mtp_info_model_key(info)
-        if not model_key:
-            return
-        saved = getattr(self.config.settings, "spec_draft_manual_paths", {})
-        saved = dict(saved) if isinstance(saved, dict) else {}
-        normalized = {
-            self._mtp_model_key(saved_model): str(path or "").strip()
-            for saved_model, path in saved.items()
-            if str(saved_model or "").strip() and str(path or "").strip()
-        }
-        text = str(draft_path or "").strip()
-        if text:
-            normalized[model_key] = text
-        else:
-            normalized.pop(model_key, None)
-        self.config.settings.spec_draft_manual_paths = normalized
-        self._set_mtp_draft_auto_disabled(not bool(text), info)
+        MtpModelRules.set_manual_draft_path(
+            self.config.settings, draft_path, info, self._current_model_path()
+        )
 
     def _on_mtp_draft_path_edited(self, text):
         # textEdited is emitted only for a user edit, not for automatic setText().
@@ -2543,35 +2505,18 @@ class LlamaGUI:
 
     def _uses_embedded_mtp_mode(self, info):
         """True when llama.cpp should use --spec-type draft-mtp without --model-draft."""
-        arch = str(info.get("architecture") or "").lower()
-        name_text = " ".join(
-            str(info.get(k) or "") for k in ("path", "name", "display", "_model_path")
-        ).lower()
-        return (
-            arch.startswith(("gemma4", "qwen"))
-            and bool(info.get("mtp_capable"))
-            and not info.get("is_qat")
-            and "qat" not in name_text
-        )
+        return MtpModelRules.uses_embedded_mtp_mode(info)
 
     def _auto_mtp_supported(self, info):
         """Auto-enable known embedded MTP or an available non-disabled nearby draft."""
-        if self._uses_embedded_mtp_mode(info):
-            return True
-        draft_path = str(info.get("mtp_draft_path") or "").strip()
-        return bool(
-            draft_path
-            and os.path.isfile(draft_path)
-            and not self._is_mtp_draft_auto_disabled(info)
+        return MtpModelRules.auto_mtp_supported(
+            self.config.settings, info, self._current_model_path()
         )
 
     def _auto_mtp_draft_path(self, info):
-        if not self._auto_mtp_supported(info) or self._uses_embedded_mtp_mode(info):
-            return ""
-        manual_draft = self._mtp_manual_draft_path(info)
-        if manual_draft and os.path.isfile(manual_draft):
-            return manual_draft
-        return str(info.get("mtp_draft_path") or "").strip()
+        return MtpModelRules.auto_mtp_draft_path(
+            self.config.settings, info, self._current_model_path()
+        )
 
     def _apply_mtp_recommended_params(self, info):
         block_count = int(info.get("block_count") or 0)
@@ -2673,7 +2618,7 @@ class LlamaGUI:
             parallel_slots=self.ui.parallel_slots.value(),
             current_ncmoe=self.ui.cpu_moe_layers.value(),
         )
-        self.ui.cpu_moe_layers.setToolTip(tooltip)
+        self._set_ncmoe_help_text(tooltip)
 
         tooltip_ctx = build_ctx_tooltip(
             info=info,
@@ -2684,7 +2629,7 @@ class LlamaGUI:
             flash_attn=self.ui.flash_attn.isChecked(),
             parallel_slots=self.ui.parallel_slots.value(),
         )
-        self.ui.ctx_size.setToolTip(tooltip_ctx)
+        self._set_ctx_help_text(tooltip_ctx)
 
         preset_loaded = False
         model_path = self._current_model_path()
@@ -2741,13 +2686,13 @@ class LlamaGUI:
         self.ui.cli_apply_btn.setEnabled(checked)
         if checked:
             self.ui.cli_status.setText("Manual CLI editing")
-            self.ui.cli_status.setStyleSheet("color: #FF9800;")
+            self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_WARNING + ";")
             self.ui.cli_preview.setStyleSheet(
                 "background-color: #1f2933; color: #ffffff; font-family: Consolas; padding: 4px;"
             )
         else:
             self.ui.cli_status.setText("Generated from UI")
-            self.ui.cli_status.setStyleSheet("color: #888;")
+            self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
             self.ui.cli_preview.setStyleSheet(
                 "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
             )
@@ -2863,7 +2808,7 @@ class LlamaGUI:
         parsed = parse_llama_server_command(self.ui.cli_preview.text())
         if parsed.warnings and not parsed.settings:
             self.ui.cli_status.setText("; ".join(parsed.warnings))
-            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_ERROR + ";")
             return
 
         self._applying_cli = True
@@ -2891,10 +2836,10 @@ class LlamaGUI:
 
         if parsed.warnings:
             status = "Applied with warnings: " + "; ".join(parsed.warnings)
-            color = "#FF9800"
+            color = STATUS_COLOR_WARNING
         else:
             status = "CLI applied"
-            color = "#4CAF50"
+            color = STATUS_COLOR_RUNNING
         ignored = []
         if parsed.executable:
             ignored.append("program path")
@@ -2914,19 +2859,19 @@ class LlamaGUI:
         text = self.portable_cli_text().strip()
         if not text:
             self.ui.cli_status.setText("CLI is empty")
-            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_ERROR + ";")
             return
 
         QApplication.clipboard().setText(text)
         self.ui.cli_status.setText("CLI copied with relative paths")
-        self.ui.cli_status.setStyleSheet("color: #4CAF50;")
+        self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_RUNNING + ";")
         self.log_mgr.append("CLI copied to clipboard with relative paths")
 
     def import_cli_from_clipboard(self):
         text = QApplication.clipboard().text().strip()
         if not text:
             self.ui.cli_status.setText("Clipboard is empty")
-            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_ERROR + ";")
             return
 
         self.ui.cli_preview.setText(text)
@@ -2947,26 +2892,29 @@ class LlamaGUI:
             self.ui.cli_preview.setText("")
         finally:
             self._update_cuda_status()
+            self._refresh_overview()
 
     def _mark_restart_needed(self):
         """Подсвечивает, что запущенному серверу нужен рестарт для новых параметров."""
         if not self.server.is_server_running():
             return
-        self._restart_needed = True
+        self.launcher.mark_restart_needed()
         self.ui.start_btn.setVisible(False)
         self.ui.reload_btn.setVisible(True)
         self.ui.reload_btn.setText("Restart to apply")
         self.ui.reload_btn.setStyleSheet(
-            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
         )
         self.ui.reload_btn.setEnabled(True)
+        self._refresh_overview()
 
     def _reset_restart_indicator(self):
-        self._restart_needed = False
+        self.launcher.clear_restart_needed()
         self.ui.reload_btn.setText("Restart")
         self.ui.reload_btn.setStyleSheet(
-            "background-color: #FF9800; color: white; font-weight: bold; padding: 8px;"
+            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
         )
+        self._refresh_overview()
 
     def _system_ram_snapshot_mib(self):
         """Returns (used_mib, total_mib, percent) for system RAM without extra deps."""
@@ -3013,9 +2961,11 @@ class LlamaGUI:
                 check=False,
                 **no_console_kwargs(),
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("nvidia-smi query failed: %s", exc)
             return []
         if result.returncode != 0:
+            logger.debug("nvidia-smi returned code %s", result.returncode)
             return []
         gpus = []
         for line in result.stdout.splitlines():
@@ -3054,10 +3004,12 @@ class LlamaGUI:
                 check=False,
                 **no_console_kwargs(),
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("tasklist query failed for PID %s: %s", pid, exc)
             return None
         line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
         if not line or "INFO:" in line:
+            logger.debug("tasklist returned no row for PID %s", pid)
             return None
         try:
             import csv
@@ -3264,11 +3216,23 @@ class LlamaGUI:
         self.server.force_stop_server()
 
     def _mark_mtp_launch_failed(self, reason: str, fatal: bool = False):
-        self._mtp_draft_error_seen = True
-        self._mtp_failure_reason = reason
-        if fatal and not self._mtp_auto_abort_requested:
-            self._mtp_auto_abort_requested = True
+        if self.mtp.mark_failed(reason, fatal=fatal):
             QTimer.singleShot(0, self._abort_bad_mtp_launch)
+
+    def _schedule_mem_viz_flush(self):
+        self._mem_viz_dirty = True
+        timer = getattr(self, "_mem_viz_timer", None)
+        if timer is None:
+            self._flush_mem_viz()
+        elif not timer.isActive():
+            timer.start()
+
+    def _flush_mem_viz(self):
+        if not getattr(self, "_mem_viz_dirty", False):
+            return
+        self._mem_viz_dirty = False
+        self.ui.mem_viz.update_from_data(self._mem_data)
+        self._refresh_overview()
 
     def _on_log_for_mem_viz(self, text: str, level: str):
         """Обработка логов для визуализации памяти."""
@@ -3305,18 +3269,20 @@ class LlamaGUI:
         if self._mem_data.server_ready:
             self._update_process_memory_fallbacks()
         self._maybe_log_memory_summary()
-        # Принудительно обновляем UI после каждого блока логов
-        self.ui.mem_viz.update_from_data(self._mem_data)
-        # Обрабатываем события Qt чтобы UI не зависал
-        QApplication.processEvents()
+        self._schedule_mem_viz_flush()
 
     def _reset_mem_viz(self, status: str | None = None):
         """Сброс визуализации памяти."""
+        self._mem_viz_dirty = False
+        timer = getattr(self, "_mem_viz_timer", None)
+        if timer is not None:
+            timer.stop()
         self._mem_data = MemoryData()
         self._memory_summary_logged = False
         self.ui.mem_viz.clear()
         if status:
             self.ui.mem_viz.status_label.setText(status)
+        self._refresh_overview()
 
     def _finalize_mem_viz_after_stop(self, exit_code: int | None, status: str):
         """Обновляет вкладку Memory после выгрузки модели/остановки процесса."""
@@ -3325,62 +3291,22 @@ class LlamaGUI:
             # какой компонент и сколько памяти пытались выделить.
             self._mem_data.process_exit_code = exit_code
             self.ui.mem_viz.update_from_data(self._mem_data)
+            self._refresh_overview()
         else:
             # Нормальная выгрузка освобождает RAM/VRAM — старые allocations
             # больше неактуальны, поэтому полностью очищаем вкладку.
             self._reset_mem_viz(status)
 
-    def _strip_mtp_args(self, args: list[str]) -> list[str]:
-        value_flags = {
-            "-md",
-            "--model-draft",
-            "--spec-draft-device",
-            "--spec-type",
-            "--spec-draft-n-max",
-            "--spec-draft-n-min",
-            "--spec-draft-p-min",
-            "--spec-draft-ngl",
-            "--spec-draft-type-k",
-            "--spec-draft-type-v",
-        }
-        stripped = []
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            base = arg.split("=", 1)[0] if str(arg).startswith("-") else arg
-            if base in value_flags:
-                if "=" not in str(arg) and i + 1 < len(args):
-                    i += 2
-                else:
-                    i += 1
-                continue
-            stripped.append(arg)
-            i += 1
-        return stripped
+    @staticmethod
+    def _strip_mtp_args(args: list[str]) -> list[str]:
+        return strip_mtp_args(args)
 
     def _retry_without_mtp_if_needed(self, exit_code: int) -> bool:
-        if exit_code == 0 or self._mtp_fallback_attempted:
-            return False
-        if not self._mtp_draft_error_seen or not self._last_server_launch:
-            return False
-
-        exe, args, env = self._last_server_launch
-        if (
-            "--spec-type" not in args
-            and "--model-draft" not in args
-            and "-md" not in args
-        ):
+        should_retry, launch, reason = self.mtp.retry_plan(exit_code)
+        if not should_retry:
             return False
 
-        fallback_args = self._strip_mtp_args(args)
-        if fallback_args == args:
-            return False
-
-        self._mtp_fallback_attempted = True
-        reason = self._mtp_failure_reason or "MTP initialization failed"
-        self._mtp_draft_error_seen = False
-        self._mtp_failure_reason = ""
-        self._mtp_auto_abort_requested = False
+        exe, fallback_args, env = launch
         self.ui.speculative_mtp.setChecked(False)
         self.log_mgr.append(
             f"⚠️ MTP disabled: {reason}. Retrying once without MTP so the main model can start. "
@@ -3431,7 +3357,7 @@ class LlamaGUI:
                 )
             )
         except OSError as exc:
-            result["action"] += f" Не удалось записать отчёт: {exc}"
+            result["action"] += f" Failed to write the report: {exc}"
 
         summary = format_diagnostic_summary(result, report_path)
         self.last_diagnostic_path = report_path
@@ -3445,7 +3371,7 @@ class LlamaGUI:
         result = {
             "cause": cause,
             "action": action,
-            "exit_code": "процесс не запущен",
+            "exit_code": "process not started",
         }
         summary = format_diagnostic_summary(result)
         self.last_diagnostic_path = ""
@@ -3485,10 +3411,10 @@ class LlamaGUI:
     def show_previous_native_crash(self, report_path: Path):
         self.last_diagnostic_path = str(report_path)
         self.last_diagnostic_summary = (
-            "❌ ДИАГНОСТИКА\n"
-            "Причина: в предыдущем сеансе аварийно завершилось само приложение.\n"
-            "Что сделать: откройте отчёт; там сохранены Python-потоки на момент сбоя.\n"
-            f"Полный отчёт: {report_path}"
+            "❌ DIAGNOSTICS\n"
+            "Cause: the application itself crashed in the previous session.\n"
+            "What to do: open the report; it contains the Python threads at crash time.\n"
+            f"Full report: {report_path}"
         )
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(self.last_diagnostic_summary, "error")
@@ -3504,10 +3430,10 @@ class LlamaGUI:
         except OSError:
             self.last_diagnostic_path = ""
         self.last_diagnostic_summary = (
-            "❌ ДИАГНОСТИКА\n"
-            f"Причина: необработанная ошибка интерфейса: {exc_value}\n"
-            "Что сделать: скопируйте отчёт кнопкой Copy last error.\n"
-            f"Полный отчёт: {self.last_diagnostic_path or 'записать не удалось'}"
+            "❌ DIAGNOSTICS\n"
+            f"Cause: unhandled UI error: {exc_value}\n"
+            "What to do: copy the report with the Copy last error button.\n"
+            f"Full report: {self.last_diagnostic_path or 'failed to write'}"
         )
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(self.last_diagnostic_summary, "error")
@@ -3533,10 +3459,10 @@ class LlamaGUI:
         except OSError:
             self.last_diagnostic_path = ""
         self.last_diagnostic_summary = (
-            "❌ ДИАГНОСТИКА\n"
-            f"Причина: критическая ошибка Qt: {message}\n"
-            "Что сделать: откройте отчёт; в нём сохранён стек приложения.\n"
-            f"Полный отчёт: {self.last_diagnostic_path or 'записать не удалось'}"
+            "❌ DIAGNOSTICS\n"
+            f"Cause: critical Qt error: {message}\n"
+            "What to do: open the report; it contains the application stack.\n"
+            f"Full report: {self.last_diagnostic_path or 'failed to write'}"
         )
         self.ui.copy_last_error_btn.setEnabled(True)
 
@@ -3545,25 +3471,25 @@ class LlamaGUI:
         self._stop_metrics_polling()
         exit_code = self.server.server_last_exit_code
         self._record_server_diagnostic(exit_code)
-        if self._restart_pending:
-            self._reset_mem_viz("Сервер остановлен, перезапуск с новыми параметрами...")
+        if self.launcher.is_pending:
+            self._reset_mem_viz("Server stopped, restarting with new parameters...")
             QTimer.singleShot(150, self._start_pending_restart)
             return
         if self._retry_without_mtp_if_needed(exit_code):
             return
         self._finalize_mem_viz_after_stop(
             exit_code,
-            "Сервер остановлен",
+            "Server stopped",
         )
 
     def _on_bench_finished(self, exit_code: int):
-        self._finalize_mem_viz_after_stop(exit_code, "Benchmark завершён")
+        self._finalize_mem_viz_after_stop(exit_code, "Benchmark finished")
 
     def _prepare_server_launch(self):
         if self.server.is_bench_running():
             self._record_preflight_diagnostic(
-                "модель не запущена: сейчас выполняется benchmark",
-                "Остановите benchmark и повторите запуск.",
+                "model not started: a benchmark is running",
+                "Stop the benchmark and start again.",
             )
             QMessageBox.warning(
                 self.ui,
@@ -3574,8 +3500,8 @@ class LlamaGUI:
         exe = self._resolve_llamacpp_executable("server")
         if not exe or not os.path.exists(exe):
             self._record_preflight_diagnostic(
-                "llama-server.exe не найден в выбранной CUDA-сборке",
-                "Проверьте папку llama.cpp и выбранную версию CUDA.",
+                "llama-server.exe not found in the selected CUDA build",
+                "Check the llama.cpp folder and the selected CUDA version.",
             )
             QMessageBox.critical(
                 self.ui,
@@ -3641,15 +3567,15 @@ class LlamaGUI:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
         except ValueError as e:
             self._record_preflight_diagnostic(
-                f"ошибка параметров запуска: {e}",
-                "Исправьте указанный параметр в Launch settings и повторите запуск.",
+                f"launch parameter error: {e}",
+                "Fix the reported parameter in Launch settings and start again.",
             )
             QMessageBox.warning(self.ui, "Error", str(e))
             return None
         if not args:
             self._record_preflight_diagnostic(
-                "не удалось сформировать команду llama-server",
-                "Проверьте выбранную модель и Launch settings.",
+                "failed to build the llama-server command",
+                "Check the selected model and Launch settings.",
             )
             return None
         if getattr(self.config.settings, "speculative_mtp", False):
@@ -3669,18 +3595,7 @@ class LlamaGUI:
         return exe, args, env
 
     def _server_env_from_settings(self):
-        env = {}
-        cuda_visible = str(
-            getattr(self.config.settings, "cuda_visible_devices", "") or ""
-        ).strip()
-        cuda_loading = str(
-            getattr(self.config.settings, "cuda_module_loading", "") or ""
-        ).strip()
-        if cuda_visible:
-            env["CUDA_VISIBLE_DEVICES"] = cuda_visible
-        if cuda_loading:
-            env["CUDA_MODULE_LOADING"] = cuda_loading
-        return env
+        return ServerLaunchController.env_from_settings(self.config.settings)
 
     def _launch_server(
         self,
@@ -3699,13 +3614,7 @@ class LlamaGUI:
         self.log_mgr.append(
             f"{action} [CUDA {cuda_ver}]: {exe}\n   Args: {' '.join(args)}{env_text}"
         )
-        self._last_server_launch = (exe, list(args), dict(env or {}))
-        if "--spec-type" in args or "--model-draft" in args or "-md" in args:
-            self._mtp_draft_error_seen = False
-            self._mtp_failure_reason = ""
-            self._mtp_auto_abort_requested = False
-            if not action.lower().startswith("retry without mtp"):
-                self._mtp_fallback_attempted = False
+        self.mtp.remember_launch(exe, args, env, is_retry=is_retry)
         self._reset_mem_viz()
         self.server.start_server(exe, args, env=env)
         self._start_metrics_polling()
@@ -3722,17 +3631,15 @@ class LlamaGUI:
             )
 
     def _start_pending_restart(self):
-        if not self._restart_pending:
+        had_pending, launch = self.launcher.poll_pending(self.server.is_server_running())
+        if not had_pending:
             return
-        if self.server.is_server_running():
+        if launch is None:
+            # Сервер ещё не остановился — опросим снова.
             QTimer.singleShot(150, self._start_pending_restart)
             return
-        launch = self._pending_restart_launch
-        self._restart_pending = False
-        self._pending_restart_launch = None
-        if launch:
-            exe, args, env = launch
-            self._launch_server(exe, args, env=env, action="Restarting server")
+        exe, args, env = launch
+        self._launch_server(exe, args, env=env, action="Restarting server")
 
     def restart_server(self):
         """Перезапускает llama-server с текущими параметрами UI."""
@@ -3742,10 +3649,9 @@ class LlamaGUI:
         launch = self._prepare_server_launch()
         if not launch:
             return
-        self._pending_restart_launch = launch
-        self._restart_pending = True
+        self.launcher.request_restart(launch)
         self.log_mgr.append("Restart requested: stopping current server...")
-        self._reset_mem_viz("Остановка сервера для перезапуска...")
+        self._reset_mem_viz("Stopping the server for restart...")
         self.server.stop_server()
         self.update_action_buttons()
 
@@ -3811,11 +3717,38 @@ class LlamaGUI:
         return info
 
     def open_autotune_tab(self):
-        """Открывает секцию Benchmark/AutoTune и строит свежий план."""
-        if not self.ui.bench_panel.toggle_btn.isChecked():
-            self.ui.bench_panel.toggle_btn.setChecked(True)
-            self.ui.bench_panel.toggle_visibility()
+        """Opens the right-side AutoTune workspace and builds a fresh plan."""
+        if hasattr(self.ui, "tabs"):
+            index = self.ui.tabs.indexOf(self.ui.autotune)
+            if index >= 0:
+                self.ui.tabs.setCurrentIndex(index)
         self.build_autotune_plan()
+
+    def _current_autotune_plan_signature(self, options=None):
+        if options is None:
+            options = self.ui.autotune.options()
+        model_path = self._current_model_path() or ""
+        return (
+            os.path.normcase(os.path.abspath(model_path)) if model_path else "",
+            int(self.ui.ctx_size.value()),
+            bool(self.ui.gpu_auto.isChecked()),
+            int(self.ui.gpu_layers.value()),
+            int(self.ui.cpu_moe_layers.value()),
+            int(self.ui.threads.value()),
+            int(self.ui.threads_batch.value()),
+            str(self.ui.cache_type_k.currentText()),
+            str(self.ui.cache_type_v.currentText()),
+            int(self.ui.batch_size.value()),
+            int(self.ui.ubatch_size.value()),
+            int(self.ui.parallel_slots.value()),
+            bool(self.ui.flash_attn.isChecked()),
+            bool(self.ui.use_mmproj.isChecked()),
+            int(self.ui.ctx_checkpoints.value()),
+            int(self.ui.cache_ram.value()),
+            int(self.ui.bench_prompt.value()),
+            int(self.ui.bench_gen.value()),
+            tuple(sorted((str(k), repr(v)) for k, v in options.items())),
+        )
 
     def build_autotune_plan(self):
         model_path = self._current_model_path()
@@ -3837,6 +3770,7 @@ class LlamaGUI:
             early_stop_on_peak=bool(options.get("early_stop_on_peak", False)),
         )
         self.autotune_plan = plan
+        self._autotune_plan_signature = self._current_autotune_plan_signature(options)
         self.autotune_best_result = None
         self._autotune_best_applied = False
         self.autotune_results_dir = ""
@@ -3919,12 +3853,16 @@ class LlamaGUI:
                 "llama-bench.exe was not found in the selected CUDA build folder.",
             )
             return
-        plan = self.autotune_plan or self.build_autotune_plan()
+        options = self.ui.autotune.options()
+        current_signature = self._current_autotune_plan_signature(options)
+        plan = self.autotune_plan
+        if not plan or self._autotune_plan_signature != current_signature:
+            plan = self.build_autotune_plan()
         if not plan:
             return
-        options = self.ui.autotune.options()
         plan = self.ui.autotune.apply_table_edits_to_plan(plan)
         self.autotune_plan = plan
+        self._autotune_plan_signature = current_signature
         plan.early_stop_on_peak = bool(options.get("early_stop_on_peak", False))
         if str(options.get("engine", "llama-bench")) == "llama-server":
             QMessageBox.information(
@@ -3969,10 +3907,13 @@ class LlamaGUI:
             self.autotune.cancel()
 
     def _best_autotune_params(self):
-        if not self.autotune_plan or not self.autotune_best_result:
+        return self._autotune_params_for_result(self.autotune_best_result)
+
+    def _autotune_params_for_result(self, result):
+        if not self.autotune_plan or not result:
             return {}
         for candidate in self.autotune_plan.candidates:
-            if candidate.id == self.autotune_best_result.candidate_id:
+            if candidate.id == result.candidate_id:
                 params = dict(candidate.params)
                 if str(params.get("ngl", "")).strip().lower() == "auto":
                     info = self._current_model_info()
@@ -3980,6 +3921,68 @@ class LlamaGUI:
                     params["ngl"] = block_count if block_count > 0 else 99
                 return params
         return {}
+
+    def _autotune_result_by_id(self, candidate_id: str):
+        if not candidate_id:
+            return None
+        if self.autotune_best_result and self.autotune_best_result.candidate_id == candidate_id:
+            return self.autotune_best_result
+        if self.autotune:
+            for result in getattr(self.autotune, "results", []) or []:
+                if result.candidate_id == candidate_id:
+                    return result
+        return None
+
+    def _autotune_apply_diff_lines(self, params: dict) -> list[str]:
+        fields = [
+            ("Context", str(self.ui.ctx_size.value()), str(params.get("ctx_size", self.ui.ctx_size.value()))),
+            ("GPU layers", "auto" if self.ui.gpu_auto.isChecked() else str(self.ui.gpu_layers.value()), str(params.get("ngl", self.ui.gpu_layers.value()))),
+            ("KV K", self.ui.cache_type_k.currentText(), str(params.get("cache_type_k", self.ui.cache_type_k.currentText()))),
+            ("KV V", self.ui.cache_type_v.currentText(), str(params.get("cache_type_v", self.ui.cache_type_v.currentText()))),
+            ("Batch", str(self.ui.batch_size.value()), str(params.get("batch_size", self.ui.batch_size.value()))),
+            ("UBatch", str(self.ui.ubatch_size.value()), str(params.get("ubatch_size", self.ui.ubatch_size.value()))),
+            ("Threads", str(self.ui.threads.value()), str(params.get("threads", self.ui.threads.value()))),
+            ("Threads batch", str(self.ui.threads_batch.value()), str(params.get("threads_batch", self.ui.threads_batch.value()))),
+            ("Slots", str(self.ui.parallel_slots.value()), str(params.get("parallel_slots", self.ui.parallel_slots.value()))),
+            ("CPU MoE", str(self.ui.cpu_moe_layers.value()), str(params.get("ncmoe", self.ui.cpu_moe_layers.value()))),
+            ("MTP", "on" if self.ui.speculative_mtp.isChecked() else "off", "on" if bool(params.get("speculative_mtp", self.ui.speculative_mtp.isChecked())) else "off"),
+            ("MTP n-max", str(self.ui.spec_draft_n_max.value()), str(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value()))),
+            ("Flash Attention", "on" if self.ui.flash_attn.isChecked() else "off", "on" if bool(params.get("flash_attn", self.ui.flash_attn.isChecked())) else "off"),
+            ("Fit", "off" if self.ui.fit_off.isChecked() else "auto", "off" if bool(params.get("fit_off", self.ui.fit_off.isChecked())) else "auto"),
+            ("Prompt cache", "on" if self.ui.cache_prompt.isChecked() else "off", "on" if bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked())) else "off"),
+        ]
+        lines = []
+        for label, current, best in fields:
+            if current != best:
+                lines.append(f"{label}: {current} -> {best}")
+        if params.get("_estimated_vram_gib"):
+            risk = str(params.get("_risk") or "unknown")
+            pct = float(params.get("_vram_pct") or 0.0)
+            lines.append(
+                f"Estimated VRAM: {float(params['_estimated_vram_gib']):.2f} GiB"
+                + (f" ({pct:.1f}%, {risk})" if pct else f" ({risk})")
+            )
+        if self.autotune_best_result:
+            lines.append(
+                f"Benchmark: TG {self.autotune_best_result.generation_tok_s:.1f} tok/s, "
+                f"PP {self.autotune_best_result.prompt_tok_s:.1f} tok/s, "
+                f"score {self.autotune_best_result.score:.3f}"
+            )
+        return lines or ["No setting changes; best result already matches the UI."]
+
+    def _confirm_apply_autotune_best(self, params: dict) -> bool:
+        lines = self._autotune_apply_diff_lines(params)
+        text = "Apply AutoTune best result?\n\n" + "\n".join(lines[:22])
+        if len(lines) > 22:
+            text += f"\n... and {len(lines) - 22} more"
+        reply = QMessageBox.question(
+            self.ui,
+            "Apply AutoTune Best",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _on_autotune_finished(self, best, output_dir):
         self.autotune_best_result = best
@@ -3991,20 +3994,10 @@ class LlamaGUI:
             self.log_mgr.append(
                 f"AutoTune finished: best={best.candidate_id}, score={best.score:.3f}, results={output_dir}"
             )
-            # Auto-apply best + server verification если включен чекбокс
-            try:
-                options = self.ui.autotune.options()
-                if options.get("verify_server_after_apply"):
-                    self.log_mgr.append(
-                        "AutoTune auto-apply: applying best and starting server verification...",
-                        "info",
-                    )
-                    if self.apply_autotune_best(silent=True):
-                        self._start_or_restart_server_with_verification()
-            except Exception as e:
-                self.log_mgr.append(
-                    f"Auto-apply after autotune failed (non-critical): {e}", "warn"
-                )
+            self.log_mgr.append(
+                "Review the best result, then click Apply Best to update the UI.",
+                "info",
+            )
         else:
             self.log_mgr.append(
                 f"AutoTune finished: no successful result, results={output_dir}", "warn"
@@ -4016,6 +4009,9 @@ class LlamaGUI:
         if not params:
             if not silent:
                 QMessageBox.warning(self.ui, "AutoTune", "No best result to apply")
+            return False
+
+        if not silent and not self._confirm_apply_autotune_best(params):
             return False
 
         # Убеждаемся что ngl — число, не "auto", для reproducibility
@@ -4125,6 +4121,28 @@ class LlamaGUI:
                 )
         return True
 
+    def apply_autotune_selected(self, candidate_id: str = ""):
+        result = self._autotune_result_by_id(candidate_id)
+        if not result:
+            QMessageBox.warning(self.ui, "AutoTune", "Select a completed run first")
+            return False
+        if result.status != "success":
+            QMessageBox.warning(
+                self.ui,
+                "AutoTune",
+                f"Selected run is not successful: {result.status}",
+            )
+            return False
+        if not self._autotune_params_for_result(result):
+            QMessageBox.warning(self.ui, "AutoTune", "Selected run has no parameters")
+            return False
+
+        self.autotune_best_result = result
+        self.ui.autotune.show_best(
+            result, self._best_autotune_params(), self.autotune_results_dir
+        )
+        return self.apply_autotune_best(silent=False)
+
     def _start_or_restart_server_with_verification(self):
         launch = self._prepare_server_launch()
         if not launch:
@@ -4142,8 +4160,7 @@ class LlamaGUI:
             "info",
         )
         if self.server.is_server_running():
-            self._pending_restart_launch = (exe, args, env)
-            self._restart_pending = True
+            self.launcher.request_restart((exe, args, env))
             self.server.stop_server()
         else:
             self._launch_server(
@@ -4335,9 +4352,7 @@ class LlamaGUI:
             subprocess.Popen(["xdg-open", self.autotune_results_dir])
 
     def stop_work(self):
-        if self._restart_pending:
-            self._restart_pending = False
-            self._pending_restart_launch = None
+        if self.launcher.cancel_pending():
             self.log_mgr.append("Restart cancelled")
         if self.server.is_server_running():
             self.server.stop_server()
@@ -4350,10 +4365,29 @@ class LlamaGUI:
         self.update_action_buttons()
 
     def force_stop_server(self):
-        if self._restart_pending:
-            self._restart_pending = False
-            self._pending_restart_launch = None
+        if self.launcher.cancel_pending():
             self.log_mgr.append("Restart cancelled")
+        has_owned = self.server.is_server_running()
+        external = [] if has_owned else self._external_llama_processes()
+        if not has_owned and not external:
+            self.log_mgr.append("Force stop skipped: no llama processes found", "warn")
+            self.update_action_buttons()
+            return
+        now = time.monotonic()
+        if now - self._last_force_stop_confirmed_at > 6.0:
+            target_text = (
+                "the current llama-server process tree"
+                if has_owned
+                else f"{len(external)} external llama process(es)"
+            )
+            if not confirm_destructive_action(
+                self.ui,
+                "Force Stop",
+                "Force Stop immediately kills llama.cpp processes and may interrupt a model load or request.\n\n"
+                f"Kill {target_text} now?",
+            ):
+                return
+            self._last_force_stop_confirmed_at = now
         if self.server.is_server_running():
             self.log_mgr.append(
                 "Force stop requested: killing llama-server now", "error"
@@ -4361,8 +4395,6 @@ class LlamaGUI:
             self.server.force_stop_server()
             self.update_action_buttons()
             return
-        # Нет своего процесса — попробуем убить внешние llama процессы
-        external = self._external_llama_processes()
         if external:
             self.log_mgr.append(
                 f"Force stop: killing {len(external)} external llama process(es)...",
@@ -4380,8 +4412,6 @@ class LlamaGUI:
                         )
             self.update_action_buttons()
             return
-        self.log_mgr.append("Force stop skipped: no llama processes found", "warn")
-        self.update_action_buttons()
 
     def update_action_buttons(self, busy=False):
         srv = self.server.is_server_running()
@@ -4389,12 +4419,14 @@ class LlamaGUI:
         scan = self.scanner and self.scanner.isRunning()
         upd = self.updater and self.updater.isRunning()
         tune = self._autotune_running or (self.autotune and self.autotune.isRunning())
-        busy = srv or bnch or scan or tune or self._restart_pending
-        show_reload = srv or self._restart_pending
+        busy = srv or bnch or scan or tune or self.launcher.is_pending
+        show_reload = srv or self.launcher.is_pending
         self.ui.start_btn.setVisible(not show_reload)
         self.ui.reload_btn.setVisible(show_reload)
         self.ui.stop_btn.setEnabled(busy)
         self.ui.force_stop_btn.setEnabled(True)
+        self.ui.force_stop_action.setEnabled(True)
+        self.ui.more_actions_btn.setEnabled(True)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
         self.ui.cuda_version_combo.setEnabled(not busy and not upd)
@@ -4420,7 +4452,7 @@ class LlamaGUI:
             and not scan
             and not upd
             and not tune
-            and not self._restart_pending
+            and not self.launcher.is_pending
             and not self.server.server_stop_requested
         )
         self.ui.test_btn.setEnabled(not busy and not upd)
@@ -4428,8 +4460,9 @@ class LlamaGUI:
         self.ui.autotune.start_btn.setEnabled(not busy and not upd)
         self.ui.autotune.build_plan_btn.setEnabled(not busy and not upd)
         self.ui.autotune.cancel_btn.setEnabled(bool(tune))
-        if not srv and not self._restart_pending:
+        if not srv and not self.launcher.is_pending:
             self._reset_restart_indicator()
+        self._refresh_overview()
 
     def update_llamacpp(self):
         if self.server.is_server_running() or self.server.is_bench_running():
@@ -4527,10 +4560,72 @@ class LlamaGUI:
         QApplication.instance().quit()
 
 
+logger = logging.getLogger("llamaserver")
+
+
+def _configure_logging() -> None:
+    """Уровень логов llamaserver: WARNING по умолчанию, DEBUG с --debug."""
+    level = logging.DEBUG if "--debug" in sys.argv else logging.WARNING
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s")
+    )
+    root = logging.getLogger("llamaserver")
+    root.setLevel(level)
+    root.addHandler(handler)
+    root.propagate = False
+
+
+def _apply_theme(app: QApplication) -> None:
+    """Глобальная QSS-тема (Этап 3.3). Точечные стили виджетов главнее."""
+    theme_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    theme_path = theme_root / "src" / "ui" / "theme.qss"
+    if not theme_path.exists():
+        theme_path = Path(__file__).resolve().parent / "src" / "ui" / "theme.qss"
+    try:
+        app.setStyleSheet(theme_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        logger.debug("theme.qss not applied: %s", exc)
+
+
+def _selected_language() -> str:
+    """Язык интерфейса: --lang=ru имеет приоритет, затем QSettings, затем en."""
+    for arg in sys.argv[1:]:
+        if arg.startswith("--lang="):
+            return arg.split("=", 1)[1].strip().lower()
+    settings = QSettings("LlamaServerGUI", "UIState")
+    return str(settings.value("language", "en") or "en").strip().lower()
+
+
+def _install_translator(app: QApplication) -> str:
+    """Подключает QTranslator с compiled-каталогом translations/ (Этап 4).
+
+    Возвращает применённый язык ("en" — без перевода, исходные строки).
+    """
+    lang = _selected_language()
+    if not lang or lang == "en":
+        return "en"
+    translator = QTranslator(app)
+    for root in (
+        Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)),
+        Path(__file__).resolve().parent,
+        Path.cwd(),
+    ):
+        qm_path = root / "translations" / f"llamaserver_{lang}.qm"
+        if qm_path.exists() and translator.load(str(qm_path)):
+            app.installTranslator(translator)
+            return lang
+    logger.debug("translation catalog not found for language %r", lang)
+    return "en"
+
+
 def main():
+    _configure_logging()
     previous_native_crash = consume_previous_native_crash()
     native_log_path, native_log_stream = start_native_crash_capture()
     app = QApplication(sys.argv)
+    _apply_theme(app)
+    _install_translator(app)
     icon_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     icon_path = icon_root / "assets" / "llama_server_icon.svg"
     if icon_path.exists():

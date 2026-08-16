@@ -15,28 +15,28 @@ from typing import Iterable
 _CAUSES = [
     (
         re.compile(r"out of memory|cuda.*alloc|failed to allocate|not enough memory", re.I),
-        "Недостаточно памяти (VRAM или RAM)",
-        "Уменьшите Context Size, Batch/UBatch или GPU layers; закройте другие GPU-приложения.",
+        "Out of memory (VRAM or RAM)",
+        "Reduce Context Size, Batch/UBatch or GPU layers; close other GPU applications.",
     ),
     (
         re.compile(r"address already in use|failed to bind|bind.*failed|port.*in use", re.I),
-        "Порт сервера уже занят",
-        "Выберите другой порт или завершите другой процесс llama-server.",
+        "Server port is already in use",
+        "Choose another port or stop the other llama-server process.",
     ),
     (
         re.compile(r"unknown argument|invalid argument|unrecognized option|invalid value", re.I),
-        "Текущая сборка llama.cpp не поддерживает один из параметров",
-        "Проверьте строку Args в отчёте, уберите несовместимый параметр или обновите llama.cpp.",
+        "The current llama.cpp build does not support one of the parameters",
+        "Check the Args line in the report, remove the unsupported parameter or update llama.cpp.",
     ),
     (
         re.compile(r"failed to load model|invalid gguf|gguf.*(error|invalid)|model.*corrupt", re.I),
-        "Не удалось прочитать GGUF-модель",
-        "Проверьте, что файл скачан полностью, доступен и поддерживается этой версией llama.cpp.",
+        "Failed to read the GGUF model",
+        "Make sure the file is fully downloaded, readable and supported by this llama.cpp build.",
     ),
     (
         re.compile(r"failed to load draft|model-draft|mtp input row width|mtp.*assert", re.I),
-        "Ошибка MTP/draft-модели",
-        "Уберите несовместимый draft или отключите MTP speculative для этой модели.",
+        "MTP/draft model error",
+        "Remove the incompatible draft or disable MTP speculative decoding for this model.",
     ),
     (
         re.compile(
@@ -44,40 +44,40 @@ _CAUSES = [
             r"|(?:error|failed|invalid).*(?:chat template|jinja)",
             re.I,
         ),
-        "Ошибка chat template / Jinja",
-        "Проверьте файл шаблона и поддержку Jinja выбранной сборкой llama.cpp.",
+        "Chat template / Jinja error",
+        "Check the template file and Jinja support in the selected llama.cpp build.",
     ),
     (
         re.compile(r"cudart|cublas|cuda.*dll|no cuda-capable|cuda driver|driver version", re.I),
-        "Ошибка CUDA или драйвера NVIDIA",
-        "Проверьте выбранную CUDA-сборку, драйвер NVIDIA и наличие DLL рядом с llama-server.exe.",
+        "CUDA or NVIDIA driver error",
+        "Check the selected CUDA build, the NVIDIA driver and the DLLs next to llama-server.exe.",
     ),
     (
         re.compile(r"access is denied|permission denied|отказано в доступе", re.I),
-        "Нет доступа к файлу или папке",
-        "Проверьте права, антивирус и не удерживается ли файл другим процессом.",
+        "No access to the file or folder",
+        "Check permissions, antivirus, and whether another process holds the file.",
     ),
     (
         re.compile(r"context.*(too large|exceed|failed)|kv cache.*(failed|too large)", re.I),
-        "Слишком большой контекст или KV cache",
-        "Уменьшите Context Size/Parallel slots либо используйте более компактные типы KV cache.",
+        "Context or KV cache is too large",
+        "Reduce Context Size/Parallel slots or use more compact KV cache types.",
     ),
     (
         re.compile(r"assert|access violation|segmentation fault|fatal error|stack overflow", re.I),
-        "Аварийное завершение внутри llama.cpp",
-        "Сохраните отчёт, попробуйте другую сборку llama.cpp и проверьте совместимость модели и параметров.",
+        "Crash inside llama.cpp",
+        "Save the report, try another llama.cpp build and check model/parameter compatibility.",
     ),
 ]
 
 _WINDOWS_EXIT_CODES = {
-    -1073741819: "нарушение доступа к памяти (0xC0000005)",
-    3221225477: "нарушение доступа к памяти (0xC0000005)",
-    -1073740791: "повреждение стека (0xC0000409)",
-    3221226505: "повреждение стека (0xC0000409)",
-    -1073741571: "переполнение стека (0xC00000FD)",
-    3221225725: "переполнение стека (0xC00000FD)",
-    -1073740940: "повреждение heap (0xC0000374)",
-    3221226356: "повреждение heap (0xC0000374)",
+    -1073741819: "access violation (0xC0000005)",
+    3221225477: "access violation (0xC0000005)",
+    -1073740791: "stack corruption (0xC0000409)",
+    3221226505: "stack corruption (0xC0000409)",
+    -1073741571: "stack overflow (0xC00000FD)",
+    3221225725: "stack overflow (0xC00000FD)",
+    -1073740940: "heap corruption (0xC0000374)",
+    3221226356: "heap corruption (0xC0000374)",
 }
 
 
@@ -115,17 +115,17 @@ def analyze_server_failure(
     exit_detail = _WINDOWS_EXIT_CODES.get(int(exit_code))
     unexpected = not stop_requested
     if not cause and exit_detail:
-        cause = f"Процесс llama-server аварийно завершился: {exit_detail}"
-        action = "Попробуйте другую сборку llama.cpp; приложите сохранённый отчёт при сообщении об ошибке."
+        cause = f"llama-server process crashed: {exit_detail}"
+        action = "Try another llama.cpp build; attach the saved report when reporting the bug."
     if not cause and process_error and not crash_exit:
-        cause = f"QProcess не смог запустить или обслужить llama-server: {process_error}"
-        action = "Проверьте путь к EXE, права доступа и DLL выбранной CUDA-сборки."
+        cause = f"QProcess failed to start or serve llama-server: {process_error}"
+        action = "Check the EXE path, permissions and DLLs of the selected CUDA build."
     if not cause and crash_exit:
-        cause = "llama-server завершился аварийно без явного сообщения"
-        action = "Откройте полный отчёт: в нём сохранены команда, код завершения и последние строки процесса."
+        cause = "llama-server crashed without an explicit message"
+        action = "Open the full report: it contains the command, exit code and last process lines."
     if not cause and unexpected:
-        cause = f"llama-server неожиданно завершился с кодом {exit_code}"
-        action = "Проверьте последние строки отчёта; попробуйте уменьшить нагрузку или другую сборку llama.cpp."
+        cause = f"llama-server exited unexpectedly with code {exit_code}"
+        action = "Check the last report lines; try reducing the load or another llama.cpp build."
         detail = next(
             (line.strip() for line in reversed(text.splitlines()) if line.strip()), ""
         )[:700]
@@ -133,7 +133,7 @@ def analyze_server_failure(
         return None
 
     if stop_requested and (crash_exit or exit_detail):
-        cause = f"Сбой при выгрузке модели: {cause}"
+        cause = f"Failed to unload the model: {cause}"
     return {
         "cause": cause,
         "action": action,
@@ -146,18 +146,18 @@ def analyze_server_failure(
 
 def format_diagnostic_summary(result: dict, report_path: str = "") -> str:
     lines = [
-        "❌ ДИАГНОСТИКА",
-        f"Причина: {result.get('cause') or 'не определена'}",
+        "❌ DIAGNOSTICS",
+        f"Cause: {result.get('cause') or 'unidentified'}",
         *(
-            [f"Сообщение llama.cpp: {result.get('detail')}"]
+            [f"llama.cpp message: {result.get('detail')}"]
             if result.get("detail")
             else []
         ),
-        f"Что сделать: {result.get('action') or 'откройте полный отчёт'}",
-        f"Код завершения: {result.get('exit_code')}",
+        f"What to do: {result.get('action') or 'open the full report'}",
+        f"Exit code: {result.get('exit_code')}",
     ]
     if report_path:
-        lines.append(f"Полный отчёт: {report_path}")
+        lines.append(f"Full report: {report_path}")
     return "\n".join(lines)
 
 

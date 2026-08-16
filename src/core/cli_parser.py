@@ -7,7 +7,14 @@ import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from src.core.param_registry import (
+    FLAG_TO_SPEC,
+    NEG_FLAG_TO_SPEC,
+    OPTIONAL_VALUE_FLAGS as _OPTIONAL_VALUE_FLAGS,
+    VALUE_FLAGS as _VALUE_FLAGS,
+)
 
 
 @dataclass
@@ -125,68 +132,57 @@ def _set_gpu_layers(settings: dict[str, Any], value: str) -> None:
         settings["gpu_layers"] = int(value)
 
 
-_VALUE_FLAGS = {
-    "-m",
-    "--model",
-    "--host",
-    "--port",
-    "--device",
-    "--spec-draft-device",
-    "--split-mode",
-    "--main-gpu",
-    "-ngl",
-    "--n-gpu-layers",
-    "-t",
-    "--threads",
-    "-tb",
-    "--threads-batch",
-    "-c",
-    "--ctx-size",
-    "-b",
-    "--batch-size",
-    "-ub",
-    "--ubatch-size",
-    "-np",
-    "--parallel",
-    "-ctk",
-    "--cache-type-k",
-    "-ctv",
-    "--cache-type-v",
-    "-ncmoe",
-    "--n-cpu-moe",
-    "--fit",
-    "-rea",
-    "--reasoning",
-    "--ctx-checkpoints",
-    "--cache-ram",
-    "--temp",
-    "--temperature",
-    "--top-k",
-    "--top-p",
-    "--min-p",
-    "--typical",
-    "--typical-p",
-    "--repeat-penalty",
-    "--repeat-last-n",
-    "--presence-penalty",
-    "--frequency-penalty",
-    "-s",
-    "--seed",
-    "-mm",
-    "--mmproj",
-    "-md",
-    "--model-draft",
-    "--spec-type",
-    "--spec-draft-n-max",
-    "--spec-draft-p-min",
-    "--spec-draft-ngl",
-    "-ngld",
-    "--chat-template-file",
-}
+# Наборы value/optional-value флагов генерируются из реестра параметров;
+# паритет со старыми ручными таблицами фиксирует tests/test_param_registry.py.
 
-_OPTIONAL_VALUE_FLAGS = {
-    "-fa",
-    "--flash-attn",
+# Спец-обработчики для cli_kind == "special": флаги с составной логикой
+# (несколько полей или условное применение). (result, settings, extra, value).
+def _sp_model_path(result, settings, extra, value):
+    result.model_path = str(value)
+
+
+def _sp_gpu_layers(result, settings, extra, value):
+    _set_gpu_layers(settings, str(value))
+
+
+def _sp_fit(result, settings, extra, value):
+    settings["fit_off"] = str(value).strip().lower() == "off"
+
+
+def _sp_mmproj(result, settings, extra, value):
+    settings["use_mmproj"] = True
+    settings["mmproj_path"] = str(value)
+
+
+def _sp_model_draft(result, settings, extra, value):
+    settings["speculative_mtp"] = True
+    settings["spec_draft_model_path"] = str(value)
+
+
+def _sp_chat_template(result, settings, extra, value):
+    settings["use_chat_template"] = True
+    settings["chat_template_file"] = str(value)
+
+
+def _sp_spec_type(result, settings, extra, value):
+    if str(value).strip().lower() == "draft-mtp":
+        settings["speculative_mtp"] = True
+    else:
+        extra.extend(["--spec-type", str(value)])
+
+
+_SPECIAL_HANDLERS: dict[str, Callable[[Any, dict[str, Any], list[str], "str | None"], None]] = {
+    "-m": _sp_model_path,
+    "--model": _sp_model_path,
+    "-ngl": _sp_gpu_layers,
+    "--n-gpu-layers": _sp_gpu_layers,
+    "--fit": _sp_fit,
+    "-mm": _sp_mmproj,
+    "--mmproj": _sp_mmproj,
+    "-md": _sp_model_draft,
+    "--model-draft": _sp_model_draft,
+    "--chat-template-file": _sp_chat_template,
+    "--spec-type": _sp_spec_type,
 }
 
 
@@ -249,119 +245,13 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
             value = inline_value
 
         try:
-            if flag in {"-m", "--model"}:
-                result.model_path = str(value)
-            elif flag == "--host":
-                result.settings["host"] = str(value)
-            elif flag == "--port":
-                result.settings["port"] = int(value)
-            elif flag == "--device":
-                result.settings["cuda_device"] = str(value)
-            elif flag == "--spec-draft-device":
-                result.settings["spec_draft_device"] = str(value)
-            elif flag == "--split-mode":
-                result.settings["split_mode"] = str(value)
-            elif flag == "--main-gpu":
-                result.settings["main_gpu"] = int(value)
-            elif flag in {"-ngl", "--n-gpu-layers"}:
-                _set_gpu_layers(result.settings, str(value))
-            elif flag in {"-t", "--threads"}:
-                result.settings["threads"] = int(value)
-            elif flag in {"-tb", "--threads-batch"}:
-                result.settings["threads_batch"] = int(value)
-            elif flag in {"-c", "--ctx-size"}:
-                result.settings["ctx_size"] = int(value)
-            elif flag in {"-b", "--batch-size"}:
-                result.settings["batch_size"] = int(value)
-            elif flag in {"-ub", "--ubatch-size"}:
-                result.settings["ubatch_size"] = int(value)
-            elif flag in {"-np", "--parallel"}:
-                result.settings["parallel_slots"] = int(value)
-            elif flag in {"-ctk", "--cache-type-k"}:
-                result.settings["cache_type_k"] = str(value)
-            elif flag in {"-ctv", "--cache-type-v"}:
-                result.settings["cache_type_v"] = str(value)
-            elif flag in {"-ncmoe", "--n-cpu-moe"}:
-                result.settings["cpu_moe_layers"] = int(value)
-            elif flag == "--fit":
-                result.settings["fit_off"] = str(value).strip().lower() == "off"
-            elif flag in {"-rea", "--reasoning"}:
-                result.settings["reasoning_mode"] = str(value)
-            elif flag == "--ctx-checkpoints":
-                result.settings["ctx_checkpoints"] = int(value)
-            elif flag == "--cache-ram":
-                result.settings["cache_ram"] = int(value)
-            elif flag in {"--temp", "--temperature"}:
-                result.settings["temperature"] = float(value)
-            elif flag == "--top-k":
-                result.settings["top_k"] = int(value)
-            elif flag == "--top-p":
-                result.settings["top_p"] = float(value)
-            elif flag == "--min-p":
-                result.settings["min_p"] = float(value)
-            elif flag in {"--typical", "--typical-p"}:
-                result.settings["typical_p"] = float(value)
-            elif flag == "--repeat-penalty":
-                result.settings["repeat_penalty"] = float(value)
-            elif flag == "--repeat-last-n":
-                result.settings["repeat_last_n"] = int(value)
-            elif flag == "--presence-penalty":
-                result.settings["presence_penalty"] = float(value)
-            elif flag == "--frequency-penalty":
-                result.settings["frequency_penalty"] = float(value)
-            elif flag in {"-s", "--seed"}:
-                result.settings["seed"] = int(value)
-            elif flag in {"-fa", "--flash-attn"}:
-                result.settings["flash_attn"] = _as_bool(value, default=True)
-            elif flag in {"-mm", "--mmproj"}:
-                result.settings["use_mmproj"] = True
-                result.settings["mmproj_path"] = str(value)
-            elif flag in {"-md", "--model-draft"}:
-                result.settings["speculative_mtp"] = True
-                result.settings["spec_draft_model_path"] = str(value)
-            elif flag == "--spec-type":
-                if str(value).strip().lower() == "draft-mtp":
-                    result.settings["speculative_mtp"] = True
-                else:
-                    extra.extend([flag, str(value)])
-            elif flag == "--spec-draft-n-max":
-                result.settings["spec_draft_n_max"] = int(value)
-            elif flag == "--spec-draft-p-min":
-                result.settings["spec_draft_p_min"] = float(value)
-            elif flag in {"--spec-draft-ngl", "-ngld"}:
-                result.settings["spec_draft_gpu_layers"] = str(value)
-            elif flag == "--chat-template-file":
-                result.settings["use_chat_template"] = True
-                result.settings["chat_template_file"] = str(value)
-            elif flag in {"--kv-unified", "-kvu"}:
-                result.settings["kv_unified"] = True
-            elif flag == "--no-mmproj":
-                result.settings["use_mmproj"] = False
-            elif flag == "--no-mmproj-offload":
-                result.settings["mmproj_offload"] = False
-            elif flag == "--mmap":
-                result.settings["use_mmap"] = True
-            elif flag == "--no-mmap":
-                result.settings["use_mmap"] = False
-            elif flag == "--mlock":
-                result.settings["use_mlock"] = True
-            elif flag == "--verbose":
-                result.settings["verbose"] = True
-            elif flag == "--log-timestamps":
-                result.settings["log_timestamps"] = True
-            elif flag == "--no-cont-batching":
-                result.settings["cont_batching"] = False
-            elif flag == "--no-cache-prompt":
-                result.settings["cache_prompt"] = False
-            elif flag == "--context-shift":
-                result.settings["context_shift"] = True
-            elif flag == "--no-webui":
-                result.settings["no_webui"] = True
-            elif flag == "--jinja":
-                result.settings["jinja"] = True
-            elif flag == "--metrics":
-                pass
-            else:
+            spec = FLAG_TO_SPEC.get(flag)
+            neg_spec = NEG_FLAG_TO_SPEC.get(flag)
+            if neg_spec is not None and spec is None:
+                # --no-*: выключить булево поле.
+                result.settings[neg_spec.name] = False
+            elif spec is None:
+                # Неизвестный реестру флаг остаётся в extra_args.
                 if inline_value is not None:
                     extra.append(token)
                 elif i + 1 < len(tokens) and _is_value_token(tokens[i + 1]):
@@ -369,6 +259,19 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
                     consumed_value = True
                 else:
                     extra.append(token)
+            elif spec.cli_kind == "value":
+                converter = spec.field_type or str
+                result.settings[spec.name] = converter(value)
+            elif spec.cli_kind == "bool":
+                result.settings[spec.name] = True
+            elif spec.cli_kind == "false":
+                result.settings[spec.name] = False
+            elif spec.cli_kind == "bool_value":
+                result.settings[spec.name] = _as_bool(value, default=True)
+            elif spec.cli_kind == "ignore":
+                pass
+            else:  # special: составная логика по конкретному флагу
+                _SPECIAL_HANDLERS[flag](result, result.settings, extra, value)
         except (TypeError, ValueError):
             result.warnings.append(f"{flag} has invalid value: {value}")
             if inline_value is not None:

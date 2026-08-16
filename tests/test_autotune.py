@@ -11,6 +11,7 @@ from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, Benchmar
 from src.core.benchmark_plan import build_autotune_plan
 from src.core.benchmark_scorer import score_result
 from src.core.cli_builder import build_benchmark_args_from_params
+from src.services.autotune_manager import AutoTuneManager
 from src.services.benchmark_runner import BenchmarkRunner, parse_llama_bench_output
 from src.services.report_writer import (
     write_best,
@@ -239,6 +240,56 @@ class TestAutoTunePlan(unittest.TestCase):
             all(c.params["ncmoe"] <= c.params["ngl"] for c in moe_candidates)
         )
 
+    def test_smart_auto_plan_records_constraints_and_filters_blocked_vram_candidates(self):
+        settings = AutoTuneSettingsStub(ctx_size=131072, ubatch_size=-1)
+        model_info = {
+            "architecture": "llama",
+            "expert_count": 0,
+            "block_count": 40,
+            "head_count": 40,
+            "embedding_length": 5120,
+            "size_gib": 20.0,
+            "context_length": 131072,
+        }
+
+        with patch("src.core.benchmark_plan._detect_total_vram_gib", return_value=16.0):
+            plan = build_autotune_plan(
+                settings,
+                "dense.gguf",
+                model_info,
+                mode="smart",
+                target="auto",
+                max_runs=None,
+                time_budget_sec=None,
+            )
+
+        self.assertEqual(plan.mode, "smart")
+        self.assertEqual(plan.target, "low_vram")
+        self.assertLessEqual(len(plan.candidates), 10)
+        self.assertEqual(plan.constraints["gpu_vram_gib"], 16.0)
+        self.assertEqual(plan.constraints["selected_target"], "low_vram")
+        self.assertTrue(plan.constraints["notes"])
+        self.assertTrue(all("_estimated_vram_gib" in c.params for c in plan.candidates))
+        self.assertFalse(any(c.params.get("_risk") == "blocked" for c in plan.candidates))
+
+    def test_autotune_metadata_is_ignored_by_llama_bench_cli(self):
+        params = {
+            "ngl": 40,
+            "batch_size": 512,
+            "ubatch_size": 256,
+            "cache_type_k": "q4_0",
+            "cache_type_v": "q4_0",
+            "threads": 12,
+            "flash_attn": True,
+            "_estimated_vram_gib": 15.5,
+            "_risk": "high",
+        }
+
+        args = build_benchmark_args_from_params("model.gguf", params, 128, 256)
+
+        self.assertNotIn("_estimated_vram_gib", args)
+        self.assertNotIn("_risk", args)
+
     def test_moe_huge_context_quick_keeps_moe_candidates_limited(self):
         settings = AutoTuneSettingsStub(ctx_size=131072, cpu_moe_layers=8)
         plan = build_autotune_plan(
@@ -371,6 +422,23 @@ class TestAutoTuneScoring(unittest.TestCase):
 
         self.assertGreater(q8_score, q4_score)
 
+    def test_balanced_score_penalizes_high_resource_risk(self):
+        low_risk = self._result()
+        high_risk = self._result()
+
+        low_score = score_result(
+            low_risk,
+            {"_risk": "low", "_vram_pct": 70.0, "ctx_size": 32768},
+            "balanced",
+        )
+        high_score = score_result(
+            high_risk,
+            {"_risk": "high", "_vram_pct": 99.0, "ctx_size": 32768},
+            "balanced",
+        )
+
+        self.assertGreater(low_score, high_score)
+
 
 class TestBenchmarkRunnerParsing(unittest.TestCase):
     def test_parse_llama_bench_markdown_output(self):
@@ -442,6 +510,92 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
 
             self.assertEqual(result.status, "failed_oom")
             self.assertEqual(result.error, "Out of memory")
+
+
+class TestAutoTuneManager(unittest.TestCase):
+    def test_repeat_top_runs_verification_candidates(self):
+        class FakeRunner:
+            seen: list[str] = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def cancel(self):
+                pass
+
+            def run(
+                self,
+                candidate,
+                prompt_tokens=128,
+                generation_tokens=256,
+                timeout_sec=300,
+                log_callback=None,
+            ):
+                self.seen.append(candidate.id)
+                tg_by_id = {
+                    "run_001": 20.0,
+                    "run_002": 26.0,
+                    "verify_001_run_002": 25.5,
+                    "verify_002_run_001": 20.5,
+                }
+                result = BenchmarkResult(
+                    candidate_id=candidate.id,
+                    status="success",
+                    prompt_tok_s=1000.0,
+                    generation_tok_s=tg_by_id.get(candidate.id, 22.0),
+                    load_time_sec=2.0,
+                )
+                result.metrics.prompt_tok_s = result.prompt_tok_s
+                result.metrics.generation_tok_s = result.generation_tok_s
+                return result
+
+        candidates = [
+            BenchmarkCandidate(
+                "run_001",
+                {"ctx_size": 8192, "batch_size": 512, "ubatch_size": 256},
+                "baseline",
+                "baseline",
+            ),
+            BenchmarkCandidate(
+                "run_002",
+                {"ctx_size": 8192, "batch_size": 1024, "ubatch_size": 512},
+                "faster batch",
+                "batch",
+            ),
+        ]
+        plan = AutoTunePlan(
+            model_path="G:/models/model.gguf",
+            ctx_size=8192,
+            mode="smart",
+            target="balanced",
+            engine="llama-bench",
+            time_budget_sec=900,
+            max_runs=2,
+            repeat_top=2,
+            candidates=candidates,
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("src.services.autotune_manager.BenchmarkRunner", FakeRunner),
+        ):
+            manager = AutoTuneManager(
+                "llama-bench.exe",
+                plan,
+                per_run_timeout_sec=120,
+                output_root=tmpdir,
+            )
+            manager.run()
+
+        verify_ids = [c.id for c in plan.candidates if c.stage == "verify"]
+        self.assertEqual(verify_ids, ["verify_001_run_002", "verify_002_run_001"])
+        self.assertEqual([r.candidate_id for r in manager.results], [
+            "run_001",
+            "run_002",
+            "verify_001_run_002",
+            "verify_002_run_001",
+        ])
+        self.assertEqual(manager.best_result.candidate_id, "verify_001_run_002")
 
 
 class TestAutoTuneReports(unittest.TestCase):

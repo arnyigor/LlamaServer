@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSpinBox,
+    QDoubleSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -37,6 +38,8 @@ _COLUMNS = [
     "Load sec",
     "VRAM",
     "RAM",
+    "Est VRAM",
+    "Risk",
     "ngl",
     "ncmoe",
     "ctk",
@@ -54,19 +57,19 @@ _COLUMNS = [
 ]
 
 _PARAM_COLUMNS = {
-    10: "ngl",
-    11: "ncmoe",
-    12: "cache_type_k",
-    13: "cache_type_v",
-    14: "batch_size",
-    15: "ubatch_size",
-    16: "threads",
-    17: "threads_batch",
-    18: "parallel_slots",
-    19: "flash_attn",
-    20: "use_mmproj",
-    21: "ctx_checkpoints",
-    22: "cache_ram",
+    12: "ngl",
+    13: "ncmoe",
+    14: "cache_type_k",
+    15: "cache_type_v",
+    16: "batch_size",
+    17: "ubatch_size",
+    18: "threads",
+    19: "threads_batch",
+    20: "parallel_slots",
+    21: "flash_attn",
+    22: "use_mmproj",
+    23: "ctx_checkpoints",
+    24: "cache_ram",
 }
 
 _INT_PARAM_KEYS = {
@@ -89,6 +92,7 @@ class AutoTuneWidget(QWidget):
     start_requested = Signal()
     cancel_requested = Signal()
     apply_best_requested = Signal()
+    apply_selected_requested = Signal(str)
     save_best_requested = Signal()
     export_report_requested = Signal()
     open_results_requested = Signal()
@@ -122,8 +126,9 @@ class AutoTuneWidget(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Quick", "Normal", "Deep"])
+        self.mode_combo.addItems(["Smart", "Quick", "Normal", "Deep"])
         self.mode_combo.setToolTip(
+            "Smart: auto-selects a compact plan from model/hardware constraints.\n"
             "Quick: small staged plan for fast checks.\n"
             "Normal: more KV/batch/ubatch/thread candidates.\n"
             "Deep: wider search, slower but more thorough."
@@ -133,9 +138,10 @@ class AutoTuneWidget(QWidget):
         row1.addWidget(QLabel("Target:"))
         self.target_combo = QComboBox()
         self.target_combo.addItems(
-            ["Balanced", "Max Speed", "Low VRAM", "Quality KV", "MoE Optimized"]
+            ["Auto", "Balanced", "Max Speed", "Low VRAM", "Quality KV", "MoE Optimized"]
         )
         self.target_combo.setToolTip(
+            "Auto: picks Balanced/Low VRAM/Max Speed from current model and GPU estimate.\n"
             "Balanced: speed + stability + memory margin.\n"
             "Max Speed: prioritizes tok/s.\n"
             "Low VRAM: favors memory-saving settings.\n"
@@ -158,13 +164,13 @@ class AutoTuneWidget(QWidget):
         row2.addWidget(QLabel("Time budget (min):"))
         self.time_budget = QSpinBox()
         self.time_budget.setRange(1, 240)
-        self.time_budget.setValue(15)
+        self.time_budget.setValue(10)
         row2.addWidget(self.time_budget)
 
         row2.addWidget(QLabel("Max runs:"))
         self.max_runs = QSpinBox()
         self.max_runs.setRange(1, 500)
-        self.max_runs.setValue(12)
+        self.max_runs.setValue(10)
         row2.addWidget(self.max_runs)
 
         row2.addWidget(QLabel("Repeat top:"))
@@ -181,16 +187,24 @@ class AutoTuneWidget(QWidget):
         settings.addLayout(row2)
 
         row2b = QHBoxLayout()
+        self.auto_limits = QCheckBox("Auto limits")
+        self.auto_limits.setChecked(True)
+        self.auto_limits.setToolTip(
+            "Let Smart AutoTune choose time budget and run count from mode/model constraints."
+        )
         self.early_stop_peak = QCheckBox("Early stop after peak drop")
+        self.early_stop_peak.setChecked(True)
         self.early_stop_peak.setToolTip(
             "Stop after at least 3 successful runs when a new successful run is slower than the current peak."
         )
         self.verify_server_after_apply = QCheckBox(
             "Start server and verify after Apply Best"
         )
+        self.verify_server_after_apply.setChecked(True)
         self.verify_server_after_apply.setToolTip(
             "After Apply Best, start/restart llama-server with the same saved parameters and send one short test request."
         )
+        row2b.addWidget(self.auto_limits)
         row2b.addWidget(self.early_stop_peak)
         row2b.addWidget(self.verify_server_after_apply)
         row2b.addStretch(1)
@@ -198,13 +212,15 @@ class AutoTuneWidget(QWidget):
 
         row3 = QHBoxLayout()
         self.build_plan_btn = QPushButton("Build Plan")
-        self.start_btn = QPushButton("Start AutoTune")
+        self.start_btn = QPushButton("Run AutoTune")
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setEnabled(False)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.apply_best_btn = QPushButton("Apply Best")
         self.apply_best_btn.setEnabled(False)
+        self.apply_selected_btn = QPushButton("Apply Selected")
+        self.apply_selected_btn.setEnabled(False)
         self.save_best_btn = QPushButton("Save Best Preset")
         self.save_best_btn.setEnabled(False)
         self.export_report_btn = QPushButton("Export Report")
@@ -218,6 +234,7 @@ class AutoTuneWidget(QWidget):
             self.pause_btn,
             self.cancel_btn,
             self.apply_best_btn,
+            self.apply_selected_btn,
             self.save_best_btn,
             self.export_report_btn,
             self.open_results_btn,
@@ -227,12 +244,18 @@ class AutoTuneWidget(QWidget):
         layout.addWidget(settings_group)
 
         self.hint_label = QLabel(
-            "Uses current selected model, Context Size and Prompt/Gen benchmark sizes. "
-            "After Build Plan you can edit candidate rows before Start: numeric cells are editable, "
-            "KV/FA/mmproj use drop-downs. Edits are applied when AutoTune starts."
+            "Default Smart mode builds a short hardware-aware plan from the selected model, context, GPU estimate and CPU threads. "
+            "Build Plan is optional: Run AutoTune will build it automatically when needed."
         )
         self.hint_label.setWordWrap(True)
         layout.addWidget(self.hint_label)
+
+        self.plan_summary = QLabel("Smart summary will appear after Build Plan.")
+        self.plan_summary.setWordWrap(True)
+        self.plan_summary.setStyleSheet(
+            "background-color: #f5f7fa; color: #263238; padding: 8px; border: 1px solid #d5dde5; border-radius: 4px;"
+        )
+        layout.addWidget(self.plan_summary)
 
         self.status_label = QLabel("Build a plan or start Quick AutoTune.")
         layout.addWidget(self.status_label)
@@ -281,17 +304,21 @@ class AutoTuneWidget(QWidget):
         self.start_btn.clicked.connect(self.start_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.apply_best_btn.clicked.connect(self.apply_best_requested.emit)
+        self.apply_selected_btn.clicked.connect(self._emit_apply_selected)
         self.save_best_btn.clicked.connect(self.save_best_requested.emit)
         self.export_report_btn.clicked.connect(self.export_report_requested.emit)
         self.open_results_btn.clicked.connect(self.open_results_requested.emit)
+        self.table.itemSelectionChanged.connect(self._update_selection_actions)
 
     def options(self) -> Dict[str, object]:
         return {
             "mode": self.mode_combo.currentText().lower(),
             "target": self.target_combo.currentText().lower().replace(" ", "_"),
             "engine": self.engine_combo.currentText(),
-            "time_budget_sec": self.time_budget.value() * 60,
-            "max_runs": self.max_runs.value(),
+            "time_budget_sec": None
+            if self.auto_limits.isChecked()
+            else self.time_budget.value() * 60,
+            "max_runs": None if self.auto_limits.isChecked() else self.max_runs.value(),
             "repeat_top": self.repeat_top.value(),
             "per_run_timeout_sec": self.per_run_timeout.value(),
             "early_stop_on_peak": self.early_stop_peak.isChecked(),
@@ -301,7 +328,7 @@ class AutoTuneWidget(QWidget):
     def set_running(self, running: bool) -> None:
         self.build_plan_btn.setEnabled(not running)
         self.start_btn.setEnabled(not running)
-        self.start_btn.setText("AutoTune running..." if running else "Start AutoTune")
+        self.start_btn.setText("AutoTune running..." if running else "Run AutoTune")
         self.cancel_btn.setEnabled(running)
         self.progress_bar.setVisible(running or self.progress_bar.value() > 0)
         if running:
@@ -320,6 +347,9 @@ class AutoTuneWidget(QWidget):
             self._update_time_labels(finished=True)
         self.apply_best_btn.setEnabled(
             False if running else self.apply_best_btn.isEnabled()
+        )
+        self.apply_selected_btn.setEnabled(
+            False if running else self.apply_selected_btn.isEnabled()
         )
         self.save_best_btn.setEnabled(
             False if running else self.save_best_btn.isEnabled()
@@ -343,7 +373,9 @@ class AutoTuneWidget(QWidget):
         self.progress_bar.setVisible(False)
         self.progress_summary.setText("Progress: idle")
         self.current_run_label.setText("Idle")
+        self.plan_summary.setText("Smart summary will appear after Build Plan.")
         self.apply_best_btn.setEnabled(False)
+        self.apply_selected_btn.setEnabled(False)
         self.save_best_btn.setEnabled(False)
         self.export_report_btn.setEnabled(False)
         self.open_results_btn.setEnabled(False)
@@ -354,8 +386,15 @@ class AutoTuneWidget(QWidget):
         self.status_label.setText(
             f"Plan: {len(plan.candidates)} candidates | ctx={plan.ctx_size:,} | mode={plan.mode} | target={plan.target}"
         )
+        constraints = getattr(plan, "constraints", {}) or {}
+        notes = constraints.get("notes") or []
+        risk_counts = constraints.get("risk_counts") or {}
+        note_text = "\n".join(f"• {note}" for note in notes[:6])
+        if risk_counts:
+            note_text += f"\n• risk: {risk_counts}"
+        self.plan_summary.setText(note_text or "Plan constraints unavailable.")
         self.progress_summary.setText(
-            f"Ready: {len(plan.candidates)} runs planned. Time budget and per-run timeout are shown above."
+            f"Ready: {len(plan.candidates)} runs planned. Budget: {plan.time_budget_sec // 60} min. Per-run timeout is shown above."
         )
         self.table.setRowCount(len(plan.candidates))
         for row, candidate in enumerate(plan.candidates):
@@ -385,12 +424,56 @@ class AutoTuneWidget(QWidget):
         combo.setToolTip("Editable AutoTune candidate value")
         self.table.setCellWidget(row, col, combo)
 
+    def _set_spin_cell(self, row: int, col: int, key: str, value: object) -> bool:
+        try:
+            int_value = int(value)
+        except (TypeError, ValueError):
+            return False
+        ranges = {
+            "ngl": (0, 999),
+            "ncmoe": (-1, 999),
+            "batch_size": (1, 32768),
+            "ubatch_size": (1, 8192),
+            "threads": (1, 128),
+            "threads_batch": (0, 128),
+            "parallel_slots": (1, 32),
+            "ctx_checkpoints": (0, 128),
+            "cache_ram": (0, 262144),
+        }
+        low, high = ranges.get(key, (-999999, 999999))
+        spin = QSpinBox()
+        spin.setRange(low, high)
+        spin.setValue(max(low, min(high, int_value)))
+        spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        spin.setToolTip("Editable AutoTune candidate value")
+        self.table.setCellWidget(row, col, spin)
+        return True
+
     def _cell_text(self, row: int, col: int) -> str:
         widget = self.table.cellWidget(row, col)
         if isinstance(widget, QComboBox):
             return widget.currentText()
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            return str(widget.value())
         item = self.table.item(row, col)
         return item.text().strip() if item else ""
+
+    def selected_candidate_id(self) -> str:
+        selected = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not selected:
+            return ""
+        return self._cell_text(selected[0].row(), 0)
+
+    def _emit_apply_selected(self) -> None:
+        self.apply_selected_requested.emit(self.selected_candidate_id())
+
+    def _update_selection_actions(self) -> None:
+        cid = self.selected_candidate_id()
+        enabled = False
+        if cid:
+            row = self._row_by_id.get(cid)
+            enabled = row is not None and self._cell_text(row, 1) == "success"
+        self.apply_selected_btn.setEnabled(enabled and self.start_btn.isEnabled())
 
     def _coerce_param_value(self, key: str, value: str, old_value: object) -> object:
         text = str(value).strip()
@@ -437,6 +520,8 @@ class AutoTuneWidget(QWidget):
             "",  # load sec
             "",  # VRAM
             "",  # RAM
+            f"{p.get('_estimated_vram_gib', 0):.2f} GiB" if p.get("_estimated_vram_gib") else "",
+            p.get("_risk", ""),
             p.get("ngl", ""),
             p.get("ncmoe", ""),
             p.get("cache_type_k", ""),
@@ -453,15 +538,29 @@ class AutoTuneWidget(QWidget):
             candidate.reason,
         ]
         for col, value in enumerate(values):
-            if col in (12, 13):
+            if col in (14, 15):
                 self._set_combo_cell(row, col, value, _QUANT_CHOICES)
-            elif col in (19, 20):
+            elif col in (21, 22):
                 self._set_combo_cell(row, col, value, _BOOL_CHOICES)
+            elif col in _PARAM_COLUMNS and _PARAM_COLUMNS[col] in _INT_PARAM_KEYS:
+                if not self._set_spin_cell(row, col, _PARAM_COLUMNS[col], value):
+                    self._set_item(row, col, value, editable=True)
             else:
                 self._set_item(row, col, value, editable=col in _PARAM_COLUMNS)
 
-    def mark_running(self, candidate: BenchmarkCandidate) -> None:
+    def _ensure_candidate_row(self, candidate: BenchmarkCandidate) -> int:
         row = self._row_by_id.get(candidate.id)
+        if row is not None:
+            return row
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._row_by_id[candidate.id] = row
+        self._fill_candidate_row(row, candidate)
+        self._total_runs = max(self._total_runs, self.table.rowCount())
+        return row
+
+    def mark_running(self, candidate: BenchmarkCandidate) -> None:
+        row = self._ensure_candidate_row(candidate)
         p = candidate.params
         self._current_run_id = candidate.id
         self._current_run_started_at = time.monotonic()
@@ -476,10 +575,9 @@ class AutoTuneWidget(QWidget):
             f"batch={p.get('batch_size')}, ubatch={p.get('ubatch_size')}, threads={p.get('threads')}"
         )
         self._update_time_labels()
-        if row is not None:
-            self._set_item(row, 1, "running")
-            self.table.selectRow(row)
-            self.table.scrollToItem(self.table.item(row, 0))
+        self._set_item(row, 1, "running")
+        self.table.selectRow(row)
+        self.table.scrollToItem(self.table.item(row, 0))
 
     def update_result(self, result: BenchmarkResult) -> None:
         row = self._row_by_id.get(result.candidate_id)
@@ -500,7 +598,7 @@ class AutoTuneWidget(QWidget):
             7: f"{result.load_time_sec:.1f}",
             8: f"{result.vram_used_mib:.0f}",
             9: f"{result.ram_used_mib:.0f}",
-            23: result.error,
+            25: result.error,
         }
         for col, value in values.items():
             self._set_item(row, col, value)
@@ -510,6 +608,7 @@ class AutoTuneWidget(QWidget):
             f"PP={result.prompt_tok_s:.1f}, TG={result.generation_tok_s:.1f}, score={result.score:.3f}"
             + (f", error={result.error}" if result.error else "")
         )
+        self._update_selection_actions()
 
     def _refresh_deltas(self) -> None:
         """Пересчитывает %Best (колонка 3) и ΔTG (колонка 4) для всех строк."""
@@ -560,9 +659,11 @@ class AutoTuneWidget(QWidget):
                 f"No successful result. Results folder: {output_dir}"
             )
             self.apply_best_btn.setEnabled(False)
+            self.apply_selected_btn.setEnabled(False)
             self.save_best_btn.setEnabled(False)
             return
         self.apply_best_btn.setEnabled(True)
+        self._update_selection_actions()
         self.save_best_btn.setEnabled(True)
 
         # Вычисляем сравнение с baseline (первый успешный кандидат)
@@ -571,6 +672,12 @@ class AutoTuneWidget(QWidget):
             if cid in self._gen_tg and self._gen_tg[cid] > 0:
                 baseline_tg = self._gen_tg.get(cid)
                 break
+
+        verified = str(best.candidate_id).startswith("verify_")
+        risk = str(params.get("_risk") or "").strip()
+        confidence = "verified repeat" if verified else "single run"
+        if risk:
+            confidence += f", resource risk: {risk}"
 
         lines = [
             "Best result",
@@ -582,12 +689,12 @@ class AutoTuneWidget(QWidget):
             f"Load: {best.load_time_sec:.1f} sec",
             f"VRAM: {best.vram_used_mib:.0f} MiB",
             f"RAM: {best.ram_used_mib:.0f} MiB",
-            "Stable: yes",
+            f"Confidence: {confidence}",
             "",
             "Why selected:",
             "- highest target-specific score among successful candidates",
             "- no detected OOM/crash",
-            "- stable llama-bench completion",
+            "- verified repeat completed" if verified else "- stable llama-bench completion",
         ]
         if baseline_tg and baseline_tg > 0:
             imp = ((best.generation_tok_s / baseline_tg) - 1.0) * 100.0
@@ -597,6 +704,8 @@ class AutoTuneWidget(QWidget):
             "Parameters:",
         ]
         for key, value in params.items():
+            if str(key).startswith("_"):
+                continue
             lines.append(f"- {key}: {value}")
         lines.append(f"\nResults folder: {output_dir}")
         self.best_text.setPlainText("\n".join(lines))

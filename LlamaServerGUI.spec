@@ -7,6 +7,8 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets/llama_server_icon.svg', 'assets'),
+        ('src/ui/theme.qss', 'src/ui'),
+        ('translations/llamaserver_ru.qm', 'translations'),
     ],
     hiddenimports=[],
     hookspath=[],

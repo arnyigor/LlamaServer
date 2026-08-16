@@ -87,6 +87,7 @@ class AutoTunePlan:
     early_stop_on_peak: bool = False
     early_stop_min_successes: int = 3
     early_stop_drop_pct: float = 3.0
+    constraints: Dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -102,6 +103,7 @@ class AutoTunePlan:
             "early_stop_on_peak": self.early_stop_on_peak,
             "early_stop_min_successes": self.early_stop_min_successes,
             "early_stop_drop_pct": self.early_stop_drop_pct,
+            "constraints": self.constraints,
             "created_at": self.created_at,
             "candidates": [c.to_dict() for c in self.candidates],
         }

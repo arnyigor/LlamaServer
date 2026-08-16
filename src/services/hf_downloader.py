@@ -60,7 +60,7 @@ class HfRepoScanner(QThread):
     def run(self):
         try:
             repo_id = normalize_hf_repo_id(self.repo_or_url)
-            self.progress.emit(f"Hugging Face: чтение списка файлов {repo_id}")
+            self.progress.emit(f"Hugging Face: reading file list for {repo_id}")
             files = fetch_gguf_files(repo_id)
             main_files = [f for f in files if not f.get("is_projector")]
             projector_files = [f for f in files if f.get("is_projector")]
@@ -105,7 +105,7 @@ class HfModelDownloader(QThread):
     def run(self):
         try:
             if not self.files:
-                raise HfRepoError("Не выбраны файлы для скачивания")
+                raise HfRepoError("No files selected for download")
             target_root = lmstudio_repo_dir(self.base_model_dir, self.repo_id)
             target_root.mkdir(parents=True, exist_ok=True)
 
@@ -123,7 +123,7 @@ class HfModelDownloader(QThread):
                     continue
                 target = safe_repo_file_path(target_root, filename)
                 size = int(file_info.get("size") or 0)
-                self.progress.emit(f"Скачивание {filename} ({index}/{total_files})")
+                self.progress.emit(f"Downloading {filename} ({index}/{total_files})")
                 completed_bytes = self._download_one(
                     filename,
                     target,
@@ -136,11 +136,11 @@ class HfModelDownloader(QThread):
                 )
 
             self.percent.emit(100)
-            self.completed.emit(True, f"Готово: {target_root}")
+            self.completed.emit(True, f"Done: {target_root}")
         except HfDownloadInterrupted as exc:
             self.completed.emit(False, str(exc))
         except Exception as exc:
-            self.completed.emit(False, f"Ошибка скачивания: {exc}")
+            self.completed.emit(False, f"Download failed: {exc}")
 
     def _download_one(
         self,
@@ -157,7 +157,7 @@ class HfModelDownloader(QThread):
         if target.exists() and expected_size > 0 and target.stat().st_size == expected_size:
             completed_bytes += expected_size
             self.progress.emit(
-                f"Уже скачано: {target.name} | всего {format_bytes(completed_bytes)}"
+                f"Already downloaded: {target.name} | total {format_bytes(completed_bytes)}"
             )
             if total_bytes:
                 self.percent.emit(min(99, int(completed_bytes * 100 / total_bytes)))
@@ -171,7 +171,7 @@ class HfModelDownloader(QThread):
             if 0 < target_size < expected_size and not part.exists():
                 target.replace(part)
                 self.progress.emit(
-                    f"Найден недокачанный файл {target.name}: "
+                    f"Found unfinished file {target.name}: "
                     f"{format_bytes(target_size)} / {format_bytes(expected_size)}"
                 )
 
@@ -187,7 +187,7 @@ class HfModelDownloader(QThread):
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
             self.progress.emit(
-                f"Продолжение {filename}: уже есть "
+                f"Resuming {filename}: already have "
                 f"{format_bytes(resume_from)} / {format_bytes(expected_size)}"
             )
         request = urllib.request.Request(url, headers=headers)
@@ -207,7 +207,7 @@ class HfModelDownloader(QThread):
                 can_resume = resume_from > 0 and status == 206
                 if resume_from > 0 and not can_resume:
                     self.progress.emit(
-                        f"Сервер не поддержал докачку для {filename}, начинаю файл заново"
+                        f"Server does not support resume for {filename}; restarting the file"
                     )
                     resume_from = 0
 
@@ -261,7 +261,7 @@ class HfModelDownloader(QThread):
         except urllib.error.HTTPError as exc:
             raise HfRepoError(f"HTTP {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
-            raise HfRepoError(f"Сетевая ошибка: {exc.reason}") from exc
+            raise HfRepoError(f"Network error: {exc.reason}") from exc
         except BaseException:
             if part.exists() and self.isInterruptionRequested() and self.delete_partial_on_stop:
                 delete_file_safely(part)
@@ -282,10 +282,10 @@ class HfModelDownloader(QThread):
 
     def _stop_message(self, part: Path | None = None) -> str:
         if self.delete_partial_on_stop:
-            return "Скачивание отменено. Частичный .part файл удалён."
+            return "Download cancelled. Partial .part file deleted."
         if part:
-            return f"Пауза: частичный файл сохранён для докачки: {part}"
-        return "Пауза: частичный файл сохранён для докачки."
+            return f"Paused: partial file saved for resume: {part}"
+        return "Paused: partial file saved for resume."
 
     def _overall_percent(
         self,
@@ -321,15 +321,15 @@ class HfModelDownloader(QThread):
         file_total_text = format_bytes(file_total) if file_total else "размер неизвестен"
         if total_bytes:
             total_text = (
-                f"всего {format_bytes(current_total_done)} / {format_bytes(total_bytes)}, "
-                f"осталось {format_bytes(remaining)}, ETA {eta}"
+                f"total {format_bytes(current_total_done)} / {format_bytes(total_bytes)}, "
+                f"remaining {format_bytes(remaining)}, ETA {eta}"
             )
         else:
             total_text = "общий размер неизвестен"
         return (
             f"{filename} ({index}/{total_files}): "
             f"{format_bytes(done)} / {file_total_text}; "
-            f"{total_text}; скорость {format_bytes(speed)}/s"
+            f"{total_text}; speed {format_bytes(speed)}/s"
         )
 
 
@@ -337,7 +337,7 @@ def normalize_hf_repo_id(value: str) -> str:
     """Нормализует repo id из `owner/model` или URL Hugging Face."""
     text = str(value or "").strip().strip('"').strip("'")
     if not text:
-        raise HfRepoError("Укажите Hugging Face repo id или URL")
+        raise HfRepoError("Specify a Hugging Face repo id or URL")
 
     if text.startswith("hf://"):
         text = text[5:]
@@ -345,7 +345,7 @@ def normalize_hf_repo_id(value: str) -> str:
     if re.match(r"^https?://", text, re.IGNORECASE):
         parsed = urllib.parse.urlparse(text)
         if parsed.netloc.lower() not in {"huggingface.co", "www.huggingface.co"}:
-            raise HfRepoError("Поддерживаются только ссылки huggingface.co")
+            raise HfRepoError("Only huggingface.co URLs are supported")
         parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
         if len(parts) >= 2 and parts[0] in {"models", "datasets", "spaces"}:
             parts = parts[1:]
@@ -361,9 +361,9 @@ def normalize_hf_repo_id(value: str) -> str:
 
     text = text.strip("/")
     if len(text.split("/")) < 2:
-        raise HfRepoError("Repo id должен быть вида author/model")
+        raise HfRepoError("Repo id must look like author/model")
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$", text):
-        raise HfRepoError(f"Некорректный Hugging Face repo id: {text}")
+        raise HfRepoError(f"Invalid Hugging Face repo id: {text}")
     return text
 
 
@@ -381,10 +381,10 @@ def fetch_gguf_files(repo_id: str) -> List[Dict]:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise HfRepoError(f"Репозиторий не найден: {repo_id}") from exc
+            raise HfRepoError(f"Repository not found: {repo_id}") from exc
         raise HfRepoError(f"Hugging Face API HTTP {exc.code}: {exc.reason}") from exc
     except urllib.error.URLError as exc:
-        raise HfRepoError(f"Сетевая ошибка: {exc.reason}") from exc
+        raise HfRepoError(f"Network error: {exc.reason}") from exc
 
     siblings = payload.get("siblings") or []
     result = []
@@ -673,13 +673,13 @@ def partial_download_info(
 def safe_repo_file_path(root: Path, filename: str) -> Path:
     rel = PurePosixPath(filename)
     if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
-        raise HfRepoError(f"Недопустимое имя файла в репозитории: {filename}")
+        raise HfRepoError(f"Invalid repository file name: {filename}")
     target = (root / Path(*rel.parts)).resolve()
     root_resolved = root.resolve()
     try:
         target.relative_to(root_resolved)
     except ValueError as exc:
-        raise HfRepoError(f"Недопустимый путь файла: {filename}") from exc
+        raise HfRepoError(f"Invalid file path: {filename}") from exc
     return target
 
 

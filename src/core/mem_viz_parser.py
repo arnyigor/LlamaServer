@@ -230,7 +230,7 @@ class MemoryData:
 
     def components_used(self) -> list[str]:
         agg = self.get_aggregated()
-        all_comps = set()
+        all_comps: set[str] = set()
         for comps in agg.values():
             all_comps.update(comps.keys())
         return [c for c in COMPONENT_ORDER if c in all_comps]
@@ -244,6 +244,7 @@ class MemoryData:
     def to_dict(self) -> dict:
         agg = self.get_aggregated()
         failure_cat, remaining_mib, deficit_mib = estimate_shortfall_mib(self)
+        utilization = {"VRAM": self.utilization("VRAM"), "RAM": self.utilization("RAM")}
         return {
             "cli_args": self.cli_args,
             "model": self.model_info,
@@ -259,11 +260,12 @@ class MemoryData:
                     "capacity_mib": round(self.system_memory[cat], 2)
                     if cat in self.system_memory
                     else None,
-                    "utilization_pct": round(self.utilization(cat), 2)
-                    if self.utilization(cat) is not None
-                    else None,
+                    "utilization_pct": round(util_pct, 2) if util_pct is not None else None,
                 }
-                for cat in ["VRAM", "RAM"]
+                for cat, util_pct in (
+                    ("VRAM", utilization["VRAM"]),
+                    ("RAM", utilization["RAM"]),
+                )
             },
             "grand_total_mib": round(self.grand_total(), 2),
             "status": {
@@ -475,15 +477,15 @@ def parse_line(line: str, data: MemoryData, debug: bool = False) -> None:
 
     if m := GGUF_KV_RE.search(line):
         key = m.group("key").strip()
-        value = m.group("value").strip()
+        kv_value = m.group("value").strip()
         if key == "general.name":
-            data.model_info.setdefault("name", value)
+            data.model_info.setdefault("name", kv_value)
         elif key == "general.architecture":
-            data.model_info.setdefault("arch", value)
+            data.model_info.setdefault("arch", kv_value)
 
     if m := PRINT_INFO_RE.search(line):
         key = normalize_info_key(m.group("key"))
-        value = m.group("value").strip()
+        info_value = m.group("value").strip()
         mapping = {
             "file_format": "file_format",
             "file_type": "file_type",
@@ -493,15 +495,15 @@ def parse_line(line: str, data: MemoryData, debug: bool = False) -> None:
             "general.name": "name",
         }
         if key in mapping:
-            data.model_info.setdefault(mapping[key], value)
+            data.model_info.setdefault(mapping[key], info_value)
 
     if m := CONTEXT_INFO_RE.search(line):
         key = m.group("key").strip()
-        value = m.group("value").strip()
+        ctx_value = m.group("value").strip()
         if key == "n_ctx":
-            data.model_info.setdefault("ctx", value)
+            data.model_info.setdefault("ctx", ctx_value)
         elif key == "n_seq_max":
-            data.model_info.setdefault("n_seq_max", value)
+            data.model_info.setdefault("n_seq_max", ctx_value)
 
     if m := OFFLOADED_RE.search(line):
         data.model_info["layers_offloaded"] = m.group(1)

@@ -46,6 +46,11 @@ jobs:
       - name: Run tests
         run: .\.venv\Scripts\python.exe -m unittest discover -s tests
 
+      - name: Type-check src/core (mypy)
+        run: |
+          .\.venv\Scripts\python.exe -m pip install mypy
+          .\.venv\Scripts\python.exe -m mypy src/core/
+
       - name: Build executable
         run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean LlamaServerGUI.spec
 

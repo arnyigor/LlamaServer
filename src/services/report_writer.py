@@ -61,6 +61,7 @@ def results_payload(
             "early_stop_min_successes": getattr(plan, "early_stop_min_successes", 3),
             "early_stop_drop_pct": getattr(plan, "early_stop_drop_pct", 3.0),
         },
+        "constraints": getattr(plan, "constraints", {}) or {},
         "llama_cpp_build": llama_cpp_build,
         "best_run_id": best.candidate_id if best else None,
         "runs": [
@@ -122,6 +123,21 @@ def write_markdown_report(
         f"Mode: {plan.mode}",
         f"Target: {plan.target}",
         f"Context: {plan.ctx_size}",
+        "",
+        "## Constraints",
+    ]
+    constraints = getattr(plan, "constraints", {}) or {}
+    notes = constraints.get("notes") or []
+    if notes:
+        for note in notes:
+            lines.append(f"- {note}")
+    else:
+        lines.append("- No constraint summary was recorded.")
+    risk_counts = constraints.get("risk_counts") or {}
+    if risk_counts:
+        lines.append(f"- Candidate risk counts: {risk_counts}")
+
+    lines += [
         "",
         "## Model",
         f"- Path: `{plan.model_path}`",

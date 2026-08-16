@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -362,14 +362,20 @@ class TestPerfPresetsUI(unittest.TestCase):
             "files": files,
             "projectors": [],
         }
-        self.ui.hf_files.clear()
+        self.ui.hf_files.setRowCount(0)
         for file_info in files:
-            self.ui.hf_files.addItem(file_info["name"])
-            item = self.ui.hf_files.item(self.ui.hf_files.count() - 1)
-            item.setData(Qt.ItemDataRole.UserRole, file_info)
-            item.setSelected(True)
+            self.gui._add_hf_file_row(file_info)
+        selection = self.ui.hf_files.selectionModel()
+        for row in range(len(files)):
+            selection.select(
+                self.ui.hf_files.model().index(row, 0),
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
 
-        with patch("main.HfModelDownloader", FakeDownloader), patch.object(
+        with patch(
+            "src.services.hf_download_coordinator.HfModelDownloader", FakeDownloader
+        ), patch.object(
             QMessageBox,
             "question",
             return_value=QMessageBox.StandardButton.Yes,
@@ -377,21 +383,21 @@ class TestPerfPresetsUI(unittest.TestCase):
             self.gui.download_hf_selection()
 
         self.assertEqual(len(FakeDownloader.instances), 2)
-        self.assertEqual(len(self.gui.hf_downloaders), 2)
+        self.assertEqual(len(self.gui.hf.tasks()), 2)
         self.assertTrue(all(worker.running for worker in FakeDownloader.instances))
-        self.assertEqual(self.ui.hf_downloads.count(), 2)
+        self.assertEqual(self.ui.hf_downloads.rowCount(), 2)
 
-        task_key = next(iter(self.gui.hf_downloaders))
+        task_key = next(iter(self.gui.hf.tasks()))
         progress_text = (
-            "model-Q4.gguf (1/1): 25 MiB / 100 MiB; всего 25 MiB / 100 MiB, "
-            "осталось 75 MiB, ETA 00:30; скорость 2.5 MiB/s"
+            "model-Q4.gguf (1/1): 25 MiB / 100 MiB; total 25 MiB / 100 MiB, "
+            "remaining 75 MiB, ETA 00:30; speed 2.5 MiB/s"
         )
-        self.gui._on_hf_task_progress(task_key, progress_text)
-        task_item = self.gui.hf_downloaders[task_key]["item"]
-        self.assertIn("25 MiB / 100 MiB", task_item.text())
-        self.assertIn("осталось 75 MiB", task_item.text())
-        self.assertIn("ETA 00:30", task_item.text())
-        self.assertIn("скорость 2.5 MiB/s", task_item.text())
+        # Прогресс идёт через координатор: сигнал task_changed рендерит строку.
+        self.gui.hf._on_progress(task_key, progress_text)
+        row = self.gui.hf.task(task_key)["row"]
+        self.assertIn("25 MiB / 100 MiB", self.ui.hf_downloads.item(row, 3).text())
+        self.assertIn("2.5 MiB/s", self.ui.hf_downloads.item(row, 4).text())
+        self.assertIn("00:30", self.ui.hf_downloads.item(row, 5).text())
 
         self.gui.pause_hf_download()
         self.assertTrue(all(worker.paused for worker in FakeDownloader.instances))
@@ -405,12 +411,11 @@ class TestPerfPresetsUI(unittest.TestCase):
 
         self.gui._refresh_hf_partial_status()
 
-        self.assertEqual(self.ui.hf_downloads.count(), 1)
-        text = self.ui.hf_downloads.item(0).text()
-        self.assertIn("author/model / model-Q4.gguf", text)
-        self.assertIn("paused / resumable", text)
-        self.assertIn("2.05 KB", text)
-        self.assertIn(str(partial), text)
+        self.assertEqual(self.ui.hf_downloads.rowCount(), 1)
+        self.assertIn("author/model / model-Q4.gguf", self.ui.hf_downloads.item(0, 0).text())
+        self.assertIn("paused / resumable", self.ui.hf_downloads.item(0, 1).text())
+        self.assertIn("2.05 KB", self.ui.hf_downloads.item(0, 3).text())
+        self.assertIn(str(partial), self.ui.hf_downloads.item(0, 3).toolTip())
 
         file_info = {
             "name": "model-Q4.gguf",
@@ -425,8 +430,9 @@ class TestPerfPresetsUI(unittest.TestCase):
                 "all_files": [file_info],
             }
         )
-        self.assertIn("50%", self.ui.hf_downloads.item(0).text())
-        self.assertIn("4.10 KB", self.ui.hf_downloads.item(0).text())
+        progress = self.ui.hf_downloads.cellWidget(0, 2)
+        self.assertEqual(progress.value(), 50)
+        self.assertIn("4.10 KB", self.ui.hf_downloads.item(0, 3).text())
 
     def test_auto_detected_separate_mtp_draft_can_be_manually_disabled(self):
         draft_path = Path(self.tmp.name) / "model-MTP-draft.gguf"
@@ -532,7 +538,7 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertNotIn("--model-draft", command)
 
     def test_loading_draft_log_line_is_not_treated_as_mtp_failure(self):
-        self.gui._mtp_draft_error_seen = False
+        self.gui.mtp = type(self.gui.mtp)()
 
         self.gui._on_log_for_mem_viz(
             "common_speculative_init_result: loading draft model 'draft.gguf'",
@@ -540,6 +546,16 @@ class TestPerfPresetsUI(unittest.TestCase):
         )
 
         self.assertFalse(self.gui._mtp_draft_error_seen)
+
+    def test_memory_log_handler_does_not_process_qt_events(self):
+        with patch("main.QApplication.processEvents") as process_events:
+            self.gui._on_log_for_mem_viz(
+                "llama_model_load: model loaded",
+                "info",
+            )
+
+        process_events.assert_not_called()
+        self.assertTrue(self.gui._mem_viz_dirty)
 
     def test_missing_external_draft_is_not_added_but_qwen_embedded_mtp_remains_supported(self):
         missing_draft = Path(self.tmp.name) / "deleted-MTP-draft.gguf"
@@ -695,6 +711,73 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertFalse(self.ui.cache_prompt.isChecked())
         self.assertEqual(self.ui.ctx_checkpoints.value(), 0)
         self.assertEqual(self.ui.cache_ram.value(), 0)
+
+    def test_autotune_finish_does_not_apply_best_without_user_action(self):
+        self._set_autotune_best()
+        best = self.gui.autotune_best_result
+
+        with patch.object(self.gui, "apply_autotune_best") as apply_best:
+            self.gui._on_autotune_finished(best, "benchmarks/test")
+
+        apply_best.assert_not_called()
+        self.assertTrue(self.ui.autotune.apply_best_btn.isEnabled())
+
+    def test_apply_selected_autotune_result_uses_selected_candidate_params(self):
+        self._set_autotune_best()
+        selected = BenchmarkCandidate(
+            "run_002",
+            {
+                **self._make_autotune_candidate().params,
+                "ngl": 22,
+                "batch_size": 1024,
+                "ubatch_size": 256,
+                "cache_type_k": "q4_0",
+                "cache_type_v": "q4_0",
+            },
+            "selected conservative run",
+            "kv",
+        )
+        self.gui.autotune_plan.candidates.append(selected)
+        selected_result = BenchmarkResult(
+            candidate_id="run_002",
+            status="success",
+            score=95.0,
+            prompt_tok_s=900.0,
+            generation_tok_s=90.0,
+        )
+        self.gui.autotune = type("AutoTuneState", (), {"results": [selected_result]})()
+        self.ui.autotune.verify_server_after_apply.setChecked(False)
+        self.ui.autotune.set_plan(self.gui.autotune_plan)
+        self.ui.autotune.update_result(selected_result)
+        self.ui.autotune.table.selectRow(1)
+
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "information", return_value=None),
+        ):
+            applied = self.gui.apply_autotune_selected("run_002")
+
+        self.assertTrue(applied)
+        self.assertEqual(self.gui.autotune_best_result.candidate_id, "run_002")
+        self.assertEqual(self.ui.gpu_layers.value(), 22)
+        self.assertEqual(self.ui.batch_size.value(), 1024)
+        self.assertEqual(self.ui.ubatch_size.value(), 256)
+        self.assertEqual(self.ui.cache_type_k.currentText(), "q4_0")
+
+    def test_start_autotune_rebuilds_stale_plan_signature(self):
+        self.ui.ctx_size.setValue(16384)
+        plan = self.gui.build_autotune_plan()
+        self.assertIsNotNone(plan)
+        old_signature = self.gui._autotune_plan_signature
+
+        self.ui.ctx_size.setValue(32768)
+        new_signature = self.gui._current_autotune_plan_signature()
+
+        self.assertNotEqual(old_signature, new_signature)
 
 
 if __name__ == "__main__":

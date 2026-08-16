@@ -12,8 +12,18 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QThread, Signal
 
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, BenchmarkResult
+from src.core.benchmark_plan import EARLY_STOP_DROP_PCT_DEFAULT
 from src.core.benchmark_scorer import score_result
 from src.services.benchmark_runner import BenchmarkRunner
+
+# --- Пороги замены baseline ---------------------------------------------------
+# Single-repetition llama-bench has noise. Do not replace the current baseline
+# unless the candidate is clearly better (>= 3% score or >= 5% generation),
+# otherwise AutoTune can apply a tiny/noisy +1-2% result that feels slower
+# in real server use.
+MIN_SCORE_GAIN_TO_REPLACE = 0.03
+MIN_TG_GAIN_TO_REPLACE = 0.05
+
 from src.services.report_writer import (
     write_best,
     write_json_report,
@@ -86,10 +96,77 @@ class AutoTuneManager(QThread):
     def _emit_log(self, message: str, level: str = "info") -> None:
         self.log.emit(message, level)
 
+    def _candidate_by_id(self) -> Dict[str, BenchmarkCandidate]:
+        return {c.id: c for c in self.plan.candidates}
+
+    def _candidate_signature(self, candidate: BenchmarkCandidate) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (k, str(v))
+                for k, v in candidate.params.items()
+                if not str(k).startswith("_")
+            )
+        )
+
     def _rank_best(self) -> Optional[BenchmarkResult]:
         successful = [r for r in self.results if r.status == "success"]
         if not successful:
             return None
+        by_id = self._candidate_by_id()
+        if any((by_id.get(r.candidate_id) and by_id[r.candidate_id].stage == "verify") for r in successful):
+            groups: Dict[tuple[tuple[str, str], ...], List[BenchmarkResult]] = {}
+            for result in successful:
+                candidate = by_id.get(result.candidate_id)
+                if not candidate:
+                    continue
+                groups.setdefault(self._candidate_signature(candidate), []).append(result)
+
+            ranked_groups = []
+            for signature, results in groups.items():
+                count = len(results)
+                avg_score = sum(r.score for r in results) / count
+                avg_tg = sum(r.generation_tok_s for r in results) / count
+                avg_pp = sum(r.prompt_tok_s for r in results) / count
+                representative = next(
+                    (
+                        r
+                        for r in reversed(results)
+                        if by_id.get(r.candidate_id)
+                        and by_id[r.candidate_id].stage == "verify"
+                    ),
+                    max(results, key=lambda r: (r.score, r.generation_tok_s)),
+                )
+                ranked_groups.append(
+                    (avg_score, avg_tg, avg_pp, count, representative, signature)
+                )
+
+            best_group = max(ranked_groups, key=lambda item: item[:4])
+            baseline = next((r for r in successful if r.candidate_id == "run_001"), None)
+            if baseline:
+                baseline_candidate = by_id.get(baseline.candidate_id)
+                baseline_signature = (
+                    self._candidate_signature(baseline_candidate)
+                    if baseline_candidate
+                    else None
+                )
+                baseline_group = next(
+                    (g for g in ranked_groups if g[5] == baseline_signature),
+                    None,
+                )
+                if baseline_group and best_group[5] != baseline_signature:
+                    score_gain = (best_group[0] - baseline_group[0]) / max(
+                        baseline_group[0], 1.0
+                    )
+                    tg_gain = (best_group[1] - baseline_group[1]) / max(
+                        baseline_group[1], 1.0
+                    )
+                    if (
+                        score_gain < MIN_SCORE_GAIN_TO_REPLACE
+                        and tg_gain < MIN_TG_GAIN_TO_REPLACE
+                    ):
+                        return baseline_group[4]
+            return best_group[4]
+
         best = max(
             successful, key=lambda r: (r.score, r.generation_tok_s, r.prompt_tok_s)
         )
@@ -104,7 +181,10 @@ class AutoTuneManager(QThread):
         tg_gain = (best.generation_tok_s - baseline.generation_tok_s) / max(
             baseline.generation_tok_s, 1.0
         )
-        if score_gain < 0.03 and tg_gain < 0.05:
+        if (
+            score_gain < MIN_SCORE_GAIN_TO_REPLACE
+            and tg_gain < MIN_TG_GAIN_TO_REPLACE
+        ):
             return baseline
         return best
 
@@ -138,7 +218,13 @@ class AutoTuneManager(QThread):
             return False  # Новый пик — не останавливаем
 
         drop_pct = max(
-            0.0, float(getattr(self.plan, "early_stop_drop_pct", 3.0) or 3.0)
+            0.0,
+            float(
+                getattr(
+                    self.plan, "early_stop_drop_pct", EARLY_STOP_DROP_PCT_DEFAULT
+                )
+                or EARLY_STOP_DROP_PCT_DEFAULT
+            ),
         )
         threshold = best.generation_tok_s * (1.0 - drop_pct / 100.0)
 
@@ -153,6 +239,63 @@ class AutoTuneManager(QThread):
             return True
 
         return False
+
+    def _run_candidate(
+        self,
+        candidate: BenchmarkCandidate,
+        index: int,
+        total: int,
+    ) -> BenchmarkResult:
+        self.progress.emit(index - 1, total)
+        self.run_started.emit(candidate)
+        self._emit_log(f"[{index}/{total}] {candidate.id}: {candidate.reason}", "bench")
+
+        result = self.runner.run(
+            candidate,
+            prompt_tokens=self.prompt_tokens,
+            generation_tokens=self.generation_tokens,
+            timeout_sec=self.per_run_timeout_sec,
+            log_callback=lambda msg: self._emit_log(msg, "bench"),
+        )
+        score_result(result, candidate.params, self.plan.target)
+        self.results.append(result)
+        self.run_finished.emit(result)
+        self.best_result = self._rank_best()
+        self.progress.emit(index, total)
+        return result
+
+    def _successful_ranked_results(self) -> List[BenchmarkResult]:
+        successful = [r for r in self.results if r.status == "success"]
+        return sorted(
+            successful,
+            key=lambda r: (r.score, r.generation_tok_s, r.prompt_tok_s),
+            reverse=True,
+        )
+
+    def _verification_candidates(self, count: int) -> List[BenchmarkCandidate]:
+        by_id = self._candidate_by_id()
+        chosen: List[BenchmarkCandidate] = []
+        seen_params: set[tuple[tuple[str, str], ...]] = set()
+        for result in self._successful_ranked_results():
+            source = by_id.get(result.candidate_id)
+            if not source or source.stage == "verify":
+                continue
+            signature = self._candidate_signature(source)
+            if signature in seen_params:
+                continue
+            seen_params.add(signature)
+            verify_id = f"verify_{len(chosen) + 1:03d}_{source.id}"
+            chosen.append(
+                BenchmarkCandidate(
+                    verify_id,
+                    dict(source.params),
+                    f"verify {source.id}: {source.reason}",
+                    "verify",
+                )
+            )
+            if len(chosen) >= count:
+                break
+        return chosen
 
     def _write_reports(self) -> None:
         by_id = {c.id: c for c in self.plan.candidates}
@@ -187,7 +330,8 @@ class AutoTuneManager(QThread):
             f"AutoTune started: {total} candidates, output: {self.output_dir}", "info"
         )
 
-        for index, candidate in enumerate(self.plan.candidates, start=1):
+        executed = 0
+        for index, candidate in enumerate(list(self.plan.candidates), start=1):
             if self.isInterruptionRequested():
                 break
             if time.monotonic() - start_mono > self.plan.time_budget_sec:
@@ -197,22 +341,8 @@ class AutoTuneManager(QThread):
                 self._emit_log("AutoTune stopped: too many failed candidates", "warn")
                 break
 
-            self.progress.emit(index - 1, total)
-            self.run_started.emit(candidate)
-            self._emit_log(
-                f"[{index}/{total}] {candidate.id}: {candidate.reason}", "bench"
-            )
-
-            result = self.runner.run(
-                candidate,
-                prompt_tokens=self.prompt_tokens,
-                generation_tokens=self.generation_tokens,
-                timeout_sec=self.per_run_timeout_sec,
-                log_callback=lambda msg: self._emit_log(msg, "bench"),
-            )
-            score_result(result, candidate.params, self.plan.target)
-            self.results.append(result)
-            self.run_finished.emit(result)
+            result = self._run_candidate(candidate, index, total)
+            executed = index
 
             if result.status != "success":
                 failures += 1
@@ -221,9 +351,6 @@ class AutoTuneManager(QThread):
             else:
                 failures = 0
 
-            self.best_result = self._rank_best()
-            self.progress.emit(index, total)
-
             if self._should_early_stop_after_peak(result):
                 best = self.best_result
                 message = "AutoTune early stop: latest successful run is slower than the current peak"
@@ -231,6 +358,26 @@ class AutoTuneManager(QThread):
                     message += f"; best={best.candidate_id} TG={best.generation_tok_s:.1f} tok/s"
                 self._emit_log(message, "info")
                 break
+
+        if not self.isInterruptionRequested():
+            repeat_count = int(getattr(self.plan, "repeat_top", 1) or 1)
+            if repeat_count > 1:
+                verify_candidates = self._verification_candidates(repeat_count)
+                if verify_candidates:
+                    self.plan.candidates.extend(verify_candidates)
+                    total = executed + len(verify_candidates)
+                    self._emit_log(
+                        f"AutoTune verification: repeating top {len(verify_candidates)} candidate(s)",
+                        "info",
+                    )
+                    for candidate in verify_candidates:
+                        if self.isInterruptionRequested():
+                            break
+                        if time.monotonic() - start_mono > self.plan.time_budget_sec:
+                            self._emit_log("AutoTune time budget reached", "warn")
+                            break
+                        executed += 1
+                        self._run_candidate(candidate, executed, total)
 
         if self.isInterruptionRequested():
             self._emit_log("AutoTune cancelled", "warn")

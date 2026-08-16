@@ -4,6 +4,14 @@ import shlex
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+from src.core.constants import (
+    SAMPLING_AUTO_FLOAT,
+    SAMPLING_AUTO_INT,
+    SAMPLING_LAST_N_AUTO,
+    SAMPLING_PENALTY_AUTO,
+    SAMPLING_SEED_AUTO,
+)
+from src.core.param_registry import FILTER_BOOL_FLAGS, FILTER_VALUE_FLAGS
 from src.utils.file_utils import validate_path
 
 
@@ -92,89 +100,11 @@ def _filter_duplicate_extra_args(
     Это предотвращает CLI вроде `--ctx-checkpoints 0 ... --ctx-checkpoints 0`.
     Если флаг не был добавлен UI, он остаётся валидным extra arg.
     """
-    flags_with_values = {
-        "-m",
-        "--model",
-        "--port",
-        "--host",
-        "--device",
-        "--spec-draft-device",
-        "-md",
-        "--model-draft",
-        "--chat-template-kwargs",
-        "--split-mode",
-        "--main-gpu",
-        "-ngl",
-        "--n-gpu-layers",
-        "-t",
-        "--threads",
-        "-tb",
-        "--threads-batch",
-        "-c",
-        "--ctx-size",
-        "-b",
-        "--batch-size",
-        "-ub",
-        "--ubatch-size",
-        "-np",
-        "--parallel",
-        "-ctk",
-        "--cache-type-k",
-        "-ctv",
-        "--cache-type-v",
-        "-ncmoe",
-        "--n-cpu-moe",
-        "--fit",
-        "-rea",
-        "--reasoning",
-        "--ctx-checkpoints",
-        "--cache-ram",
-        "--spec-type",
-        "--spec-draft-n-max",
-        "--spec-draft-n-min",
-        "--spec-draft-p-min",
-        "--spec-draft-ngl",
-        "-ngld",
-        "--spec-draft-type-k",
-        "-ctkd",
-        "--spec-draft-type-v",
-        "-ctvd",
-        "--temp",
-        "--temperature",
-        "--top-k",
-        "--top-p",
-        "--min-p",
-        "--typical",
-        "--typical-p",
-        "--repeat-penalty",
-        "--repeat-last-n",
-        "--presence-penalty",
-        "--frequency-penalty",
-        "-s",
-        "--seed",
-        "--flash-attn",
-        "-fa",
-        "-mm",
-        "--mmproj",
-        "--chat-template-file",
-    }
-    bool_flags = {
-        "--no-mmproj",
-        "--no-mmproj-offload",
-        "--mmap",
-        "--no-mmap",
-        "--mlock",
-        "--verbose",
-        "--log-timestamps",
-        "--no-cont-batching",
-        "--no-cache-prompt",
-        "--context-shift",
-        "--no-webui",
-        "--jinja",
-        "--kv-unified",
-        "-kvu",
-        "--metrics",
-    }
+    # Классификация флагов (потребляет значение / автономный переключатель)
+    # генерируется из реестра параметров; паритет со старыми ручными наборами
+    # фиксирует tests/test_param_registry.py.
+    flags_with_values = FILTER_VALUE_FLAGS
+    bool_flags = FILTER_BOOL_FLAGS
     managed = {_flag_base(a) for a in existing_args if str(a).startswith("-")}
     filtered: List[str] = []
     i = 0
@@ -358,17 +288,19 @@ def build_args(
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:
             args += ["--cache-ram", str(cfg.cache_ram)]
+        # Третий элемент — sentinel: значение не выше него означает "auto",
+        # флаг не передаётся (см. constants.py).
         sampling_values = (
-            ("--temp", "temperature", -1.0),
-            ("--top-k", "top_k", -1),
-            ("--top-p", "top_p", -1.0),
-            ("--min-p", "min_p", -1.0),
-            ("--typical", "typical_p", -1.0),
-            ("--repeat-penalty", "repeat_penalty", -1.0),
-            ("--repeat-last-n", "repeat_last_n", -2),
-            ("--presence-penalty", "presence_penalty", -3.0),
-            ("--frequency-penalty", "frequency_penalty", -3.0),
-            ("--seed", "seed", -2),
+            ("--temp", "temperature", SAMPLING_AUTO_FLOAT),
+            ("--top-k", "top_k", SAMPLING_AUTO_INT),
+            ("--top-p", "top_p", SAMPLING_AUTO_FLOAT),
+            ("--min-p", "min_p", SAMPLING_AUTO_FLOAT),
+            ("--typical", "typical_p", SAMPLING_AUTO_FLOAT),
+            ("--repeat-penalty", "repeat_penalty", SAMPLING_AUTO_FLOAT),
+            ("--repeat-last-n", "repeat_last_n", SAMPLING_LAST_N_AUTO),
+            ("--presence-penalty", "presence_penalty", SAMPLING_PENALTY_AUTO),
+            ("--frequency-penalty", "frequency_penalty", SAMPLING_PENALTY_AUTO),
+            ("--seed", "seed", SAMPLING_SEED_AUTO),
         )
         for flag, field_name, auto_value in sampling_values:
             value = getattr(cfg, field_name, auto_value)

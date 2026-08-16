@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from typing import Any, Dict, Iterable, List, Tuple
 
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate
@@ -11,14 +12,35 @@ from src.core.moe_advisor import compute_moe_advice
 from src.core.vram_estimator import full_vram_estimate
 from src.utils.subprocess_utils import no_console_kwargs
 
+# --- Доли VRAM-бюджета для поиска ncmoe ---------------------------------------
+# Цель — 94% бюджета: запас под KV-фрагментацию и потребности монитора/десктопа;
+# 98% — жёсткий предел, выше которого кандидат штрафуется.
+VRAM_TARGET_FRACTION = 0.94
+VRAM_HARD_LIMIT_FRACTION = 0.98
+# Окно поиска ncmoe вокруг текущего/рекомендуемого значения: эстиматор для
+# MoE GGUF приблизительный, поэтому не прыгаем сразу к "все эксперты на CPU".
+NCMOE_SEARCH_ANCHOR_PAD = 6
+NCMOE_SEARCH_MAX_FRACTION = 0.35
+# Штраф за превышение hard limit: доминирует над отклонением от цели,
+# чтобы кандидат над пределом не выигрывал у "чуть недобравшего".
+NCMOE_OVER_LIMIT_PENALTY = 3.0
+# Соседи лучшего значения: локальная проверка ±2 слоя.
+NCMOE_NEIGHBOR_SPAN = 2
+# Dense-модели на 128K+ упираются в KV memory — стартуем с меньшего ubatch.
+DENSE_LONG_CTX_UBATCH_CAP = 256
+LONG_CTX_THRESHOLD = 131072
+# Дефолтный порог early stop: падение скорости на 3% от пика.
+EARLY_STOP_DROP_PCT_DEFAULT = 3.0
 
 _TIME_BUDGETS = {
+    "smart": 10 * 60,
     "quick": 15 * 60,
     "normal": 45 * 60,
     "deep": 120 * 60,
 }
 
 _MAX_RUNS = {
+    "smart": 10,
     "quick": 12,
     "normal": 60,
     "deep": 120,
@@ -31,6 +53,10 @@ def _mode_key(mode: str) -> str:
 
 def _target_key(target: str) -> str:
     return (target or "balanced").strip().lower().replace(" ", "_")
+
+
+def _is_auto_target(target: str) -> bool:
+    return _target_key(target) in {"auto", "smart"}
 
 
 def _ctx_from_settings(settings: Any, model_info: Dict[str, Any]) -> int:
@@ -239,6 +265,42 @@ def _detect_total_vram_gib() -> float:
         return 0.0
 
 
+def _detect_system_ram_gib() -> float:
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return float(stat.ullTotalPhys) / (1024**3)
+        except Exception:
+            return 0.0
+    # os.sysconf есть только на POSIX — mypy на Windows ругается на прямой вызов.
+    sysconf = getattr(os, "sysconf", None)
+    if sysconf is None:
+        return 0.0
+    try:
+        pages = sysconf("SC_PHYS_PAGES")
+        page_size = sysconf("SC_PAGE_SIZE")
+        return float(pages * page_size) / (1024**3)
+    except Exception:
+        return 0.0
+
+
 def _vram_budget_gib(settings: Any, model_info: Dict[str, Any]) -> float:
     for source in (settings, model_info):
         for key in ("vram_budget_gib", "vram_gib", "gpu_vram_gib"):
@@ -251,6 +313,201 @@ def _vram_budget_gib(settings: Any, model_info: Dict[str, Any]) -> float:
             except (TypeError, ValueError):
                 pass
     return _detect_total_vram_gib()
+
+
+def _auto_target_for_constraints(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int
+) -> str:
+    budget = _vram_budget_gib(settings, model_info)
+    base = _base_params(settings, model_info, ctx_size)
+    estimated = _estimate_vram_gib(base, model_info) if model_info else 0.0
+    pct = estimated / budget if budget > 0 and estimated > 0 else 0.0
+    if pct >= 0.92 or ctx_size >= 131072:
+        return "low_vram"
+    if _is_moe(model_info) or _is_mtp_model(model_info):
+        return "balanced"
+    if pct > 0 and pct <= 0.72:
+        return "max_speed"
+    return "balanced"
+
+
+def _candidate_vram_metadata(
+    params: Dict[str, Any], model_info: Dict[str, Any], budget_gib: float
+) -> Dict[str, Any]:
+    estimated = _estimate_vram_gib(params, model_info) if model_info else 0.0
+    pct = (estimated / budget_gib * 100.0) if budget_gib > 0 and estimated > 0 else 0.0
+    if pct >= 103.0:
+        risk = "blocked"
+        note = "estimated above VRAM capacity"
+    elif pct >= 97.0:
+        risk = "high"
+        note = "very low VRAM margin"
+    elif pct >= 90.0:
+        risk = "medium"
+        note = "tight VRAM margin"
+    elif estimated > 0:
+        risk = "low"
+        note = "fits estimated VRAM budget"
+    else:
+        risk = "unknown"
+        note = "VRAM estimate unavailable"
+    return {
+        "_estimated_vram_gib": round(estimated, 2) if estimated > 0 else 0.0,
+        "_vram_pct": round(pct, 1) if pct > 0 else 0.0,
+        "_risk": risk,
+        "_risk_note": note,
+    }
+
+
+def _annotate_candidates(
+    candidates: List[BenchmarkCandidate],
+    model_info: Dict[str, Any],
+    budget_gib: float,
+) -> None:
+    for candidate in candidates:
+        candidate.params.update(
+            _candidate_vram_metadata(candidate.params, model_info, budget_gib)
+        )
+
+
+def _filter_smart_candidates(
+    candidates: List[BenchmarkCandidate], max_runs: int
+) -> List[BenchmarkCandidate]:
+    if not candidates:
+        return []
+    kept: List[BenchmarkCandidate] = []
+    blocked: List[BenchmarkCandidate] = []
+    for candidate in candidates:
+        if candidate.params.get("_risk") == "blocked":
+            blocked.append(candidate)
+        else:
+            kept.append(candidate)
+    if not kept:
+        kept = candidates[:1]
+    # Smart tune should cover major dimensions first, not spend all runs in one stage.
+    preferred_order = {
+        "baseline": 0,
+        "kv": 1,
+        "batch": 2,
+        "ubatch": 3,
+        "threads": 4,
+        "moe_vram": 5,
+        "ngl": 6,
+        "moe": 7,
+        "memory": 8,
+    }
+    kept.sort(
+        key=lambda c: (
+            preferred_order.get(c.stage, 20),
+            {"low": 0, "medium": 1, "unknown": 2, "high": 3}.get(
+                str(c.params.get("_risk")), 4
+            ),
+            c.id,
+        )
+    )
+    selected = kept[: max(1, max_runs)]
+    for index, candidate in enumerate(selected, start=1):
+        candidate.id = f"run_{index:03d}"
+    return selected
+
+
+def _smart_rescue_candidates(
+    settings: Any, model_info: Dict[str, Any], ctx_size: int
+) -> List[BenchmarkCandidate]:
+    base = _base_params(settings, model_info, ctx_size)
+    seen: set = set()
+    candidates: List[BenchmarkCandidate] = []
+    ctx_values = []
+    for value in (ctx_size // 2, 65536, 32768, 16384, 8192):
+        if value > 0 and value < ctx_size and value not in ctx_values:
+            ctx_values.append(value)
+    ngl_values = _ngl_candidates(settings, model_info, "quick", "low_vram")
+    if 0 not in ngl_values:
+        ngl_values.append(0)
+    for ctx in ctx_values:
+        for ngl in ngl_values[:3]:
+            p = dict(
+                base,
+                ctx_size=ctx,
+                ngl=ngl,
+                cache_type_k="q4_0",
+                cache_type_v="q4_0",
+                batch_size=512,
+                ubatch_size=256,
+                parallel_slots=1,
+                kv_unified=False,
+                ncmoe=-1 if not _is_moe(model_info) else base.get("ncmoe", -1),
+            )
+            _append_unique(
+                candidates,
+                seen,
+                p,
+                f"Smart fallback ctx={ctx:,} ngl={ngl}",
+                "fallback",
+            )
+    return candidates
+
+
+def _plan_constraints(
+    settings: Any,
+    model_info: Dict[str, Any],
+    ctx_size: int,
+    target: str,
+    candidates: List[BenchmarkCandidate],
+    requested_target: str,
+) -> Dict[str, Any]:
+    budget = _vram_budget_gib(settings, model_info)
+    ram_gib = _detect_system_ram_gib()
+    logical = max(os.cpu_count() or 0, 0)
+    baseline = candidates[0].params if candidates else {}
+    estimated = float(baseline.get("_estimated_vram_gib") or 0.0)
+    vram_pct = float(baseline.get("_vram_pct") or 0.0)
+    blocked = sum(1 for c in candidates if c.params.get("_risk") == "blocked")
+    high = sum(1 for c in candidates if c.params.get("_risk") == "high")
+    model_kind = "MoE" if _is_moe(model_info) else "Dense"
+    if _is_mtp_model(model_info):
+        model_kind += " + MTP"
+    notes = [
+        f"{model_kind} model, ctx={ctx_size:,}",
+        f"target={target}" + (" (auto-selected)" if _is_auto_target(requested_target) else ""),
+    ]
+    if budget > 0 and estimated > 0:
+        margin = budget - estimated
+        notes.append(
+            f"baseline VRAM estimate {estimated:.2f}/{budget:.2f} GiB ({vram_pct:.1f}%, margin {margin:.2f} GiB)"
+        )
+    elif estimated > 0:
+        notes.append(f"baseline VRAM estimate {estimated:.2f} GiB; GPU capacity unknown")
+    else:
+        notes.append("VRAM estimate unavailable; plan keeps conservative defaults")
+    if blocked:
+        notes.append(f"{blocked} candidate(s) were above estimated VRAM capacity")
+    if high:
+        notes.append(f"{high} candidate(s) have very low VRAM margin")
+    if _is_moe(model_info):
+        notes.append("MoE search includes ncmoe values clamped to active GPU layers")
+    if _is_mtp_model(model_info):
+        notes.append("MTP search keeps one slot and Q8-first KV baseline")
+    return {
+        "gpu_vram_gib": round(budget, 2) if budget > 0 else 0.0,
+        "system_ram_gib": round(ram_gib, 2) if ram_gib > 0 else 0.0,
+        "cpu_threads": logical,
+        "model_kind": model_kind,
+        "native_ctx": int(model_info.get("context_length") or 0),
+        "ctx_size": int(ctx_size),
+        "requested_target": _target_key(requested_target),
+        "selected_target": target,
+        "baseline_estimated_vram_gib": round(estimated, 2) if estimated > 0 else 0.0,
+        "baseline_vram_pct": round(vram_pct, 1) if vram_pct > 0 else 0.0,
+        "risk_counts": {
+            "blocked": blocked,
+            "high": high,
+            "medium": sum(1 for c in candidates if c.params.get("_risk") == "medium"),
+            "low": sum(1 for c in candidates if c.params.get("_risk") == "low"),
+            "unknown": sum(1 for c in candidates if c.params.get("_risk") == "unknown"),
+        },
+        "notes": notes,
+    }
 
 
 def _estimate_vram_gib(params: Dict[str, Any], model_info: Dict[str, Any]) -> float:
@@ -296,27 +553,36 @@ def _vram_targeted_ncmoe_values(
 
     budget = _vram_budget_gib(settings, model_info)
     if budget > 0:
-        target = budget * 0.94
-        hard_limit = budget * 0.98
+        target = budget * VRAM_TARGET_FRACTION
+        hard_limit = budget * VRAM_HARD_LIMIT_FRACTION
         best = None
         best_key = None
         # The estimator is intentionally approximate for MoE GGUFs. Avoid
         # jumping straight to "all experts on CPU" just because a formula says
         # it fits; search around current/recommended values first.
         anchor = max([v for v in values if v >= 0] or [0])
-        max_search = min(max_ncmoe, max(anchor + 6, int(max_ncmoe * 0.35)))
+        max_search = min(
+            max_ncmoe,
+            max(anchor + NCMOE_SEARCH_ANCHOR_PAD, int(max_ncmoe * NCMOE_SEARCH_MAX_FRACTION)),
+        )
         for ncmoe in range(0, max_search + 1):
             params = dict(base, ncmoe=ncmoe)
             estimated = _estimate_vram_gib(params, model_info)
             # prefer candidates under the hard limit and closest to 94% VRAM;
             # if estimator is pessimistic, still pick the least-bad nearby value.
-            over_penalty = max(0.0, estimated - hard_limit) * 3.0
+            over_penalty = max(0.0, estimated - hard_limit) * NCMOE_OVER_LIMIT_PENALTY
             key = abs(estimated - target) + over_penalty
             if best_key is None or key < best_key:
                 best_key = key
                 best = ncmoe
         if best is not None:
-            values.extend([best, max(0, best - 2), min(max_ncmoe, best + 2)])
+            values.extend(
+                [
+                    best,
+                    max(0, best - NCMOE_NEIGHBOR_SPAN),
+                    min(max_ncmoe, best + NCMOE_NEIGHBOR_SPAN),
+                ]
+            )
 
     values.extend([0, -1])
     result: List[int] = []
@@ -338,10 +604,10 @@ def _base_params(
     ubatch = int(getattr(settings, "ubatch_size", min(batch, 512)) or min(batch, 512))
     if ubatch <= 0:
         ubatch = min(batch, 512)
-    if ctx_size >= 131072 and not _is_moe(model_info):
+    if ctx_size >= LONG_CTX_THRESHOLD and not _is_moe(model_info):
         # Dense 128K+ сильнее упирается в KV memory; безопаснее стартовать с
         # меньшего micro-batch и уже потом проверять соседние варианты.
-        ubatch = min(ubatch, 256)
+        ubatch = min(ubatch, DENSE_LONG_CTX_UBATCH_CAP)
 
     ctx_checkpoints = int(getattr(settings, "ctx_checkpoints", -1))
     cache_ram = int(getattr(settings, "cache_ram", -2))
@@ -653,29 +919,48 @@ def build_autotune_plan(
     repeat_top: int = 1,
     early_stop_on_peak: bool = False,
     early_stop_min_successes: int = 3,
-    early_stop_drop_pct: float = 3.0,
+    early_stop_drop_pct: float = EARLY_STOP_DROP_PCT_DEFAULT,
 ) -> AutoTunePlan:
     """Создаёт ограниченный staged-план AutoTune."""
     info = dict(model_info or {})
     info.setdefault("_model_path", model_path)
     mode_key = _mode_key(mode)
     ctx_size = _ctx_from_settings(settings, info)
+    requested_target = target
+    target_key = (
+        _auto_target_for_constraints(settings, info, ctx_size)
+        if _is_auto_target(target)
+        else _target_key(target)
+    )
     budget = int(time_budget_sec or _TIME_BUDGETS.get(mode_key, _TIME_BUDGETS["quick"]))
     run_limit = int(max_runs or _MAX_RUNS.get(mode_key, _MAX_RUNS["quick"]))
 
-    if mode_key == "quick":
-        candidates = _quick_candidates(settings, info, ctx_size, target)
+    build_mode = "quick" if mode_key == "smart" else mode_key
+    if build_mode == "quick":
+        candidates = _quick_candidates(settings, info, ctx_size, target_key)
     else:
         candidates = _normal_or_deep_candidates(
-            settings, info, ctx_size, target, mode_key
+            settings, info, ctx_size, target_key, build_mode
         )
 
+    vram_budget = _vram_budget_gib(settings, info)
+    _annotate_candidates(candidates, info, vram_budget)
+    if mode_key == "smart":
+        if candidates and all(c.params.get("_risk") == "blocked" for c in candidates):
+            rescue = _smart_rescue_candidates(settings, info, ctx_size)
+            _annotate_candidates(rescue, info, vram_budget)
+            candidates.extend(rescue)
+        candidates = _filter_smart_candidates(candidates, run_limit)
+
     candidates = candidates[: max(1, run_limit)]
+    constraints = _plan_constraints(
+        settings, info, ctx_size, target_key, candidates, requested_target
+    )
     return AutoTunePlan(
         model_path=model_path,
         ctx_size=ctx_size,
         mode=mode_key,
-        target=_target_key(target),
+        target=target_key,
         engine=engine,
         time_budget_sec=budget,
         max_runs=run_limit,
@@ -684,4 +969,5 @@ def build_autotune_plan(
         early_stop_on_peak=bool(early_stop_on_peak),
         early_stop_min_successes=max(3, int(early_stop_min_successes or 3)),
         early_stop_drop_pct=max(0.0, float(early_stop_drop_pct or 0.0)),
+        constraints=constraints,
     )
