@@ -118,7 +118,9 @@ class LlamaGUI:
         self.hf_scanner = None
         self.hf = HfDownloadCoordinator()
         self.hf.task_changed.connect(self._set_hf_task_display)
-        self.hf.percent_changed.connect(lambda _key: self._refresh_hf_download_summary())
+        self.hf.percent_changed.connect(
+            lambda _key: self._refresh_hf_download_summary()
+        )
         self.hf.task_completed.connect(self._on_hf_task_completed)
         self.hf.task_finished.connect(self._on_hf_task_finished)
         self.hf_scan_result = None
@@ -196,7 +198,6 @@ class LlamaGUI:
         u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
         u.force_stop_btn.clicked.connect(self.force_stop_server)
-        u.force_stop_action.triggered.connect(self.force_stop_server)
         u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
         u.export_stats_btn.clicked.connect(self.export_runtime_stats)
         u.copy_stats_md_btn.clicked.connect(self.copy_runtime_stats_markdown)
@@ -219,9 +220,7 @@ class LlamaGUI:
         u.hf_downloads.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
-        u.preset_name_combo.activated.connect(
-            lambda _index: self._on_preset_selected()
-        )
+        u.preset_name_combo.activated.connect(lambda _index: self._on_preset_selected())
         u.preset_name_combo.currentIndexChanged.connect(
             lambda _index: self._update_preset_buttons()
         )
@@ -510,9 +509,8 @@ class LlamaGUI:
 
     def _refresh_overview(self):
         overview_status = getattr(self.ui, "overview_status", None)
-        if (
-            overview_status is None
-            or type(overview_status).__module__.startswith("unittest.mock")
+        if overview_status is None or type(overview_status).__module__.startswith(
+            "unittest.mock"
         ):
             return
 
@@ -547,8 +545,8 @@ class LlamaGUI:
             labels.get("request", "Request: -").replace("Request:", "").strip() or "-"
         )
         active = (
-            labels.get("active_time", "Active: 0:00")
-            .replace("Active:", "")
+            labels.get("active_time", "Work time: 0:00")
+            .replace("Work time:", "")
             .strip()
             or "0:00"
         )
@@ -593,6 +591,15 @@ class LlamaGUI:
             f"KV {preview['kv_text']}"
         )
 
+        # Постоянная полоса статуса поверх вкладок (всегда видна).
+        if hasattr(self.ui, "status_indicator"):
+            self.ui.status_indicator.setText("●" if running or bench else "○")
+            self.ui.status_short.setText(status_text)
+            self.ui.status_speed.setText(speed)
+            self.ui.status_vram.setText(
+                vram_text if (vram_total > 0 or estimate) else "—"
+            )
+
         detailed = self._parsed_memory_without_process_fallback() > 0
         if vram_total <= 0 and not estimate:
             note = "Monitor will show detailed or fallback memory data after launch."
@@ -614,7 +621,9 @@ class LlamaGUI:
         self.ui.preflight_mtp.setText(f"MTP: {preview['mtp_text']}")
         self.ui.preflight_endpoint.setText(f"Endpoint: {preview['endpoint']}")
         if not preview["model_path"]:
-            self.ui.preflight_status.setText("Select a model to estimate launch readiness")
+            self.ui.preflight_status.setText(
+                "Select a model to estimate launch readiness"
+            )
             self.ui.preflight_vram_label.setText("Estimated VRAM: -")
             self.ui.preflight_vram_bar.setValue(0)
             self.ui.preflight_vram_bar.setFormat("-")
@@ -660,7 +669,9 @@ class LlamaGUI:
                 )
         else:
             self.ui.preflight_status.setText("Ready to launch")
-            self.ui.preflight_status.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+            self.ui.preflight_status.setStyleSheet(
+                "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
+            )
             self.ui.preflight_vram_label.setText("Estimated VRAM: unavailable")
             self.ui.preflight_vram_bar.setValue(0)
             self.ui.preflight_vram_bar.setFormat("-")
@@ -702,7 +713,9 @@ class LlamaGUI:
                         self._fmt_counter(display["total"]),
                         STAT_COLOR_TOTAL,
                     ),
-                    stat_kv("task", self._fmt_counter(display["task"]), STAT_COLOR_TASK),
+                    stat_kv(
+                        "task", self._fmt_counter(display["task"]), STAT_COLOR_TASK
+                    ),
                     stat_kv(
                         "prompt",
                         self._fmt_counter(display["prompt"]),
@@ -757,13 +770,13 @@ class LlamaGUI:
         return format_runtime_stats_markdown(self.runtime_stats_snapshot())
 
     def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
-        """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
+        """HTML-строка времени: `Caption: total (Prompt pp | Gen tg)`."""
         inner = (
             f'<span style="color:{STAT_COLOR_CAPTION};">(</span>'
             + stat_sep().join(
                 [
-                    stat_kv("PP", format_duration(pp_s), STAT_COLOR_PROMPT),
-                    stat_kv("TG", format_duration(tg_s), STAT_COLOR_GENERATED),
+                    stat_kv("Prompt", format_duration(pp_s), STAT_COLOR_PROMPT),
+                    stat_kv("Gen", format_duration(tg_s), STAT_COLOR_GENERATED),
                 ]
             )
             + f'<span style="color:{STAT_COLOR_CAPTION};">)</span>'
@@ -773,13 +786,13 @@ class LlamaGUI:
 
     def _render_active_time_label(self, pp_s: float, tg_s: float):
         """Отрисовка total активного времени (за текущую сессию)."""
-        self.ui.active_time_label.setText(self._time_row_html("Active", pp_s, tg_s))
+        self.ui.active_time_label.setText(self._time_row_html("Work time:", pp_s, tg_s))
         self._refresh_overview()
 
     def _render_current_time_label(self, pp_s: float, tg_s: float):
         """Отрисовка времени текущего/последнего запроса."""
         self.ui.current_time_label.setText(
-            self._time_row_html("Current", pp_s, tg_s)
+            self._time_row_html("Last request:", pp_s, tg_s)
         )
         self._refresh_overview()
 
@@ -798,13 +811,15 @@ class LlamaGUI:
         if info["prompt_speed"] > 0:
             parts.append(
                 stat_kv(
-                    "PP", f"{format_speed(info['prompt_speed'])} tok/s", STAT_COLOR_PROMPT
+                    "Prompt",
+                    f"{format_speed(info['prompt_speed'])} tok/s",
+                    STAT_COLOR_PROMPT,
                 )
             )
         if info["predicted_speed"] > 0:
             parts.append(
                 stat_kv(
-                    "TG",
+                    "Gen",
                     f"{format_speed(info['predicted_speed'])} tok/s",
                     STAT_COLOR_GENERATED,
                 )
@@ -894,7 +909,9 @@ class LlamaGUI:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.runtime_stats_snapshot(), f, ensure_ascii=False, indent=2)
+                json.dump(
+                    self.runtime_stats_snapshot(), f, ensure_ascii=False, indent=2
+                )
                 f.write("\n")
         except OSError as exc:
             QMessageBox.critical(self.ui, "Export failed", str(exc))
@@ -1239,7 +1256,11 @@ class LlamaGUI:
 
         selected_name = (selected_name or combo.currentText()).strip() or "default"
         model_path = self._current_model_path()
-        names = self.config.list_perf_preset_names(model_path) if model_path else ["default"]
+        names = (
+            self.config.list_perf_preset_names(model_path)
+            if model_path
+            else ["default"]
+        )
         if selected_name not in names:
             names.append(selected_name)
 
@@ -1403,7 +1424,9 @@ class LlamaGUI:
         if getattr(self, "_loading_preset", False):
             return False
 
-        preset_name = (preset_name or self._current_perf_preset_name()).strip() or "default"
+        preset_name = (
+            preset_name or self._current_perf_preset_name()
+        ).strip() or "default"
         if preset_name == "default" and ctx_size <= 0:
             return False
 
@@ -1578,9 +1601,15 @@ class LlamaGUI:
                 data=entry,
                 tooltip=tooltip,
             )
-            self._set_table_item(self.ui.local_models_list, row, 1, entry.get("type") or "")
-            self._set_table_item(self.ui.local_models_list, row, 2, entry.get("gguf_count") or 0)
-            self._set_table_item(self.ui.local_models_list, row, 3, entry.get("size_text") or "")
+            self._set_table_item(
+                self.ui.local_models_list, row, 1, entry.get("type") or ""
+            )
+            self._set_table_item(
+                self.ui.local_models_list, row, 2, entry.get("gguf_count") or 0
+            )
+            self._set_table_item(
+                self.ui.local_models_list, row, 3, entry.get("size_text") or ""
+            )
             self._set_table_item(self.ui.local_models_list, row, 4, examples)
 
         self.ui.local_models_delete_btn.setEnabled(False)
@@ -1694,9 +1723,7 @@ class LlamaGUI:
 
         repo = self.ui.hf_repo.text().strip()
         if not repo:
-            QMessageBox.warning(
-                self.ui, "Hugging Face", "Paste a repo id or model URL"
-            )
+            QMessageBox.warning(self.ui, "Hugging Face", "Paste a repo id or model URL")
             return
 
         self.save_settings()
@@ -2037,7 +2064,9 @@ class LlamaGUI:
     def _refresh_hf_download_summary(self):
         active = self._active_hf_downloads()
         if active:
-            average = int(sum(int(task.get("percent") or 0) for task in active) / len(active))
+            average = int(
+                sum(int(task.get("percent") or 0) for task in active) / len(active)
+            )
             self.ui.hf_progress.setRange(0, 100)
             self.ui.hf_progress.setValue(average)
             self.ui.hf_progress.setVisible(True)
@@ -2074,9 +2103,7 @@ class LlamaGUI:
 
     def download_hf_selection(self):
         if not self.hf_scan_result:
-            QMessageBox.warning(
-                self.ui, "Hugging Face", "Scan the repository first"
-            )
+            QMessageBox.warning(self.ui, "Hugging Face", "Scan the repository first")
             return
         selected = self._selected_table_data(self.ui.hf_files)
         if not selected:
@@ -2097,7 +2124,9 @@ class LlamaGUI:
                 for file_info in files
             }
             projector_name = str(
-                (projector or {}).get("rfilename") or (projector or {}).get("name") or ""
+                (projector or {}).get("rfilename")
+                or (projector or {}).get("name")
+                or ""
             )
             if projector and projector_name not in selected_names:
                 files.append(projector)
@@ -2106,7 +2135,8 @@ class LlamaGUI:
         files = [
             file_info
             for file_info in files
-            if file_info and not self.hf.is_running(self._hf_task_key(repo_id, file_info))
+            if file_info
+            and not self.hf.is_running(self._hf_task_key(repo_id, file_info))
         ]
         if not files:
             self.ui.hf_status.setText("All selected files are already downloading")
@@ -2175,9 +2205,7 @@ class LlamaGUI:
         for key in selected_keys:
             task = self.hf.task(key) or {}
             file_info = task.get("file_info") or {}
-            filename = str(
-                file_info.get("rfilename") or file_info.get("name") or ""
-            )
+            filename = str(file_info.get("rfilename") or file_info.get("name") or "")
             if not filename:
                 continue
             partial_info = partial_download_info(
@@ -2284,8 +2312,7 @@ class LlamaGUI:
         info.setdefault("_model_path", path)
         cached_draft = str(info.get("mtp_draft_path") or "").strip()
         if cached_draft and (
-            not os.path.isfile(cached_draft)
-            or not is_mtp_draft_file(cached_draft)
+            not os.path.isfile(cached_draft) or not is_mtp_draft_file(cached_draft)
         ):
             # A model scan may have cached a draft that the user deleted later.
             info["mtp_draft_path"] = ""
@@ -2805,7 +2832,7 @@ class LlamaGUI:
         return subprocess.list2cmdline(tokens) if tokens else ""
 
     def apply_cli_preview(self):
-        parsed = parse_llama_server_command(self.ui.cli_preview.text())
+        parsed = parse_llama_server_command(self.ui.cli_preview.toPlainText())
         if parsed.warnings and not parsed.settings:
             self.ui.cli_status.setText("; ".join(parsed.warnings))
             self.ui.cli_status.setStyleSheet("color: " + STATUS_COLOR_ERROR + ";")
@@ -2903,7 +2930,9 @@ class LlamaGUI:
         self.ui.reload_btn.setVisible(True)
         self.ui.reload_btn.setText("Restart to apply")
         self.ui.reload_btn.setStyleSheet(
-            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
+            "background-color: "
+            + STATUS_COLOR_WARNING
+            + "; color: white; font-weight: bold; padding: 8px;"
         )
         self.ui.reload_btn.setEnabled(True)
         self._refresh_overview()
@@ -2912,7 +2941,9 @@ class LlamaGUI:
         self.launcher.clear_restart_needed()
         self.ui.reload_btn.setText("Restart")
         self.ui.reload_btn.setStyleSheet(
-            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
+            "background-color: "
+            + STATUS_COLOR_WARNING
+            + "; color: white; font-weight: bold; padding: 8px;"
         )
         self._refresh_overview()
 
@@ -3394,7 +3425,9 @@ class LlamaGUI:
                 pass
         QApplication.clipboard().setText(text)
         self.ui.copy_last_error_btn.setText("Copied")
-        QTimer.singleShot(1500, lambda: self.ui.copy_last_error_btn.setText("Copy last error"))
+        QTimer.singleShot(
+            1500, lambda: self.ui.copy_last_error_btn.setText("Copy last error")
+        )
 
     def open_diagnostics_folder(self):
         folder = diagnostics_dir()
@@ -3445,10 +3478,14 @@ class LlamaGUI:
         if getattr(context, "file", None):
             location = f" ({context.file}:{getattr(context, 'line', 0)})"
         text = f"Qt: {message}{location}"
-        serious = message_type in {
-            QtMsgType.QtCriticalMsg,
-            QtMsgType.QtFatalMsg,
-        } or "destroyed while thread is still running" in message.lower()
+        serious = (
+            message_type
+            in {
+                QtMsgType.QtCriticalMsg,
+                QtMsgType.QtFatalMsg,
+            }
+            or "destroyed while thread is still running" in message.lower()
+        )
         self.log_mgr.append(text, "error" if serious else "warn")
         if not serious:
             return
@@ -3631,7 +3668,9 @@ class LlamaGUI:
             )
 
     def _start_pending_restart(self):
-        had_pending, launch = self.launcher.poll_pending(self.server.is_server_running())
+        had_pending, launch = self.launcher.poll_pending(
+            self.server.is_server_running()
+        )
         if not had_pending:
             return
         if launch is None:
@@ -3925,7 +3964,10 @@ class LlamaGUI:
     def _autotune_result_by_id(self, candidate_id: str):
         if not candidate_id:
             return None
-        if self.autotune_best_result and self.autotune_best_result.candidate_id == candidate_id:
+        if (
+            self.autotune_best_result
+            and self.autotune_best_result.candidate_id == candidate_id
+        ):
             return self.autotune_best_result
         if self.autotune:
             for result in getattr(self.autotune, "results", []) or []:
@@ -3935,21 +3977,93 @@ class LlamaGUI:
 
     def _autotune_apply_diff_lines(self, params: dict) -> list[str]:
         fields = [
-            ("Context", str(self.ui.ctx_size.value()), str(params.get("ctx_size", self.ui.ctx_size.value()))),
-            ("GPU layers", "auto" if self.ui.gpu_auto.isChecked() else str(self.ui.gpu_layers.value()), str(params.get("ngl", self.ui.gpu_layers.value()))),
-            ("KV K", self.ui.cache_type_k.currentText(), str(params.get("cache_type_k", self.ui.cache_type_k.currentText()))),
-            ("KV V", self.ui.cache_type_v.currentText(), str(params.get("cache_type_v", self.ui.cache_type_v.currentText()))),
-            ("Batch", str(self.ui.batch_size.value()), str(params.get("batch_size", self.ui.batch_size.value()))),
-            ("UBatch", str(self.ui.ubatch_size.value()), str(params.get("ubatch_size", self.ui.ubatch_size.value()))),
-            ("Threads", str(self.ui.threads.value()), str(params.get("threads", self.ui.threads.value()))),
-            ("Threads batch", str(self.ui.threads_batch.value()), str(params.get("threads_batch", self.ui.threads_batch.value()))),
-            ("Slots", str(self.ui.parallel_slots.value()), str(params.get("parallel_slots", self.ui.parallel_slots.value()))),
-            ("CPU MoE", str(self.ui.cpu_moe_layers.value()), str(params.get("ncmoe", self.ui.cpu_moe_layers.value()))),
-            ("MTP", "on" if self.ui.speculative_mtp.isChecked() else "off", "on" if bool(params.get("speculative_mtp", self.ui.speculative_mtp.isChecked())) else "off"),
-            ("MTP n-max", str(self.ui.spec_draft_n_max.value()), str(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value()))),
-            ("Flash Attention", "on" if self.ui.flash_attn.isChecked() else "off", "on" if bool(params.get("flash_attn", self.ui.flash_attn.isChecked())) else "off"),
-            ("Fit", "off" if self.ui.fit_off.isChecked() else "auto", "off" if bool(params.get("fit_off", self.ui.fit_off.isChecked())) else "auto"),
-            ("Prompt cache", "on" if self.ui.cache_prompt.isChecked() else "off", "on" if bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked())) else "off"),
+            (
+                "Context",
+                str(self.ui.ctx_size.value()),
+                str(params.get("ctx_size", self.ui.ctx_size.value())),
+            ),
+            (
+                "GPU layers",
+                "auto"
+                if self.ui.gpu_auto.isChecked()
+                else str(self.ui.gpu_layers.value()),
+                str(params.get("ngl", self.ui.gpu_layers.value())),
+            ),
+            (
+                "KV K",
+                self.ui.cache_type_k.currentText(),
+                str(params.get("cache_type_k", self.ui.cache_type_k.currentText())),
+            ),
+            (
+                "KV V",
+                self.ui.cache_type_v.currentText(),
+                str(params.get("cache_type_v", self.ui.cache_type_v.currentText())),
+            ),
+            (
+                "Batch",
+                str(self.ui.batch_size.value()),
+                str(params.get("batch_size", self.ui.batch_size.value())),
+            ),
+            (
+                "UBatch",
+                str(self.ui.ubatch_size.value()),
+                str(params.get("ubatch_size", self.ui.ubatch_size.value())),
+            ),
+            (
+                "Threads",
+                str(self.ui.threads.value()),
+                str(params.get("threads", self.ui.threads.value())),
+            ),
+            (
+                "Threads batch",
+                str(self.ui.threads_batch.value()),
+                str(params.get("threads_batch", self.ui.threads_batch.value())),
+            ),
+            (
+                "Slots",
+                str(self.ui.parallel_slots.value()),
+                str(params.get("parallel_slots", self.ui.parallel_slots.value())),
+            ),
+            (
+                "CPU MoE",
+                str(self.ui.cpu_moe_layers.value()),
+                str(params.get("ncmoe", self.ui.cpu_moe_layers.value())),
+            ),
+            (
+                "MTP",
+                "on" if self.ui.speculative_mtp.isChecked() else "off",
+                "on"
+                if bool(
+                    params.get("speculative_mtp", self.ui.speculative_mtp.isChecked())
+                )
+                else "off",
+            ),
+            (
+                "MTP n-max",
+                str(self.ui.spec_draft_n_max.value()),
+                str(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value())),
+            ),
+            (
+                "Flash Attention",
+                "on" if self.ui.flash_attn.isChecked() else "off",
+                "on"
+                if bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))
+                else "off",
+            ),
+            (
+                "Fit",
+                "off" if self.ui.fit_off.isChecked() else "auto",
+                "off"
+                if bool(params.get("fit_off", self.ui.fit_off.isChecked()))
+                else "auto",
+            ),
+            (
+                "Prompt cache",
+                "on" if self.ui.cache_prompt.isChecked() else "off",
+                "on"
+                if bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked()))
+                else "off",
+            ),
         ]
         lines = []
         for label, current, best in fields:
@@ -4290,6 +4404,11 @@ class LlamaGUI:
         finally:
             self._pending_server_verify = None
 
+    def _reveal_force_stop(self):
+        """Показать кнопку Force Stop, если сервер всё ещё запущен."""
+        if self.server.is_server_running():
+            self.ui.force_stop_btn.setVisible(True)
+
     def save_autotune_best_preset(self):
         model_path = self._current_model_path()
         if not model_path or not self.autotune_best_result:
@@ -4356,6 +4475,11 @@ class LlamaGUI:
             self.log_mgr.append("Restart cancelled")
         if self.server.is_server_running():
             self.server.stop_server()
+            # Если сервер не остановился за 5 сек — показать Force Stop (Kill).
+            self._force_stop_reveal_timer = QTimer(self.ui)
+            self._force_stop_reveal_timer.setSingleShot(True)
+            self._force_stop_reveal_timer.timeout.connect(self._reveal_force_stop)
+            self._force_stop_reveal_timer.start(5000)
         if self.server.is_bench_running():
             self.server.stop_bench()
         if self.autotune and self.autotune.isRunning():
@@ -4425,8 +4549,9 @@ class LlamaGUI:
         self.ui.reload_btn.setVisible(show_reload)
         self.ui.stop_btn.setEnabled(busy)
         self.ui.force_stop_btn.setEnabled(True)
-        self.ui.force_stop_action.setEnabled(True)
-        self.ui.more_actions_btn.setEnabled(True)
+        # Force Stop скрыт, пока сервер не «зависнет» (показывается таймером
+        # в stop_work). Когда сервер остановлен — прячем снова.
+        self.ui.force_stop_btn.setVisible(srv)
         self.ui.update_llama_btn.setEnabled(not busy and not upd)
         self.ui.start_btn.setEnabled(not busy and not upd)
         self.ui.cuda_version_combo.setEnabled(not busy and not upd)

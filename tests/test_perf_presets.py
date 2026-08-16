@@ -207,7 +207,9 @@ class TestPerfPresetsUI(unittest.TestCase):
         self._set_different_values()
         self.ui.ctx_size.setValue(8192)
         button_16k = next(
-            btn for btn in self.ui.ctx_quick_buttons if btn.property("ctx_value") == 16384
+            btn
+            for btn in self.ui.ctx_quick_buttons
+            if btn.property("ctx_value") == 16384
         )
         button_16k.click()
 
@@ -221,7 +223,9 @@ class TestPerfPresetsUI(unittest.TestCase):
         self._set_different_values()
         self.ui.ctx_size.setValue(16384)
         button_16k = next(
-            btn for btn in self.ui.ctx_quick_buttons if btn.property("ctx_value") == 16384
+            btn
+            for btn in self.ui.ctx_quick_buttons
+            if btn.property("ctx_value") == 16384
         )
         button_16k.click()
 
@@ -373,12 +377,15 @@ class TestPerfPresetsUI(unittest.TestCase):
                 | QItemSelectionModel.SelectionFlag.Rows,
             )
 
-        with patch(
-            "src.services.hf_download_coordinator.HfModelDownloader", FakeDownloader
-        ), patch.object(
-            QMessageBox,
-            "question",
-            return_value=QMessageBox.StandardButton.Yes,
+        with (
+            patch(
+                "src.services.hf_download_coordinator.HfModelDownloader", FakeDownloader
+            ),
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
         ):
             self.gui.download_hf_selection()
 
@@ -412,7 +419,9 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.gui._refresh_hf_partial_status()
 
         self.assertEqual(self.ui.hf_downloads.rowCount(), 1)
-        self.assertIn("author/model / model-Q4.gguf", self.ui.hf_downloads.item(0, 0).text())
+        self.assertIn(
+            "author/model / model-Q4.gguf", self.ui.hf_downloads.item(0, 0).text()
+        )
         self.assertIn("paused / resumable", self.ui.hf_downloads.item(0, 1).text())
         self.assertIn("2.05 KB", self.ui.hf_downloads.item(0, 3).text())
         self.assertIn(str(partial), self.ui.hf_downloads.item(0, 3).toolTip())
@@ -450,8 +459,8 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertEqual(self.ui.spec_draft_model_path.text(), str(draft_path))
         self.assertTrue(self.ui.speculative_mtp.isChecked())
         self.gui.update_cli_preview(force=True)
-        self.assertIn("--model-draft", self.ui.cli_preview.text())
-        self.assertIn("--spec-type", self.ui.cli_preview.text())
+        self.assertIn("--model-draft", self.ui.cli_preview.toPlainText())
+        self.assertIn("--spec-type", self.ui.cli_preview.toPlainText())
 
         self.gui._set_mtp_manual_draft_path(str(draft_path), info)
         self.gui._sync_mtp_controls_for_model(info)
@@ -467,8 +476,8 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertTrue(self.ui.speculative_mtp.isChecked())
         self.assertFalse(self.gui._auto_mtp_supported(info))
         self.gui.update_cli_preview(force=True)
-        self.assertNotIn("--model-draft", self.ui.cli_preview.text())
-        self.assertIn("--spec-type", self.ui.cli_preview.text())
+        self.assertNotIn("--model-draft", self.ui.cli_preview.toPlainText())
+        self.assertIn("--spec-type", self.ui.cli_preview.toPlainText())
 
         reloaded = ConfigManager(self.settings_path, self.profiles_path)
         reloaded.load()
@@ -529,7 +538,7 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.gui._sync_mtp_controls_for_model(info)
         self.gui.update_cli_preview(force=True)
 
-        command = self.ui.cli_preview.text()
+        command = self.ui.cli_preview.toPlainText()
         self.assertTrue(self.ui.speculative_mtp.isChecked())
         self.assertEqual(self.ui.spec_draft_model_path.text(), "")
         self.assertIn("--spec-type draft-mtp", command)
@@ -557,7 +566,9 @@ class TestPerfPresetsUI(unittest.TestCase):
         process_events.assert_not_called()
         self.assertTrue(self.gui._mem_viz_dirty)
 
-    def test_missing_external_draft_is_not_added_but_qwen_embedded_mtp_remains_supported(self):
+    def test_missing_external_draft_is_not_added_but_qwen_embedded_mtp_remains_supported(
+        self,
+    ):
         missing_draft = Path(self.tmp.name) / "deleted-MTP-draft.gguf"
         info = {
             "path": self.model_path,

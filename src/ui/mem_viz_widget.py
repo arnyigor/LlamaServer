@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtGui import QColor, QPainter, QFont
 from PySide6.QtWidgets import (
     QWidget,
@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.mem_viz_parser import MemoryData, COMPONENT_META, COMPONENT_ORDER, fmt_mem
+
+_TR = QCoreApplication.translate
 
 
 class MemoryBar(QWidget):
@@ -60,7 +62,7 @@ class MemoryBar(QWidget):
             painter.setBrush(QColor(40, 40, 40))
             painter.drawRoundedRect(rect, 4, 4)
             painter.setPen(QColor(150, 150, 150))
-            painter.drawText(rect, Qt.AlignCenter, "Нет данных")
+            painter.drawText(rect, Qt.AlignCenter, _TR("MemoryBar", "No data"))
             return
 
         x = rect.left()
@@ -91,7 +93,6 @@ class MemoryCategoryWidget(QGroupBox):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # Заголовок с общим объемом
         header = QHBoxLayout()
         self.total_label = QLabel("—")
         self.total_label.setStyleSheet("font-weight: bold; font-size: 14px;")
@@ -103,7 +104,6 @@ class MemoryCategoryWidget(QGroupBox):
         header.addStretch()
         layout.addLayout(header)
 
-        # Прогресс бар использования
         self.util_bar = QProgressBar()
         self.util_bar.setRange(0, 100)
         self.util_bar.setValue(0)
@@ -122,11 +122,9 @@ class MemoryCategoryWidget(QGroupBox):
         """)
         layout.addWidget(self.util_bar)
 
-        # Стековая диаграмма
         self.mem_bar = MemoryBar()
         layout.addWidget(self.mem_bar)
 
-        # Таблица компонентов
         self.components_grid = QGridLayout()
         self.components_grid.setColumnStretch(1, 1)
         self.components_grid.setColumnStretch(2, 0)
@@ -144,7 +142,7 @@ class MemoryCategoryWidget(QGroupBox):
         util = data.utilization(category)
         if util is not None:
             self.util_label.setText(
-                f"{util:.1f}% от {fmt_mem(data.system_memory.get(category, 0))}"
+                f"{util:.1f}% {self.tr('of')} {fmt_mem(data.system_memory.get(category, 0))}"
             )
             self.util_bar.setValue(int(min(100, util)))
             if util >= 90:
@@ -169,7 +167,6 @@ class MemoryCategoryWidget(QGroupBox):
         components = data.components_used()
         self.mem_bar.set_data(comps, components)
 
-        # Обновляем компоненты
         for i, comp in enumerate(components):
             mib = comps.get(comp, 0.0)
             if mib <= 0:
@@ -203,7 +200,6 @@ class MemoryCategoryWidget(QGroupBox):
             value_label.setText(f"{fmt_mem(mib)} ({pct:.1f}%)")
             bar.set_data({comp: mib}, [comp])
 
-        # Скрываем неиспользуемые
         for comp, (label, value_label, bar) in self.comp_widgets.items():
             if comp not in components or comps.get(comp, 0) <= 0:
                 label.setVisible(False)
@@ -223,26 +219,21 @@ class MemoryVisualizationWidget(QWidget):
         layout.setSpacing(12)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # Информация о модели
-        self.model_info = QLabel("Модель не выбрана")
+        self.model_info = QLabel(self.tr("No model selected"))
         self.model_info.setStyleSheet("font-weight: bold; color: #b5cea8;")
         layout.addWidget(self.model_info)
 
-        # Статус
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        # VRAM
         self.vram_widget = MemoryCategoryWidget("VRAM (GPU)")
         layout.addWidget(self.vram_widget)
 
-        # RAM
         self.ram_widget = MemoryCategoryWidget("RAM (CPU)")
         layout.addWidget(self.ram_widget)
 
-        # Итого
-        self.total_label = QLabel("Итого: —")
+        self.total_label = QLabel(self.tr("Total: —"))
         self.total_label.setStyleSheet(
             "font-weight: bold; font-size: 12px; color: #d4d4d4;"
         )
@@ -271,25 +262,24 @@ class MemoryVisualizationWidget(QWidget):
                 )
             self.model_info.setText(" | ".join(parts))
         else:
-            self.model_info.setText("Модель не выбрана")
+            self.model_info.setText(self.tr("No model selected"))
 
-        # Статус
         status_parts = []
         if data.fatal_error:
-            status_parts.append(f"Ошибка: {data.fatal_error}")
+            status_parts.append(f"{self.tr('Error')}: {data.fatal_error}")
             if data.failed_component:
                 meta = COMPONENT_META.get(data.failed_component, {})
                 status_parts.append(
-                    f"Компонент: {meta.get('label', data.failed_component)}"
+                    f"{self.tr('Component')}: {meta.get('label', data.failed_component)}"
                 )
             if data.failed_alloc_mib:
-                status_parts.append(f"Запрос: {fmt_mem(data.failed_alloc_mib)}")
+                status_parts.append(f"{self.tr('Requested')}: {fmt_mem(data.failed_alloc_mib)}")
         elif data.warnings:
-            status_parts.append(f"Предупреждения: {len(data.warnings)}")
+            status_parts.append(f"{self.tr('Warnings')}: {len(data.warnings)}")
         elif data.server_ready:
-            status_parts.append("Сервер готов")
+            status_parts.append(self.tr("Server ready"))
         else:
-            status_parts.append("Ожидание данных...")
+            status_parts.append(self.tr("Waiting for data..."))
 
         self.status_label.setText("\n".join(status_parts))
         self.status_label.setStyleSheet(
@@ -304,12 +294,12 @@ class MemoryVisualizationWidget(QWidget):
         self.ram_widget.update_data(data, "RAM")
 
         total = data.grand_total()
-        self.total_label.setText(f"Итого использовано: {fmt_mem(total)}")
+        self.total_label.setText(f"{self.tr('Total used')}: {fmt_mem(total)}")
 
     def clear(self):
-        self.model_info.setText("Модель не выбрана")
-        self.status_label.setText("Сервер остановлен")
+        self.model_info.setText(self.tr("No model selected"))
+        self.status_label.setText(self.tr("Server stopped"))
         self.status_label.setStyleSheet("color: #888;")
         self.vram_widget.update_data(MemoryData(), "VRAM")
         self.ram_widget.update_data(MemoryData(), "RAM")
-        self.total_label.setText("Итого: —")
+        self.total_label.setText(self.tr("Total: —"))

@@ -6,6 +6,7 @@ import time
 from typing import Dict, Iterable, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -290,6 +291,20 @@ class AutoTuneWidget(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.table, 1)
 
+        # Параметры-кандидаты (ngl, ncmoe, KV, threads, ...) скрыты по умолчанию:
+        # 26 колонок нечитаемы на экране, а детали нужны лишь при анализе.
+        self._param_columns = list(_PARAM_COLUMNS.keys())
+        for col in self._param_columns:
+            self.table.setColumnHidden(col, True)
+
+        self.show_params_btn = QPushButton("Show parameters ▶")
+        self.show_params_btn.setCheckable(True)
+        self.show_params_btn.setToolTip(
+            "Show/hide candidate parameter columns (ngl, ncmoe, KV, threads, ...)"
+        )
+        self.show_params_btn.toggled.connect(self._toggle_param_columns)
+        layout.addWidget(self.show_params_btn)
+
         # Internal buffer only. Do not add a second console under Benchmark:
         # the main Logs panel already receives the same AutoTune events.
         self.activity_log = QTextEdit(readOnly=True)
@@ -401,7 +416,9 @@ class AutoTuneWidget(QWidget):
             self._row_by_id[candidate.id] = row
             self._fill_candidate_row(row, candidate)
 
-    def _set_item(self, row: int, col: int, value: object, editable: bool = False) -> None:
+    def _set_item(
+        self, row: int, col: int, value: object, editable: bool = False
+    ) -> None:
         item = QTableWidgetItem(str(value))
         item.setTextAlignment(
             Qt.AlignmentFlag.AlignCenter
@@ -412,7 +429,35 @@ class AutoTuneWidget(QWidget):
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, col, item)
 
-    def _set_combo_cell(self, row: int, col: int, value: object, choices: list[str]) -> None:
+    _STATUS_COLORS = {
+        "success": QColor(200, 255, 200),  # светло-зелёный
+        "running": QColor(200, 230, 255),  # светло-синий
+        "failed": QColor(255, 210, 210),  # светло-красный
+        "oom": QColor(255, 200, 180),  # светло-оранжевый
+        "pending": QColor(230, 230, 230),  # серый
+    }
+
+    def _toggle_param_columns(self, show: bool) -> None:
+        for col in self._param_columns:
+            self.table.setColumnHidden(col, not show)
+        self.show_params_btn.setText(
+            "Hide parameters ◀" if show else "Show parameters ▶"
+        )
+
+    def _apply_row_color(self, row: int, status: str) -> None:
+        color = self._STATUS_COLORS.get(str(status).lower())
+        if color is None:
+            return
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem()
+                self.table.setItem(row, col, item)
+            item.setBackground(color)
+
+    def _set_combo_cell(
+        self, row: int, col: int, value: object, choices: list[str]
+    ) -> None:
         combo = QComboBox()
         combo.addItems(choices)
         text = str(value).strip().lower()
@@ -459,7 +504,11 @@ class AutoTuneWidget(QWidget):
         return item.text().strip() if item else ""
 
     def selected_candidate_id(self) -> str:
-        selected = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        selected = (
+            self.table.selectionModel().selectedRows()
+            if self.table.selectionModel()
+            else []
+        )
         if not selected:
             return ""
         return self._cell_text(selected[0].row(), 0)
@@ -499,7 +548,9 @@ class AutoTuneWidget(QWidget):
                 continue
             for col, key in _PARAM_COLUMNS.items():
                 old_value = candidate.params.get(key, "")
-                new_value = self._coerce_param_value(key, self._cell_text(row, col), old_value)
+                new_value = self._coerce_param_value(
+                    key, self._cell_text(row, col), old_value
+                )
                 if new_value != old_value:
                     candidate.params[key] = new_value
                     changed += 1
@@ -520,7 +571,9 @@ class AutoTuneWidget(QWidget):
             "",  # load sec
             "",  # VRAM
             "",  # RAM
-            f"{p.get('_estimated_vram_gib', 0):.2f} GiB" if p.get("_estimated_vram_gib") else "",
+            f"{p.get('_estimated_vram_gib', 0):.2f} GiB"
+            if p.get("_estimated_vram_gib")
+            else "",
             p.get("_risk", ""),
             p.get("ngl", ""),
             p.get("ncmoe", ""),
@@ -547,6 +600,7 @@ class AutoTuneWidget(QWidget):
                     self._set_item(row, col, value, editable=True)
             else:
                 self._set_item(row, col, value, editable=col in _PARAM_COLUMNS)
+        self._apply_row_color(row, "pending")
 
     def _ensure_candidate_row(self, candidate: BenchmarkCandidate) -> int:
         row = self._row_by_id.get(candidate.id)
@@ -576,6 +630,7 @@ class AutoTuneWidget(QWidget):
         )
         self._update_time_labels()
         self._set_item(row, 1, "running")
+        self._apply_row_color(row, "running")
         self.table.selectRow(row)
         self.table.scrollToItem(self.table.item(row, 0))
 
@@ -608,6 +663,7 @@ class AutoTuneWidget(QWidget):
             f"PP={result.prompt_tok_s:.1f}, TG={result.generation_tok_s:.1f}, score={result.score:.3f}"
             + (f", error={result.error}" if result.error else "")
         )
+        self._apply_row_color(row, result.status)
         self._update_selection_actions()
 
     def _refresh_deltas(self) -> None:
@@ -694,7 +750,9 @@ class AutoTuneWidget(QWidget):
             "Why selected:",
             "- highest target-specific score among successful candidates",
             "- no detected OOM/crash",
-            "- verified repeat completed" if verified else "- stable llama-bench completion",
+            "- verified repeat completed"
+            if verified
+            else "- stable llama-bench completion",
         ]
         if baseline_tg and baseline_tg > 0:
             imp = ((best.generation_tok_s / baseline_tg) - 1.0) * 100.0

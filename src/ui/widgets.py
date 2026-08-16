@@ -1,6 +1,6 @@
 """UI виджеты для LlamaServer GUI."""
 
-from PySide6.QtCore import QEvent, QObject, QPointF
+from PySide6.QtCore import QEvent, QObject, QPointF, QSettings
 from PySide6.QtGui import QWheelEvent
 
 from PySide6.QtWidgets import (
@@ -55,9 +55,10 @@ class NoWheelValueChangeFilter(QObject):
 class CollapsiblePanel(QWidget):
     """Виджет-спойлер с возможностью сворачивания."""
 
-    def __init__(self, title, parent=None):
+    def __init__(self, title, parent=None, settings_key=None):
         super().__init__(parent)
         self.base_title = title
+        self._settings_key = settings_key or f"panel_{title}"
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(2)
@@ -78,10 +79,20 @@ class CollapsiblePanel(QWidget):
         self.content_layout.setSpacing(6)
         self.main_layout.addWidget(self.content_widget)
 
+        # Restore saved open/closed state
+        settings = QSettings("LlamaServerGUI", "UIState")
+        is_open = settings.value(self._settings_key, False, type=bool)
+        self.toggle_btn.setChecked(is_open)
+        self.content_widget.setVisible(is_open)
+        if is_open:
+            self.toggle_btn.setText(f"▼ {title}")
+
     def toggle_visibility(self):
         is_open = self.toggle_btn.isChecked()
         self.content_widget.setVisible(is_open)
         self.toggle_btn.setText(f"{'▼' if is_open else '▶'} {self.base_title}")
+        settings = QSettings("LlamaServerGUI", "UIState")
+        settings.setValue(self._settings_key, is_open)
 
     def add_widget(self, w):
         self.content_layout.addWidget(w)

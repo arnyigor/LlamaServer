@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QTextEdit,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QMessageBox,
     QListWidget,
@@ -118,29 +119,37 @@ class MainWindowUI(QMainWindow):
     def _build_left_panel(self):
         panel = QWidget()
         panel.setMinimumWidth(720)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(10)
+        outer_lay = QVBoxLayout(panel)
+        outer_lay.setContentsMargins(10, 10, 10, 10)
+        outer_lay.setSpacing(10)
 
-    def _build_left_panel(self):
-        panel = QWidget()
-        panel.setMinimumWidth(720)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(10)
+        # === Фиксированная зона: кнопки запуска + runtime stats ===
+        self._build_launch_controls_section(outer_lay)
+        self._build_hf_models_section(
+            outer_lay
+        )  # creates runtime_stats_group, adds to outer_lay
 
-        # Секции собираются отдельными методами (Этап 3.1); порядок
-        # добавления панелей задаёт _assemble_left_sections.
-        self._build_launch_controls_section(lay)
+        # === Scrollable zone: все остальные секции ===
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        inner_lay = QVBoxLayout(inner)
+        inner_lay.setContentsMargins(0, 0, 0, 0)
+        inner_lay.setSpacing(10)
+
         self._build_paths_section()
-        self._build_model_section(lay)
-        self._build_hf_models_section(lay)
-        self._build_performance_section(lay)
+        self._build_model_section(inner_lay)
+        self._build_performance_section(inner_lay)
         self._build_sampling_section()
         self._build_integration_section()
         self._build_benchmark_section()
-        self._build_cli_section(lay)
-        self._assemble_left_sections(lay)
+        self._build_cli_section(inner_lay)
+        self._assemble_left_sections(inner_lay)
+        inner_lay.addStretch()
+        scroll.setWidget(inner)
+        outer_lay.addWidget(scroll, 1)
+
         self._apply_advanced_mode(self.advanced_mode_chk.isChecked())
 
         # Collect all widgets that must be locked while server/bench/autotune runs
@@ -229,7 +238,9 @@ class MainWindowUI(QMainWindow):
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton(self.tr("Start Server"))
         self.start_btn.setStyleSheet(
-            "background-color: " + STATUS_COLOR_RUNNING + "; color: white; font-weight: bold; padding: 8px;"
+            "background-color: "
+            + STATUS_COLOR_RUNNING
+            + "; color: white; font-weight: bold; padding: 8px;"
         )
         self.reload_btn = QPushButton(self.tr("Restart"), enabled=False)
         self.reload_btn.setVisible(False)
@@ -237,11 +248,15 @@ class MainWindowUI(QMainWindow):
             "Restart the running server and apply the current model parameters"
         )
         self.reload_btn.setStyleSheet(
-            "background-color: " + STATUS_COLOR_WARNING + "; color: white; font-weight: bold; padding: 8px;"
+            "background-color: "
+            + STATUS_COLOR_WARNING
+            + "; color: white; font-weight: bold; padding: 8px;"
         )
         self.stop_btn = QPushButton(self.tr("Stop"), enabled=False)
         self.stop_btn.setStyleSheet(
-            "background-color: " + STATUS_COLOR_ERROR + "; color: white; font-weight: bold; padding: 8px;"
+            "background-color: "
+            + STATUS_COLOR_ERROR
+            + "; color: white; font-weight: bold; padding: 8px;"
         )
         self.force_stop_btn = QPushButton(self.tr("Force Stop"), enabled=True)
         self.force_stop_btn.setToolTip(
@@ -250,17 +265,9 @@ class MainWindowUI(QMainWindow):
         self.force_stop_btn.setStyleSheet(
             "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
         )
+        # Скрыта по умолчанию; появляется автоматически через ~5 сек после
+        # нажатия Stop, если сервер не остановился (см. _reveal_force_stop).
         self.force_stop_btn.setVisible(False)
-        self.more_actions_btn = QPushButton(self.tr("..."))
-        self.more_actions_btn.setFixedWidth(38)
-        self.more_actions_btn.setToolTip("More server actions")
-        self.more_actions_menu = QMenu(self.more_actions_btn)
-        self.force_stop_action = QAction("Force Stop", self.more_actions_menu)
-        self.force_stop_action.setToolTip(
-            "Immediately kills llama-server process tree if normal stop is stuck"
-        )
-        self.more_actions_menu.addAction(self.force_stop_action)
-        self.more_actions_btn.setMenu(self.more_actions_menu)
 
         # Basic/Advanced (Этап 3.2): скрывает продвинутые панели разом.
         self.advanced_mode_chk = QCheckBox(self.tr("Advanced settings"))
@@ -276,7 +283,7 @@ class MainWindowUI(QMainWindow):
         btn_row.addWidget(self.start_btn)
         btn_row.addWidget(self.reload_btn)
         btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.more_actions_btn)
+        btn_row.addWidget(self.force_stop_btn)
         btn_row.addWidget(self.advanced_mode_chk)
         lay.addLayout(btn_row)
 
@@ -298,7 +305,6 @@ class MainWindowUI(QMainWindow):
             if panel is not None
         ]
 
-
     def _build_paths_section(self):
         # === 1. Пути === отдельный виджет (src/ui/panels/paths_panel.py);
         # атрибуты реэкспортируются, чтобы config/main.py работали как раньше.
@@ -317,7 +323,6 @@ class MainWindowUI(QMainWindow):
     def _save_language(self, index: int):
         lang = str(self.language_combo.itemData(index) or "en")
         self.ui_settings.setValue("language", lang)
-
 
     def _build_model_section(self, lay):
         # === 2. Модель ===
@@ -382,10 +387,12 @@ class MainWindowUI(QMainWindow):
         lm.addLayout(mrow)
         lay.addWidget(g_model)
 
-
     def _build_hf_models_section(self, lay):
         # === 2a. Локальные модели + загрузка с Hugging Face ===
-        self.models_panel = CollapsiblePanel(self.tr("Local model manager and download"))
+        self.models_panel = CollapsiblePanel(
+            self.tr("Local model manager and download"),
+            settings_key="panel_models",
+        )
         local = self.models_panel.content_layout
 
         local_row = QHBoxLayout()
@@ -478,7 +485,9 @@ class MainWindowUI(QMainWindow):
         self.hf_files = QTableWidget(0, 4)
         self.hf_files.setHorizontalHeaderLabels(["Name", "Quant", "Size", "Progress"])
         self.hf_files.setMaximumHeight(120)
-        self.hf_files.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.hf_files.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
         self.hf_files.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
@@ -565,23 +574,16 @@ class MainWindowUI(QMainWindow):
         self.tokens_saved_label = QLabel(self.tr("Saved: 0"))
         self.tokens_saved_label.setTextFormat(Qt.RichText)
         self.tokens_saved_label.setProperty("class", "mono")
-        self.active_time_label = QLabel(self.tr("Active: 0:00 (PP 0:00 | TG 0:00)"))
+        self.active_time_label = QLabel(
+            self.tr("Work time: 0:00 (Prompt 0:00 | Gen 0:00)")
+        )
         self.active_time_label.setTextFormat(Qt.RichText)
         self.active_time_label.setProperty("class", "mono")
-        self.active_time_label.setToolTip(
-            "Active — суммарное время работы модели (prompt processing + "
-            "token generation) с момента старта сервера или последнего "
-            "Reset session. Простой и ожидание в очереди не считаются. "
-            "Сбрасывается при каждом старте сервера и по Reset session."
+        self.current_time_label = QLabel(
+            self.tr("Last request: 0:00 (Prompt 0:00 | Gen 0:00)")
         )
-        self.current_time_label = QLabel(self.tr("Current: 0:00 (PP 0:00 | TG 0:00)"))
         self.current_time_label.setTextFormat(Qt.RichText)
         self.current_time_label.setProperty("class", "mono")
-        self.current_time_label.setToolTip(
-            "Current — время последнего запроса (prompt processing + "
-            "token generation). Точное значение приходит из llama_print_timings "
-            "по завершении запроса."
-        )
         self.tokens_reset_btn = QPushButton(self.tr("Save task & reset"))
         self.tokens_reset_btn.setToolTip(
             "Save current task token count to Saved and start the next task from zero. "
@@ -628,36 +630,47 @@ class MainWindowUI(QMainWindow):
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)
 
-
     def _build_performance_section(self, lay):
         # === 3. Производительность ===
-        g_launch = QGroupBox(self.tr("Launch settings"))
-        launch = QVBoxLayout(g_launch)
+        self.g_launch = QGroupBox(self.tr("Launch settings"))
+        launch = QVBoxLayout(self.g_launch)
         launch.setContentsMargins(12, 18, 12, 12)
         launch.setSpacing(8)
 
-        self.adv_panel = CollapsiblePanel(self.tr("Advanced: Performance, Memory and MTP"))
+        self.adv_panel = CollapsiblePanel(
+            self.tr("Advanced: Performance, Memory and MTP"),
+            settings_key="panel_adv",
+        )
         lperf = self.adv_panel.content_layout
         lperf.setContentsMargins(8, 6, 8, 6)
         lperf.setSpacing(8)
-        self.sampling_panel = CollapsiblePanel(self.tr("Generation: Sampling and Penalties"))
+        self.sampling_panel = CollapsiblePanel(
+            self.tr("Generation: Sampling and Penalties"),
+            settings_key="panel_sampling",
+        )
         sampling = self.sampling_panel.content_layout
         sampling.setContentsMargins(8, 6, 8, 6)
         sampling.setSpacing(8)
-        self.server_panel = CollapsiblePanel(self.tr("Server, Templates and Diagnostics"))
+        self.server_panel = CollapsiblePanel(
+            self.tr("Server, Templates and Diagnostics"),
+            settings_key="panel_server",
+        )
         server_opts = self.server_panel.content_layout
         server_opts.setContentsMargins(8, 6, 8, 6)
         server_opts.setSpacing(8)
         # Launch settings stays directly under Model; advanced controls remain collapsed below.
-        lay.insertWidget(1, g_launch)
 
         self.launch_summary_group = QGroupBox(self.tr("Launch preflight"))
         launch_summary = QVBoxLayout(self.launch_summary_group)
         launch_summary.setContentsMargins(12, 18, 12, 12)
         launch_summary.setSpacing(6)
-        self.preflight_status = QLabel(self.tr("Select a model to estimate launch readiness"))
+        self.preflight_status = QLabel(
+            self.tr("Select a model to estimate launch readiness")
+        )
         self.preflight_status.setWordWrap(True)
-        self.preflight_status.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+        self.preflight_status.setStyleSheet(
+            "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
+        )
         self.preflight_model = QLabel(self.tr("Model: -"))
         self.preflight_context = QLabel(self.tr("Context: -"))
         self.preflight_kv = QLabel(self.tr("KV: -"))
@@ -683,7 +696,6 @@ class MainWindowUI(QMainWindow):
             launch_summary.addWidget(label)
         launch_summary.addWidget(self.preflight_vram_bar)
         launch_summary.addWidget(self.preflight_warning)
-        lay.insertWidget(2, self.launch_summary_group)
 
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 999)
@@ -756,30 +768,34 @@ class MainWindowUI(QMainWindow):
         self.preset_status = QLabel(self.tr("Preset: none"))
         self.preset_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
 
-        r2 = QHBoxLayout()
-        r2.addWidget(QLabel(self.tr("Context Size (-c):")))
-        r2.addWidget(self.ctx_size)
+        r2a = QHBoxLayout()
+        r2a.addWidget(QLabel(self.tr("Context Size (-c):")))
+        r2a.addWidget(self.ctx_size)
         self.ctx_help_btn = QToolButton()
         self.ctx_help_btn.setText("?")
         self.ctx_help_btn.setToolTip("Open detailed context/VRAM guidance")
-        r2.addWidget(self.ctx_help_btn)
-        r2.addSpacing(10)
-        r2.addWidget(QLabel(self.tr("CPU MoE (-ncmoe):")))
-        r2.addWidget(self.cpu_moe_layers)
+        r2a.addWidget(self.ctx_help_btn)
+        r2a.addSpacing(10)
+        r2a.addWidget(QLabel(self.tr("CPU MoE (-ncmoe):")))
+        r2a.addWidget(self.cpu_moe_layers)
         self.ncmoe_help_btn = QToolButton()
         self.ncmoe_help_btn.setText("?")
         self.ncmoe_help_btn.setToolTip("Open detailed CPU MoE/VRAM guidance")
-        r2.addWidget(self.ncmoe_help_btn)
-        r2.addSpacing(10)
+        r2a.addWidget(self.ncmoe_help_btn)
+        r2a.addStretch(1)
+        launch.addLayout(r2a)
 
+        # Быстрые кнопки контекста — на отдельном ряду, чтобы не перегружать
+        # основной ряд spinbox'ов. Стандартные степени 2 (8K..256K); нестандартные
+        # 24K/41K/65K убраны (вводят в заблуждение: 40960 = 40K, 65536 = 64K).
+        r2b = QHBoxLayout()
+        r2b.addWidget(QLabel(self.tr("Quick:")))
         self.ctx_quick_buttons = []
         for label, value in [
             ("8K", 8192),
             ("16K", 16384),
-            ("24K", 24576),
             ("32K", 32768),
-            ("41K", 40960),
-            ("65K", 65536),
+            ("64K", 65536),
             ("128K", 131072),
             ("256K", 262144),
         ]:
@@ -789,10 +805,11 @@ class MainWindowUI(QMainWindow):
             btn.setToolTip(f"Set Context Size to {value}")
             btn.setProperty("ctx_value", value)
             self.ctx_quick_buttons.append(btn)
-            r2.addWidget(btn)
-
-        r2.addStretch(1)
-        launch.addLayout(r2)
+            r2b.addWidget(btn)
+            if label == "32K":
+                r2b.addSpacing(10)
+        r2b.addStretch(1)
+        launch.addLayout(r2b)
         launch.addLayout(r1)
 
         self.batch_size = QSpinBox()
@@ -835,7 +852,9 @@ class MainWindowUI(QMainWindow):
         r4.addWidget(self.threads)
         r4.addWidget(self.threads_batch)
         perf_header = QLabel(self.tr("Performance and Memory:"))
-        perf_header.setStyleSheet("font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";")
+        perf_header.setStyleSheet(
+            "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
+        )
         lperf.addWidget(perf_header)
         lperf.addLayout(r4)
 
@@ -1038,12 +1057,12 @@ class MainWindowUI(QMainWindow):
         sampling_grid.setHorizontalSpacing(10)
         sampling_grid.setVerticalSpacing(6)
         sampling_fields = [
-            ("Temperature (--temp):", self.temperature),
-            ("Top K (--top-k):", self.top_k),
-            ("Top P (--top-p):", self.top_p),
-            ("Min P (--min-p):", self.min_p),
-            ("Typical P (--typical):", self.typical_p),
-            ("Seed (--seed):", self.seed),
+            ("Temperature:", self.temperature),
+            ("Top K:", self.top_k),
+            ("Top P:", self.top_p),
+            ("Min P:", self.min_p),
+            ("Typical P:", self.typical_p),
+            ("Seed:", self.seed),
             ("Repeat penalty:", self.repeat_penalty),
             ("Repeat last N:", self.repeat_last_n),
             ("Presence penalty:", self.presence_penalty),
@@ -1054,16 +1073,16 @@ class MainWindowUI(QMainWindow):
             sampling_grid.addWidget(QLabel(label), row, column * 2)
             sampling_grid.addWidget(widget, row, column * 2 + 1)
         sampling_help = {
-            self.temperature: "Randomness. auto keeps the llama-server default.",
-            self.top_k: "Keep K most likely tokens; 0 disables Top-K.",
-            self.top_p: "Nucleus sampling threshold; 1.0 disables Top-P.",
-            self.min_p: "Minimum probability relative to the best token; 0 disables Min-P.",
-            self.typical_p: "Locally typical sampling; 1.0 disables it.",
-            self.seed: "RNG seed. -1 requests a random seed; auto omits the flag.",
-            self.repeat_penalty: "Penalty for repeated token sequences; 1.0 disables it.",
-            self.repeat_last_n: "How many recent tokens are penalized; -1 means full context.",
-            self.presence_penalty: "Penalty based on whether a token already appeared; 0 disables it.",
-            self.frequency_penalty: "Penalty based on token repetition count; 0 disables it.",
+            self.temperature: "Randomness (0.0–2.0).\nCLI: --temp\nauto = server default",
+            self.top_k: "Keep K most likely tokens; 0 disables.\nCLI: --top-k",
+            self.top_p: "Nucleus sampling threshold; 1.0 disables.\nCLI: --top-p",
+            self.min_p: "Min probability relative to best token; 0 disables.\nCLI: --min-p",
+            self.typical_p: "Locally typical sampling; 1.0 disables.\nCLI: --typical",
+            self.seed: "RNG seed. -1 = random; auto omits the flag.\nCLI: --seed",
+            self.repeat_penalty: "Penalty for repeated token sequences; 1.0 disables.\nCLI: --repeat-penalty",
+            self.repeat_last_n: "Recent tokens penalized; -1 = full context.\nCLI: --repeat-last-n",
+            self.presence_penalty: "Penalty based on token presence; 0 disables.\nCLI: --presence-penalty",
+            self.frequency_penalty: "Penalty based on token repetition count; 0 disables.\nCLI: --frequency-penalty",
         }
         for widget, help_text in sampling_help.items():
             widget.setToolTip(help_text)
@@ -1134,35 +1153,49 @@ class MainWindowUI(QMainWindow):
         s_tpl.addWidget(self.chat_template_btn)
         server_opts.addLayout(s_tpl)
 
-        server_opts.addWidget(QLabel(self.tr("Extra params (only uncommon llama-server flags):")))
-        self.extra_args = QLineEdit(placeholderText="--top-p 0.9 --min-p 0.05 ...")
-        self.extra_args.setPlaceholderText("--dry-multiplier 0.8 --xtc-probability 0.1 ...")
+        server_opts.addWidget(
+            QLabel(self.tr("Extra params (only uncommon llama-server flags):"))
+        )
+        self.extra_args = QLineEdit()
+        self.extra_args.setPlaceholderText(
+            "--dry-multiplier 0.8 --xtc-probability 0.1 ..."
+        )
         server_opts.addWidget(self.extra_args)
-
 
     def _build_integration_section(self):
         # === 5. Интеграция ===
-        self.int_panel = CollapsiblePanel(self.tr("Integration (OpenCode / PI / Claude Code)"))
+        self.int_panel = CollapsiblePanel(
+            self.tr("Integration (OpenCode / PI / Claude Code)"),
+            settings_key="panel_integration",
+        )
 
-        oc_layout = QHBoxLayout()
+        # Каждый путь завёрнут в контейнер, чтобы показывать только тот,
+        # что соответствует выбранному Target (см. _on_integration_target_changed).
+        self.opencode_row = QWidget()
+        oc_layout = QHBoxLayout(self.opencode_row)
+        oc_layout.setContentsMargins(0, 0, 0, 0)
         oc_layout.addWidget(QLabel(self.tr("OpenCode JSON:")))
         self.opencode_config_path = QLineEdit(placeholderText="Path to opencode.json")
         oc_btn = QPushButton(self.tr("..."))
         oc_btn.clicked.connect(self._browse_opencode_clicked)
         oc_layout.addWidget(self.opencode_config_path)
         oc_layout.addWidget(oc_btn)
-        self.int_panel.add_layout(oc_layout)
+        self.int_panel.add_widget(self.opencode_row)
 
-        pi_layout = QHBoxLayout()
+        self.pi_row = QWidget()
+        pi_layout = QHBoxLayout(self.pi_row)
+        pi_layout.setContentsMargins(0, 0, 0, 0)
         pi_layout.addWidget(QLabel(self.tr("PI JSON:")))
         self.pi_config_path = QLineEdit(placeholderText="Path to PI config.json")
         pi_btn = QPushButton(self.tr("..."))
         pi_btn.clicked.connect(self._browse_pi_clicked)
         pi_layout.addWidget(self.pi_config_path)
         pi_layout.addWidget(pi_btn)
-        self.int_panel.add_layout(pi_layout)
+        self.int_panel.add_widget(self.pi_row)
 
-        claude_layout = QHBoxLayout()
+        self.claude_row = QWidget()
+        claude_layout = QHBoxLayout(self.claude_row)
+        claude_layout.setContentsMargins(0, 0, 0, 0)
         claude_layout.addWidget(QLabel(self.tr("Claude settings JSON:")))
         self.claude_config_path = QLineEdit(
             placeholderText="Path to ~/.claude/settings.json"
@@ -1171,7 +1204,7 @@ class MainWindowUI(QMainWindow):
         claude_btn.clicked.connect(self._browse_claude_clicked)
         claude_layout.addWidget(self.claude_config_path)
         claude_layout.addWidget(claude_btn)
-        self.int_panel.add_layout(claude_layout)
+        self.int_panel.add_widget(self.claude_row)
 
         tgt_layout = QHBoxLayout()
         tgt_layout.addWidget(QLabel(self.tr("Target:")))
@@ -1183,6 +1216,11 @@ class MainWindowUI(QMainWindow):
         self.integration_check_btn = QPushButton(self.tr("Check"))
         tgt_layout.addWidget(self.integration_check_btn)
         self.int_panel.add_layout(tgt_layout)
+
+        self.integration_target.currentIndexChanged.connect(
+            self._on_integration_target_changed
+        )
+        self._on_integration_target_changed()
 
         self.integration_model_label = QLabel(
             "Model to add: not selected", wordWrap=True
@@ -1205,10 +1243,19 @@ class MainWindowUI(QMainWindow):
         )
         self.int_panel.add_widget(self.integration_status)
 
+    def _on_integration_target_changed(self):
+        """Показываем только поле пути, соответствующее выбранному Target."""
+        target = self.integration_target.currentData() or "opencode"
+        self.opencode_row.setVisible(target == "opencode")
+        self.pi_row.setVisible(target == "pi")
+        self.claude_row.setVisible(target == "claude")
 
     def _build_benchmark_section(self):
         # === 6. Бенчмарк ===
-        self.bench_panel = CollapsiblePanel(self.tr("Benchmark"))
+        self.bench_panel = CollapsiblePanel(
+            self.tr("Benchmark"),
+            settings_key="panel_benchmark",
+        )
         bp_layout = QHBoxLayout()
         bp_layout.addWidget(QLabel(self.tr("Prompt (-p):")))
         self.bench_prompt = QSpinBox()
@@ -1241,7 +1288,6 @@ class MainWindowUI(QMainWindow):
         bench_buttons.addWidget(self.autotune_btn)
         self.bench_panel.add_layout(bench_buttons)
 
-
     def _build_cli_section(self, lay):
         # === 7. Preview CLI ===
         self.cli_group = QGroupBox(self.tr("CLI Preview"))
@@ -1270,20 +1316,27 @@ class MainWindowUI(QMainWindow):
         cli_controls.addWidget(self.cli_copy_btn)
         cli_controls.addWidget(self.cli_import_btn)
         cli_controls.addWidget(self.cli_status, 1)
-        self.cli_preview = QLineEdit(
-            placeholderText="Command will be displayed here...", readOnly=True
-        )
+        self.cli_preview = QTextEdit()
+        self.cli_preview.setReadOnly(True)
+        self.cli_preview.setPlaceholderText("Command will be displayed here...")
+        self.cli_preview.setMinimumHeight(60)
+        self.cli_preview.setMaximumHeight(100)
+        self.cli_preview.setFont(QFont("Consolas", 9))
         self.cli_preview.setStyleSheet(
-            "background-color: #2a2a2a; color: #b5cea8; font-family: Consolas; padding: 4px;"
+            "background-color: #2a2a2a; color: #b5cea8; padding: 4px;"
         )
         g_cli.setLayout(cli_layout)
         cli_layout.addLayout(cli_controls)
         cli_layout.addWidget(self.cli_preview)
 
-
     def _assemble_left_sections(self, lay):
         # === 8. Итоговый порядок блоков ===
+        # g_launch (Launch settings) и launch_summary_group (Launch preflight)
+        # создаются в _build_performance_section, но не добавляются там в layout —
+        # собираем их здесь единым местом, чтобы не было «висячих» панелей.
         lay.addWidget(self.paths_panel)
+        lay.addWidget(self.g_launch)
+        lay.addWidget(self.launch_summary_group)
         lay.addWidget(self.adv_panel)
         lay.addWidget(self.sampling_panel)
         lay.addWidget(self.server_panel)
@@ -1293,12 +1346,13 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(self.cli_group)
         lay.addStretch()
 
-
-
     def _build_right_panel(self):
         panel = QWidget()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(4, 4, 4, 4)
+
+        self.status_bar_widget = self._build_status_bar()
+        lay.addWidget(self.status_bar_widget)
 
         self.tabs = QTabWidget()
 
@@ -1354,20 +1408,20 @@ class MainWindowUI(QMainWindow):
             "Memory", "-", "VRAM"
         )
         metric_grid.addWidget(card, 0, 1)
-        card, self.overview_request_value, self.overview_request_detail = make_metric_card(
-            "Request", "-", "Current tokens"
+        card, self.overview_request_value, self.overview_request_detail = (
+            make_metric_card("Request", "-", "Current tokens")
         )
         metric_grid.addWidget(card, 0, 2)
-        card, self.overview_context_value, self.overview_context_detail = make_metric_card(
-            "Context", "-", "Configured window"
+        card, self.overview_context_value, self.overview_context_detail = (
+            make_metric_card("Context", "-", "Configured window")
         )
         metric_grid.addWidget(card, 1, 0)
-        card, self.overview_active_value, self.overview_active_detail = make_metric_card(
-            "Active", "0:00", "Model work time"
+        card, self.overview_active_value, self.overview_active_detail = (
+            make_metric_card("Active", "0:00", "Model work time")
         )
         metric_grid.addWidget(card, 1, 1)
-        card, self.overview_endpoint_value, self.overview_endpoint_detail = make_metric_card(
-            "Endpoint", "-", "OpenAI-compatible base URL"
+        card, self.overview_endpoint_value, self.overview_endpoint_detail = (
+            make_metric_card("Endpoint", "-", "OpenAI-compatible base URL")
         )
         metric_grid.addWidget(card, 1, 2)
         overview.addLayout(metric_grid)
@@ -1424,6 +1478,31 @@ class MainWindowUI(QMainWindow):
         lay.addWidget(self.tabs)
         return panel
 
+    def _build_status_bar(self):
+        """Компактная полоса статуса поверх вкладок — видна всегда."""
+        bar = QFrame()
+        bar.setFrameShape(QFrame.Shape.StyledPanel)
+        bar.setLineWidth(1)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(8)
+
+        self.status_indicator = QLabel("○")
+        self.status_indicator.setStyleSheet("font-size: 14px;")
+        self.status_short = QLabel(self.tr("Server stopped"))
+        self.status_short.setStyleSheet("font-weight: bold;")
+        self.status_speed = QLabel("—")
+        self.status_vram = QLabel("—")
+
+        lay.addWidget(self.status_indicator)
+        lay.addWidget(self.status_short)
+        lay.addStretch(1)
+        lay.addWidget(QLabel(self.tr("Speed:")))
+        lay.addWidget(self.status_speed)
+        lay.addWidget(QLabel(self.tr("VRAM:")))
+        lay.addWidget(self.status_vram)
+        return bar
+
     def _setup_tooltips(self):
         tips = {
             self.exe_path: (
@@ -1450,6 +1529,15 @@ class MainWindowUI(QMainWindow):
             self.reset_saved_btn: "Zero the accumulated Saved history (last and total).",
             self.export_stats_btn: "Export current runtime counters to JSON.",
             self.copy_stats_md_btn: "Copy current runtime counters as Markdown.",
+            self.active_time_label: self.tr(
+                "Total model processing time since server start or last "
+                "Reset session (prompt processing + token generation). "
+                "Idle time and queue waiting are not counted."
+            ),
+            self.current_time_label: self.tr(
+                "Time of the last completed request (prompt processing + "
+                "token generation). Value comes from llama_print_timings."
+            ),
         }
         for widget, text in tips.items():
             if widget:
@@ -1476,7 +1564,9 @@ class MainWindowUI(QMainWindow):
         self.ui_settings.setValue("geometry", self.saveGeometry())
         self.ui_settings.setValue("windowState", self.saveState())
         if hasattr(self, "main_splitter"):
-            self.ui_settings.setValue("mainSplitterState", self.main_splitter.saveState())
+            self.ui_settings.setValue(
+                "mainSplitterState", self.main_splitter.saveState()
+            )
         if hasattr(self, "tabs"):
             self.ui_settings.setValue("rightTabIndex", self.tabs.currentIndex())
 

@@ -208,13 +208,13 @@
     </message>
     <message>
         <location filename="../src/ui/main_window.py" line="568" />
-        <source>Active: 0:00 (PP 0:00 | TG 0:00)</source>
-        <translation>Активно: 0:00 (PP 0:00 | TG 0:00)</translation>
+        <source>Work time: 0:00 (Prompt 0:00 | Gen 0:00)</source>
+        <translation>Время работы: 0:00 (Prompt 0:00 | Gen 0:00)</translation>
     </message>
     <message>
         <location filename="../src/ui/main_window.py" line="577" />
-        <source>Current: 0:00 (PP 0:00 | TG 0:00)</source>
-        <translation>Текущий: 0:00 (PP 0:00 | TG 0:00)</translation>
+        <source>Last request: 0:00 (Prompt 0:00 | Gen 0:00)</source>
+        <translation>Последний запрос: 0:00 (Prompt 0:00 | Gen 0:00)</translation>
     </message>
     <message>
         <location filename="../src/ui/main_window.py" line="585" />

@@ -368,9 +368,7 @@ class TestTokenAccumulation(unittest.TestCase):
         c._was_processing = False
         slot = _slot(0, decoded=0, processing=True)
         slot.predicted_per_second = 10.0
-        with patch(
-            "src.core.runtime_stats.time.monotonic", side_effect=[100.0, 100.5]
-        ):
+        with patch("src.core.runtime_stats.time.monotonic", side_effect=[100.0, 100.5]):
             c.update_slot_metrics([slot])
         self.assertAlmostEqual(c._cur_prompt_s, 0.0)
         self.assertAlmostEqual(c._cur_predicted_s, 0.0)
@@ -457,24 +455,24 @@ class TestTokenAccumulation(unittest.TestCase):
         self.assertIsNone(_PP_TIME_PATTERN.search(line_tg))
 
     def test_active_time_label_format(self):
-        """Лейбл Active (total): Active: total (PP pp | TG tg)."""
+        """Лейбл Work time (total): Work time: total (Prompt pp | Gen tg)."""
         gui = _make_gui()
         gui.stats._active_prompt_s = 125
         gui.stats._active_predicted_s = 7235
         gui.stats._emit_active_time()
         text = gui.ui.active_time_label.setText.call_args[0][0]
-        self.assertIn("Active", text)
-        self.assertIn("2:00:35", text)  # TG
-        self.assertIn("2:05", text)  # PP
+        self.assertIn("Work time", text)
+        self.assertIn("2:00:35", text)  # Gen
+        self.assertIn("2:05", text)  # Prompt
 
     def test_current_time_label_format(self):
-        """Лейбл Current: Current: total (PP pp | TG tg)."""
+        """Лейбл Last request: Last request: total (Prompt pp | Gen tg)."""
         gui = _make_gui()
         gui.stats._cur_prompt_s = 6.77
         gui.stats._cur_predicted_s = 1.30
         gui.stats._emit_current_time()
         text = gui.ui.current_time_label.setText.call_args[0][0]
-        self.assertIn("Current", text)
+        self.assertIn("Last request", text)
         self.assertIn("0:08", text)  # total = 6.77+1.30 = 8.07 → 0:08
         self.assertIn("0:07", text)  # PP 6.77 → 0:07
         self.assertIn("0:01", text)  # TG 1.30 → 0:01
