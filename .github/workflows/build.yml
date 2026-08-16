@@ -3,45 +3,26 @@ name: Build
 on:
   push:
     branches:
-      - '**'
+      - master
     tags:
-      - '*'
+      - "v*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag for manual release, for example v1.0.0'
+        description: "Tag for manual release, for example v1.5.1"
         required: true
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   QT_QPA_PLATFORM: offscreen
 
 jobs:
-  build:
-    name: ${{ matrix.platform }} build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform: windows
-            archive_format: zip
-            archive_ext: zip
-            venv_python: ./.venv/Scripts/python.exe
-          - os: ubuntu-latest
-            platform: linux
-            archive_format: gztar
-            archive_ext: tar.gz
-            venv_python: ./.venv/bin/python
-          - os: macos-latest
-            platform: macos
-            archive_format: zip
-            archive_ext: zip
-            venv_python: ./.venv/bin/python
+  windows:
+    name: Windows executable
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -50,92 +31,47 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.12"
           cache: pip
-
-      - name: Install Linux Qt runtime libraries
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libegl1 \
-            libgl1 \
-            libxkbcommon-x11-0 \
-            libxcb-cursor0 \
-            libxcb-icccm4 \
-            libxcb-keysyms1 \
-            libxcb-randr0 \
-            libxcb-render-util0 \
-            libxcb-shape0 \
-            libxcb-xinerama0
 
       - name: Create virtual environment
         run: python -m venv .venv
 
       - name: Install dependencies
         run: |
-          ${{ matrix.venv_python }} -m pip install --upgrade pip
-          ${{ matrix.venv_python }} -m pip install -r requirements.txt
-          ${{ matrix.venv_python }} -m pip install pyinstaller pytest
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install pyinstaller
 
       - name: Run tests
-        run: ${{ matrix.venv_python }} -m pytest
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests
 
       - name: Build executable
+        run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean LlamaServerGUI.spec
+
+      - name: Package executable
+        shell: pwsh
         run: |
-          ${{ matrix.venv_python }} -m PyInstaller --noconfirm --clean --onefile --windowed --name LlamaServerGUI --hidden-import src.core.constants --hidden-import src.core.gguf_parser --hidden-import src.services.integration --hidden-import src.services.threads --hidden-import src.ui.widgets --hidden-import src.utils.file_utils main.py
-
-      - name: Add default config files and create archive
-        shell: bash
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
-          GITHUB_SHA: ${{ github.sha }}
-        run: |
-          ${{ matrix.venv_python }} - <<'PY'
-          import os
-          import shutil
-          from pathlib import Path
-
-          dist = Path("dist")
-          for name in ("profiles.json", "settings.json"):
-              source = Path(name)
-              if source.exists():
-                  shutil.copy2(source, dist / name)
-
-          sha = os.environ["GITHUB_SHA"][:7]
-          base_name = f"LlamaServer-{os.environ['PLATFORM']}-{sha}"
-          shutil.make_archive(base_name, os.environ["ARCHIVE_FORMAT"], root_dir=dist)
-          PY
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } elseif ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.release_tag }}" } else { "${{ github.sha }}" }
+          $archive = "LlamaServerGUI-windows-$tag.zip"
+          Compress-Archive -Path dist\LlamaServerGUI.exe -DestinationPath $archive -Force
+          "ARCHIVE=$archive" >> $env:GITHUB_ENV
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LlamaServer-${{ matrix.platform }}-${{ github.sha }}
-          path: LlamaServer-${{ matrix.platform }}-*.${{ matrix.archive_ext }}
+          name: LlamaServerGUI-windows
+          path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
-  release:
-    name: GitHub release
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: LlamaServer-*
-          path: release-assets
-          merge-multiple: true
-
       - name: Create release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: release-assets/*
+          files: ${{ env.ARCHIVE }}
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
