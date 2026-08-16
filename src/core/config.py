@@ -6,7 +6,7 @@ import os
 import hashlib
 import shlex
 from dataclasses import dataclass, field, asdict, fields
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -27,6 +27,9 @@ class AppSettings:
     model_dir: str = ""
     opencode_config: str = ""
     pi_config: str = ""
+    claude_config: str = field(
+        default_factory=lambda: str(Path.home() / ".claude" / "settings.json")
+    )
     integration_target: str = "opencode"
     bench_prompt: int = 128
     bench_gen: int = 256
@@ -37,7 +40,15 @@ class AppSettings:
     last_model_path: str = ""
     model_cache: list = field(default_factory=list)
     temperature: float = -1.0
+    top_k: int = -1
+    top_p: float = -1.0
+    min_p: float = -1.0
+    typical_p: float = -1.0
     repeat_penalty: float = -1.0
+    repeat_last_n: int = -2
+    presence_penalty: float = -3.0
+    frequency_penalty: float = -3.0
+    seed: int = -2
     gpu_auto: bool = True
     gpu_layers: int = 33
     gpu_layers_all: bool = False
@@ -68,7 +79,10 @@ class AppSettings:
     kv_unified: bool = False
     speculative_mtp: bool = False
     spec_draft_model_path: str = ""
-    spec_draft_n_max: int = 3
+    spec_draft_auto_disabled_models: list = field(default_factory=list)
+    spec_draft_manual_paths: dict = field(default_factory=dict)
+    spec_draft_n_max: int = 8
+    spec_draft_p_min: float = 0.8
     spec_draft_gpu_layers: str = "all"
     ctx_checkpoints: int = -1
     cache_ram: int = -2
@@ -95,6 +109,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "model_dir": "model_dir",
     "opencode_config": "opencode_config_path",
     "pi_config": "pi_config_path",
+    "claude_config": "claude_config_path",
     "bench_prompt": "bench_prompt",
     "bench_gen": "bench_gen",
     "auto_params": "auto_params",
@@ -116,7 +131,15 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "cuda_visible_devices": "cuda_visible_devices",
     "cuda_module_loading": "cuda_module_loading",
     "temperature": "temperature",
+    "top_k": "top_k",
+    "top_p": "top_p",
+    "min_p": "min_p",
+    "typical_p": "typical_p",
     "repeat_penalty": "repeat_penalty",
+    "repeat_last_n": "repeat_last_n",
+    "presence_penalty": "presence_penalty",
+    "frequency_penalty": "frequency_penalty",
+    "seed": "seed",
     "flash_attn": "flash_attn",
     "fit_off": "fit_off",
     "reasoning_mode": "reasoning_mode",
@@ -133,6 +156,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
     "speculative_mtp": "speculative_mtp",
     "spec_draft_model_path": "spec_draft_model_path",
     "spec_draft_n_max": "spec_draft_n_max",
+    "spec_draft_p_min": "spec_draft_p_min",
     "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "ctx_checkpoints": "ctx_checkpoints",
     "cache_ram": "cache_ram",
@@ -152,6 +176,7 @@ _FIELD_WIDGET_MAP: Dict[str, str] = {
 }
 
 _PERF_PRESETS_ROOT = "__perf_presets__"
+_PERF_DEFAULT_PRESET_NAME = "default"
 
 _PERF_PRESET_FIELDS = (
     "gpu_auto",
@@ -177,6 +202,7 @@ _PERF_PRESET_FIELDS = (
     "speculative_mtp",
     "spec_draft_model_path",
     "spec_draft_n_max",
+    "spec_draft_p_min",
     "spec_draft_gpu_layers",
     "flash_attn",
     "fit_off",
@@ -184,7 +210,15 @@ _PERF_PRESET_FIELDS = (
     "ctx_checkpoints",
     "cache_ram",
     "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "typical_p",
     "repeat_penalty",
+    "repeat_last_n",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
     "use_mmap",
     "use_mlock",
     "verbose",
@@ -214,6 +248,7 @@ _AUTOTUNE_PARAM_TO_SETTING = {
     "speculative_mtp": "speculative_mtp",
     "spec_draft_model_path": "spec_draft_model_path",
     "spec_draft_n_max": "spec_draft_n_max",
+    "spec_draft_p_min": "spec_draft_p_min",
     "spec_draft_gpu_layers": "spec_draft_gpu_layers",
     "flash_attn": "flash_attn",
     "fit_off": "fit_off",
@@ -238,6 +273,7 @@ _MANAGED_EXTRA_FLAGS = {
     "-kvu",
     "--spec-type",
     "--spec-draft-n-max",
+    "--spec-draft-p-min",
     "--spec-draft-ngl",
     "--spec-draft-device",
     "-md",
@@ -251,7 +287,18 @@ _MANAGED_EXTRA_FLAGS = {
     "-rea",
     "--reasoning",
     "--temp",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+    "--min-p",
+    "--typical",
+    "--typical-p",
     "--repeat-penalty",
+    "--repeat-last-n",
+    "--presence-penalty",
+    "--frequency-penalty",
+    "-s",
+    "--seed",
     "-ctk",
     "--cache-type-k",
     "-ctv",
@@ -280,6 +327,22 @@ _MANAGED_EXTRA_FLAGS = {
     "--no-cont-batching",
     "--context-shift",
     "--no-webui",
+}
+
+_SAMPLING_EXTRA_FIELDS = {
+    "--temp": ("temperature", float),
+    "--temperature": ("temperature", float),
+    "--top-k": ("top_k", int),
+    "--top-p": ("top_p", float),
+    "--min-p": ("min_p", float),
+    "--typical": ("typical_p", float),
+    "--typical-p": ("typical_p", float),
+    "--repeat-penalty": ("repeat_penalty", float),
+    "--repeat-last-n": ("repeat_last_n", int),
+    "--presence-penalty": ("presence_penalty", float),
+    "--frequency-penalty": ("frequency_penalty", float),
+    "-s": ("seed", int),
+    "--seed": ("seed", int),
 }
 
 
@@ -321,6 +384,55 @@ def _sanitize_extra_args(value: Any) -> str:
         result.append(arg)
         i += 1
     return " ".join(shlex.quote(p) for p in result)
+
+
+def _extract_sampling_extra_args(value: Any) -> tuple[str, Dict[str, Any]]:
+    """Мигрирует старые sampling-флаги из Extra params в отдельные поля."""
+    text = str(value or "").strip()
+    if not text:
+        return "", {}
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return text, {}
+
+    remaining = []
+    extracted: Dict[str, Any] = {}
+    i = 0
+    while i < len(parts):
+        token = parts[i]
+        base, separator, inline_value = token.partition("=")
+        spec = _SAMPLING_EXTRA_FIELDS.get(base)
+        if spec is None:
+            remaining.append(token)
+            i += 1
+            continue
+
+        raw_value = inline_value if separator else None
+        consumed = False
+        if raw_value is None and i + 1 < len(parts) and _is_extra_value_token(parts[i + 1]):
+            raw_value = parts[i + 1]
+            consumed = True
+        if raw_value is None:
+            remaining.append(token)
+            i += 1
+            continue
+
+        field_name, converter = spec
+        try:
+            extracted[field_name] = converter(raw_value)
+        except (TypeError, ValueError):
+            remaining.append(token)
+            if consumed:
+                remaining.append(parts[i + 1])
+        i += 2 if consumed else 1
+
+    return " ".join(shlex.quote(p) for p in remaining), extracted
+
+
+def _normalize_perf_preset_name(preset_name: Optional[str]) -> str:
+    text = str(preset_name or "").strip()
+    return text or _PERF_DEFAULT_PRESET_NAME
 
 
 def _perf_params_from_settings(settings: AppSettings) -> Dict[str, Any]:
@@ -381,6 +493,12 @@ def _coerce_bool(value: Any) -> bool:
 
 def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(params)
+    remaining_extra, migrated_sampling = _extract_sampling_extra_args(
+        normalized.get("extra_args", "")
+    )
+    for key, value in migrated_sampling.items():
+        normalized.setdefault(key, value)
+    normalized["extra_args"] = remaining_extra
     bool_fields = {
         "gpu_auto",
         "gpu_layers_all",
@@ -413,8 +531,20 @@ def _normalize_perf_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
         "main_gpu",
         "ctx_checkpoints",
         "cache_ram",
+        "top_k",
+        "repeat_last_n",
+        "seed",
     }
-    float_fields = {"temperature", "repeat_penalty"}
+    float_fields = {
+        "spec_draft_p_min",
+        "temperature",
+        "top_p",
+        "min_p",
+        "typical_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+    }
     for key in bool_fields & normalized.keys():
         normalized[key] = _coerce_bool(normalized[key])
     for key in int_fields & normalized.keys():
@@ -522,6 +652,13 @@ class ConfigManager:
                             setattr(self.settings, k, v)
                         except (TypeError, ValueError):
                             pass  # Игнорируем невалидные значения
+                remaining_extra, migrated_sampling = _extract_sampling_extra_args(
+                    data.get("extra_args", "")
+                )
+                for key, value in migrated_sampling.items():
+                    if key not in data:
+                        setattr(self.settings, key, value)
+                self.settings.extra_args = remaining_extra
             except (json.JSONDecodeError, OSError):
                 pass  # Используем дефолтные настройки
 
@@ -636,7 +773,15 @@ class ConfigManager:
         self.read_from_ui(ui)
         profile_data = asdict(self.settings)
         # Исключаем системные поля из профиля
-        for key in ("model_cache", "last_model_path", "exe", "bench", "model_dir"):
+        for key in (
+            "model_cache",
+            "last_model_path",
+            "exe",
+            "bench",
+            "model_dir",
+            "spec_draft_auto_disabled_models",
+            "spec_draft_manual_paths",
+        ):
             profile_data.pop(key, None)
         self.profiles[name] = profile_data
         self.save_profiles()
@@ -646,6 +791,13 @@ class ConfigManager:
         profile = self.profiles.get(name)
         if not profile:
             return False
+        profile = dict(profile)
+        remaining_extra, migrated_sampling = _extract_sampling_extra_args(
+            profile.get("extra_args", "")
+        )
+        profile["extra_args"] = remaining_extra
+        for key, value in migrated_sampling.items():
+            profile.setdefault(key, value)
         valid_fields = {f.name for f in fields(AppSettings)}
         for k, v in profile.items():
             if k in valid_fields:
@@ -658,12 +810,45 @@ class ConfigManager:
         self.apply_to_ui(ui)
         return True
 
-    def _perf_preset_key(self, model_path: str, ctx_size: int) -> str:
+    def _perf_model_digest(self, model_path: str) -> str:
         normalized = os.path.normcase(os.path.abspath(str(model_path).strip()))
-        digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[
+        return hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[
             :16
         ]
+
+    def _perf_preset_key(self, model_path: str, ctx_size: int) -> str:
+        digest = self._perf_model_digest(model_path)
         return f"{digest}::ctx={int(ctx_size)}"
+
+    def _perf_named_preset_key(self, model_path: str, preset_name: str) -> str:
+        digest = self._perf_model_digest(model_path)
+        name_digest = hashlib.sha1(
+            preset_name.casefold().encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        return f"{digest}::name={name_digest}"
+
+    def list_perf_preset_names(self, model_path: str) -> List[str]:
+        if not model_path:
+            return [_PERF_DEFAULT_PRESET_NAME]
+
+        root = self.profiles.get(_PERF_PRESETS_ROOT, {})
+        if not isinstance(root, dict):
+            return [_PERF_DEFAULT_PRESET_NAME]
+
+        digest = self._perf_model_digest(model_path)
+        names = {_PERF_DEFAULT_PRESET_NAME}
+        for key, preset_obj in root.items():
+            if not str(key).startswith(f"{digest}::"):
+                continue
+            if not isinstance(preset_obj, dict):
+                continue
+            preset_name = _normalize_perf_preset_name(preset_obj.get("preset_name"))
+            if "::name=" in str(key):
+                names.add(preset_name)
+
+        return [_PERF_DEFAULT_PRESET_NAME] + sorted(
+            name for name in names if name != _PERF_DEFAULT_PRESET_NAME
+        )
 
     def save_perf_preset(
         self,
@@ -672,6 +857,7 @@ class ConfigManager:
         ui: Any,
         metadata: Optional[Dict[str, Any]] = None,
         autotune_params: Optional[Dict[str, Any]] = None,
+        preset_name: Optional[str] = None,
     ) -> None:
         """
         Сохраняет параметры производительности для пары:
@@ -696,9 +882,14 @@ class ConfigManager:
             root = {}
             self.profiles[_PERF_PRESETS_ROOT] = root
 
-        key = self._perf_preset_key(model_path, ctx_size)
+        preset_name = _normalize_perf_preset_name(preset_name)
+        if preset_name == _PERF_DEFAULT_PRESET_NAME:
+            key = self._perf_preset_key(model_path, ctx_size)
+        else:
+            key = self._perf_named_preset_key(model_path, preset_name)
 
         preset = {
+            "preset_name": preset_name,
             "model_path": str(model_path),
             "model_name": Path(model_path).name,
             "ctx_size": int(ctx_size),
@@ -711,23 +902,37 @@ class ConfigManager:
 
         self.save_profiles()
 
-    def load_perf_preset(self, model_path: str, ctx_size: int, ui: Any) -> bool:
+    def load_perf_preset(
+        self,
+        model_path: str,
+        ctx_size: int,
+        ui: Any,
+        preset_name: Optional[str] = None,
+    ) -> bool:
         """
         Загружает только параметры производительности.
         Не трогает глобальные настройки: exe, bench, model_dir, port, интеграции.
         """
-        if not model_path or ctx_size <= 0:
+        if not model_path:
+            return False
+
+        preset_name = _normalize_perf_preset_name(preset_name)
+        if preset_name == _PERF_DEFAULT_PRESET_NAME and ctx_size <= 0:
             return False
 
         root = self.profiles.get(_PERF_PRESETS_ROOT, {})
         if not isinstance(root, dict):
             return False
 
-        key = self._perf_preset_key(model_path, ctx_size)
-        preset_obj = root.get(key)
+        if preset_name == _PERF_DEFAULT_PRESET_NAME:
+            key = self._perf_preset_key(model_path, ctx_size)
+            preset_obj = root.get(key)
+        else:
+            key = self._perf_named_preset_key(model_path, preset_name)
+            preset_obj = root.get(key)
 
         # Backward compatibility со старым форматом perf_<model_name>_<ctx>
-        if not preset_obj:
+        if preset_name == _PERF_DEFAULT_PRESET_NAME and not preset_obj:
             legacy_key = f"perf_{Path(model_path).name}_{ctx_size}"
             legacy_preset = self.profiles.get(legacy_key)
             if isinstance(legacy_preset, dict):
@@ -741,7 +946,12 @@ class ConfigManager:
             return False
 
         params = dict(params)
-        params["ctx_size"] = int(ctx_size)
+        if preset_name == _PERF_DEFAULT_PRESET_NAME:
+            params["ctx_size"] = int(ctx_size)
+        else:
+            params["ctx_size"] = int(
+                params.get("ctx_size", preset_obj.get("ctx_size", ctx_size))
+            )
         params = _normalize_perf_param_types(params)
 
         for field_name, value in params.items():

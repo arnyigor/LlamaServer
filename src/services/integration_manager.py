@@ -1,14 +1,15 @@
 # src/services/integration_manager.py
-"""Менеджер интеграции с OpenCode и PI — полная реализация."""
+"""Менеджер интеграции с OpenCode, PI и Claude Code."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from src.core.constants import DEFAULT_LOCAL_BASE_URL, LLAMACPP_PROVIDER_ID
 from src.services.integration import (
+    ensure_claude_llamacpp_environment,
     ensure_opencode_llamacpp_provider,
     ensure_pi_llamacpp_provider,
     get_model_ids,
@@ -30,7 +31,7 @@ class IntegrationResult:
 
 class IntegrationManager:
     """
-    Управляет добавлением/удалением моделей в конфиги OpenCode и PI.
+    Управляет добавлением/удалением моделей в конфиги OpenCode, PI и Claude Code.
 
     Разделяет бизнес-логику от UI, позволяет тестировать независимо.
     """
@@ -67,7 +68,9 @@ class IntegrationManager:
         try:
             data = load_or_create_json(path)
             model_ids = get_model_ids(data, target)
-            provider_id = LLAMACPP_PROVIDER_ID
+            provider_id = (
+                "Claude Code env" if target == "claude" else LLAMACPP_PROVIDER_ID
+            )
             count = len(model_ids)
             return IntegrationResult(
                 success=True,
@@ -107,7 +110,9 @@ class IntegrationManager:
                 success=False, message="Не выбрана модель"
             )
 
-        validation = self._validate_config_path(config_path)
+        validation = self._validate_config_path(
+            config_path, allow_create=target == "claude"
+        )
         if not validation.success:
             return validation
 
@@ -141,6 +146,10 @@ class IntegrationManager:
                         model_ids=get_model_ids(data, target),
                     )
                 models_list.append({"id": model_id, "name": model_id})
+            elif target == "claude":
+                env = ensure_claude_llamacpp_environment(data, url)
+                env["ANTHROPIC_MODEL"] = model_id
+                env["ANTHROPIC_SMALL_FAST_MODEL"] = model_id
             else:
                 return IntegrationResult(
                     success=False,
@@ -228,6 +237,18 @@ class IntegrationManager:
                     ]
                     removed = len(provider["models"]) < before
 
+            elif target == "claude":
+                env = data.get("env", {})
+                if isinstance(env, dict):
+                    for key in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"):
+                        if str(env.get(key) or "") == model_id:
+                            env.pop(key, None)
+                            removed = True
+                    if removed:
+                        env.pop("ANTHROPIC_BASE_URL", None)
+                        if env.get("ANTHROPIC_AUTH_TOKEN") == "llamacpp":
+                            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
             if not removed:
                 return IntegrationResult(
                     success=False,
@@ -247,20 +268,22 @@ class IntegrationManager:
                 message=f"Ошибка записи конфига: {e}",
             )
 
-    def _validate_config_path(self, config_path: str) -> IntegrationResult:
+    def _validate_config_path(
+        self, config_path: str, allow_create: bool = False
+    ) -> IntegrationResult:
         """Валидация пути к конфигу."""
         if not config_path or not config_path.strip():
             return IntegrationResult(
                 success=False, message="Путь к конфигу не указан"
             )
         path = Path(config_path.strip())
-        if not path.exists():
-            return IntegrationResult(
-                success=False, message=f"Файл не найден: {path}"
-            )
         if path.suffix.lower() != ".json":
             return IntegrationResult(
                 success=False,
                 message=f"Ожидается JSON файл, получен: {path.suffix}",
+            )
+        if not path.exists() and not allow_create:
+            return IntegrationResult(
+                success=False, message=f"Файл не найден: {path}"
             )
         return IntegrationResult(success=True, message="OK")

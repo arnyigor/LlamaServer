@@ -74,6 +74,42 @@ class TestIntegrationManager(unittest.TestCase):
             r = self.mgr.add_model(str(cfg), "unknown_target", "model")
             self.assertFalse(r.success)
 
+    def test_add_check_and_remove_claude_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._make_config(Path(d), {"env": {"KEEP_ME": "yes"}})
+            r = self.mgr.add_model(str(cfg), "claude", "local-model")
+            self.assertTrue(r.success)
+            self.assertEqual(r.model_ids, ["local-model"])
+
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8080")
+            self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], "llamacpp")
+            self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "local-model")
+            self.assertEqual(data["env"]["ANTHROPIC_SMALL_FAST_MODEL"], "local-model")
+            self.assertEqual(data["env"]["KEEP_ME"], "yes")
+
+            checked = self.mgr.check_models(str(cfg), "claude")
+            self.assertTrue(checked.success)
+            self.assertEqual(checked.model_ids, ["local-model"])
+
+            removed = self.mgr.remove_model(str(cfg), "claude", "local-model")
+            self.assertTrue(removed.success)
+            self.assertEqual(removed.model_ids, [])
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(data["env"]["KEEP_ME"], "yes")
+            self.assertNotIn("ANTHROPIC_BASE_URL", data["env"])
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", data["env"])
+
+    def test_claude_code_settings_file_can_be_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / ".claude" / "settings.json"
+            result = self.mgr.add_model(str(cfg), "claude", "local-model")
+
+            self.assertTrue(result.success)
+            self.assertTrue(cfg.exists())
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "local-model")
+
 
 # tests/test_log_manager.py
 """Тесты LogManager."""

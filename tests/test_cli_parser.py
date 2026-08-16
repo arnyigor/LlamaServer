@@ -25,7 +25,27 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(parsed.settings["cache_type_k"], "q8_0")
         self.assertEqual(parsed.settings["cache_type_v"], "q4_0")
         self.assertFalse(parsed.settings["flash_attn"])
-        self.assertEqual(parsed.extra_args, "--top-p 0.9 --min-p 0.05")
+        self.assertEqual(parsed.settings["top_p"], 0.9)
+        self.assertEqual(parsed.settings["min_p"], 0.05)
+        self.assertEqual(parsed.extra_args, "")
+
+    def test_parses_all_sampling_fields(self):
+        parsed = parse_llama_server_command(
+            "llama-server -m model.gguf --top-k 20 --top-p 0.9 --min-p 0.05 "
+            "--typical-p 0.95 --repeat-last-n 128 --repeat-penalty 1.1 "
+            "--presence-penalty -0.2 --frequency-penalty 0.1 --seed 42"
+        )
+
+        self.assertEqual(parsed.settings["top_k"], 20)
+        self.assertEqual(parsed.settings["top_p"], 0.9)
+        self.assertEqual(parsed.settings["min_p"], 0.05)
+        self.assertEqual(parsed.settings["typical_p"], 0.95)
+        self.assertEqual(parsed.settings["repeat_last_n"], 128)
+        self.assertEqual(parsed.settings["repeat_penalty"], 1.1)
+        self.assertEqual(parsed.settings["presence_penalty"], -0.2)
+        self.assertEqual(parsed.settings["frequency_penalty"], 0.1)
+        self.assertEqual(parsed.settings["seed"], 42)
+        self.assertEqual(parsed.extra_args, "")
 
     def test_parses_quoted_windows_paths(self):
         parsed = parse_llama_server_command(
@@ -41,16 +61,15 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(parsed.model_path, r"G:\Models\My Model\model q4.gguf")
         self.assertEqual(parsed.settings["temperature"], 0.7)
 
-    def test_keeps_unmanaged_speculative_flags_in_extra(self):
+    def test_parses_managed_p_min_and_keeps_unmanaged_speculative_flags_in_extra(self):
         parsed = parse_llama_server_command(
             "llama-server.exe -m model.gguf --spec-type draft-mtp "
             "--spec-draft-n-min 1 --spec-draft-p-min 0.5"
         )
 
         self.assertTrue(parsed.settings["speculative_mtp"])
-        self.assertEqual(
-            parsed.extra_args, "--spec-draft-n-min 1 --spec-draft-p-min 0.5"
-        )
+        self.assertEqual(parsed.settings["spec_draft_p_min"], 0.5)
+        self.assertEqual(parsed.extra_args, "--spec-draft-n-min 1")
 
 
 if __name__ == "__main__":

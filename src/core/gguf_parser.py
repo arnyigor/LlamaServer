@@ -280,8 +280,9 @@ def is_mtp_draft_file(path: Union[str, Path]) -> bool:
 def detect_mtp_draft_for_model(path: Union[str, Path]) -> str:
     """Поиск отдельного MTP draft GGUF рядом с основной моделью.
 
-    Актуальные Unsloth Gemma 4 MTP пакеты кладут дополнительный MTP-файл
-    во вложенную папку, а Qwen3.6 MTP может требовать отдельный draft GGUF.
+    Отдельным draft считается только явно помеченный draft/assistant/speculator
+    либо MTP-файл в специальной подпапке. Другая квантизация той же MTP-модели
+    рядом с основной моделью draft-файлом не является.
     """
     model_path = Path(path)
     if not model_path.exists():
@@ -308,8 +309,7 @@ def detect_mtp_draft_for_model(path: Union[str, Path]) -> str:
             for item in root.rglob("*.gguf"):
                 if item == model_path or not item.is_file() or is_projector_file(item):
                     continue
-                haystack = f"{item.parent.name}/{item.name}".lower()
-                if "mtp" not in haystack:
+                if not is_mtp_draft_file(item):
                     continue
                 candidates.append(item)
         except OSError:

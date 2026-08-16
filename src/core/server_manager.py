@@ -3,6 +3,8 @@
 import os
 import subprocess
 import sys
+import time
+from collections import deque
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 from src.core.constants import KILL_TIMEOUT_SERVER, KILL_TIMEOUT_BENCHMARK
@@ -21,10 +23,20 @@ class ServerManager(QObject):
         self.bench_proc = QProcess()
         self.server_stop_requested = False
         self.bench_stop_requested = False
+        self.server_recent_output = deque(maxlen=300)
+        self.server_last_exit_code = 0
+        self.server_last_crash_exit = False
+        self.server_last_stop_requested = False
+        self.server_last_process_error = ""
+        self.server_last_runtime_seconds = 0.0
+        self._server_started_at = 0.0
+        self._server_stop_notified = False
 
         self.server_proc.readyReadStandardOutput.connect(self._srv_stdout)
         self.server_proc.readyReadStandardError.connect(self._srv_stderr)
         self.server_proc.stateChanged.connect(self._srv_state)
+        self.server_proc.finished.connect(self._srv_finished)
+        self.server_proc.errorOccurred.connect(self._srv_process_error)
         self.bench_proc.readyReadStandardOutput.connect(self._bench_stdout)
         self.bench_proc.readyReadStandardError.connect(self._bench_stderr)
         self.bench_proc.finished.connect(self._bench_finished)
@@ -39,6 +51,7 @@ class ServerManager(QObject):
             .data()
             .decode("utf-8", errors="ignore")
         )
+        self._remember_server_output(data)
         self._emit(data, "info")
 
     def _srv_stderr(self):
@@ -47,7 +60,19 @@ class ServerManager(QObject):
             .data()
             .decode("utf-8", errors="ignore")
         )
-        self._emit(data, "error")
+        self._remember_server_output(data)
+        # llama.cpp writes much of its normal status output to stderr. Let the
+        # log manager color only lines that actually contain an error marker.
+        self._emit(data, "info")
+
+    def _remember_server_output(self, text: str):
+        for line in str(text or "").splitlines():
+            line = line.rstrip()
+            if line:
+                self.server_recent_output.append(line)
+
+    def recent_server_output(self) -> str:
+        return "\n".join(self.server_recent_output)
 
     def _bench_stdout(self):
         data = (
@@ -68,12 +93,56 @@ class ServerManager(QObject):
     def _srv_state(self, state):
         if state == QProcess.ProcessState.NotRunning:
             self.state_changed.emit(False)
-            if self.server_stop_requested:
-                self._emit("⏹ Сервер остановлен")
-            else:
-                self._emit(f"⏹ Сервер остановлен (код: {self.server_proc.exitCode()})")
-            self.server_stop_requested = False
-            self.server_stopped.emit()
+
+    def _srv_finished(self, code, exit_status):
+        # Drain bytes that arrived together with process termination before the
+        # diagnostic report snapshots the ring buffer.
+        self._srv_stdout()
+        self._srv_stderr()
+        self.server_last_exit_code = int(code)
+        status_value = int(getattr(exit_status, "value", exit_status))
+        self.server_last_crash_exit = status_value != 0
+        self._notify_server_stopped()
+
+    def _srv_process_error(self, process_error):
+        error_value = int(getattr(process_error, "value", process_error))
+        descriptions = {
+            0: "не удалось запустить процесс",
+            1: "процесс аварийно завершился",
+            2: "истекло время ожидания процесса",
+            3: "ошибка чтения из процесса",
+            4: "ошибка записи в процесс",
+            5: "неизвестная ошибка QProcess",
+        }
+        self.server_last_process_error = descriptions.get(
+            error_value, f"ошибка QProcess {error_value}"
+        )
+        self._emit(
+            f"❌ Ошибка процесса llama-server: {self.server_last_process_error}",
+            "error",
+        )
+        if error_value == 0:
+            self.server_last_exit_code = int(self.server_proc.exitCode())
+            QTimer.singleShot(0, self._notify_server_stopped)
+
+    def _notify_server_stopped(self):
+        if self._server_stop_notified:
+            return
+        self._server_stop_notified = True
+        self.server_last_stop_requested = bool(self.server_stop_requested)
+        self.server_last_runtime_seconds = max(
+            0.0, time.monotonic() - self._server_started_at
+        ) if self._server_started_at else 0.0
+        if self.server_stop_requested and not self.server_last_crash_exit:
+            self._emit("⏹ Сервер остановлен")
+        else:
+            marker = "аварийно" if self.server_last_crash_exit else "неожиданно"
+            self._emit(
+                f"⏹ Сервер остановлен {marker} (код: {self.server_last_exit_code})",
+                "error",
+            )
+        self.server_stop_requested = False
+        self.server_stopped.emit()
 
     def _bench_finished(self, code):
         self.state_changed.emit(False)
@@ -109,6 +178,14 @@ class ServerManager(QObject):
 
     def start_server(self, exe: str, args: list, env: dict | None = None):
         self.server_stop_requested = False
+        self.server_recent_output.clear()
+        self.server_last_exit_code = 0
+        self.server_last_crash_exit = False
+        self.server_last_stop_requested = False
+        self.server_last_process_error = ""
+        self.server_last_runtime_seconds = 0.0
+        self._server_started_at = time.monotonic()
+        self._server_stop_notified = False
         self._prepare_process_environment(self.server_proc, exe, env)
         self.server_proc.start(exe, args)
         self.state_changed.emit(True)
@@ -177,6 +254,7 @@ class ServerManager(QObject):
 
     def terminate_all(self):
         if self.is_server_running():
+            self.server_stop_requested = True
             self.server_proc.terminate()
             if not self.server_proc.waitForFinished(2000):
                 self.server_proc.kill()

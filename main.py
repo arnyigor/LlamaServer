@@ -7,11 +7,12 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +26,16 @@ from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args
 from src.core.cli_parser import parse_llama_server_command
 from src.core.config import ConfigManager
+from src.core.diagnostics import (
+    analyze_server_failure,
+    consume_previous_native_crash,
+    diagnostics_dir,
+    finish_native_crash_capture,
+    format_diagnostic_summary,
+    start_native_crash_capture,
+    write_app_exception_report,
+    write_server_report,
+)
 from src.core.constants import (
     MAX_ACTIVE_TIME_DT,
     STAT_COLOR_CAPTION,
@@ -39,7 +50,7 @@ from src.core.constants import (
     stat_kv,
     stat_sep,
 )
-from src.core.gguf_parser import extract_model_info
+from src.core.gguf_parser import extract_model_info, is_mtp_draft_file
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
 from src.core.metrics_poller import MetricsPoller
 from src.core.server_manager import ServerManager
@@ -50,9 +61,9 @@ from src.services.hf_downloader import (
     HfModelDownloader,
     HfRepoScanner,
     delete_file_safely,
-    find_partial_downloads,
     format_bytes,
     list_all_local_model_entries,
+    list_all_partial_downloads,
     list_local_repo_files,
     lmstudio_repo_dir,
     normalize_hf_repo_id,
@@ -73,7 +84,7 @@ class LlamaGUI:
         self.scanner = None
         self.updater = None
         self.hf_scanner = None
-        self.hf_downloader = None
+        self.hf_downloaders = {}
         self.hf_scan_result = None
         self.autotune = None
         self.autotune_plan = None
@@ -91,6 +102,9 @@ class LlamaGUI:
         self._mtp_fallback_attempted = False
         self._mtp_auto_abort_requested = False
         self._memory_summary_logged = False
+        self._shutting_down = False
+        self.last_diagnostic_path = ""
+        self.last_diagnostic_summary = ""
 
         self.log_mgr = LogManager(self.ui.logs)
         self.log_mgr.speed_updated.connect(self._on_log_speed_updated)
@@ -98,6 +112,8 @@ class LlamaGUI:
         self.ui.autoscroll_logs.toggled.connect(
             lambda checked: setattr(self.log_mgr, "autoscroll", checked)
         )
+        self.ui.copy_last_error_btn.clicked.connect(self.copy_last_error)
+        self.ui.open_diagnostics_btn.clicked.connect(self.open_diagnostics_folder)
         self.metrics = MetricsPoller(poll_interval_ms=250)
         self.metrics.slot_metrics_updated.connect(self._on_slot_metrics_updated)
         self.metrics.server_metrics_updated.connect(self._on_server_metrics_updated)
@@ -106,6 +122,7 @@ class LlamaGUI:
         self._latest_predicted_total = 0
         self._token_baseline_total = 0
         self._saved_token_total = 0
+        self._saved_last_total = 0
         # Baseline-смещения "сессии": total/task токены и активное время
         # отображаются относительно точки Reset session, поэтому следующий
         # опрос /metrics не вернёт старые значения на экран.
@@ -154,6 +171,7 @@ class LlamaGUI:
         u.stop_btn.clicked.connect(self.stop_work)
         u.force_stop_btn.clicked.connect(self.force_stop_server)
         u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
+        u.export_stats_btn.clicked.connect(self.export_runtime_stats)
         u.reset_session_btn.clicked.connect(self.reset_session)
         u.reset_saved_btn.clicked.connect(self.reset_saved_total)
         u.test_btn.clicked.connect(self.run_benchmark)
@@ -170,8 +188,12 @@ class LlamaGUI:
             self._update_local_model_delete_button
         )
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
+        u.hf_downloads.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
+        u.preset_name_combo.activated.connect(
+            lambda _index: self._on_preset_selected()
+        )
         for btn in getattr(u, "ctx_quick_buttons", []):
             btn.clicked.connect(
                 lambda _checked=False, b=btn: self._set_context_size_from_button(
@@ -187,8 +209,10 @@ class LlamaGUI:
         u.kv_unified.stateChanged.connect(self._on_param_changed)
         u.speculative_mtp.stateChanged.connect(self._on_param_changed)
         u.spec_draft_n_max.valueChanged.connect(self._on_param_changed)
+        u.spec_draft_p_min.valueChanged.connect(self._on_param_changed)
         u.spec_draft_gpu_layers.textChanged.connect(self._on_param_changed)
         u.spec_draft_model_path.textChanged.connect(self._on_param_changed)
+        u.spec_draft_model_path.textEdited.connect(self._on_mtp_draft_path_edited)
         u.cuda_device.textChanged.connect(self._on_param_changed)
         u.spec_draft_device.textChanged.connect(self._on_param_changed)
         u.split_mode.currentIndexChanged.connect(self._on_param_changed)
@@ -206,7 +230,15 @@ class LlamaGUI:
         u.ctx_checkpoints.valueChanged.connect(self._on_param_changed)
         u.cache_ram.valueChanged.connect(self._on_param_changed)
         u.temperature.valueChanged.connect(self._on_param_changed)
+        u.top_k.valueChanged.connect(self._on_param_changed)
+        u.top_p.valueChanged.connect(self._on_param_changed)
+        u.min_p.valueChanged.connect(self._on_param_changed)
+        u.typical_p.valueChanged.connect(self._on_param_changed)
         u.repeat_penalty.valueChanged.connect(self._on_param_changed)
+        u.repeat_last_n.valueChanged.connect(self._on_param_changed)
+        u.presence_penalty.valueChanged.connect(self._on_param_changed)
+        u.frequency_penalty.valueChanged.connect(self._on_param_changed)
+        u.seed.valueChanged.connect(self._on_param_changed)
         u.use_mmap.stateChanged.connect(self._on_param_changed)
         u.use_mlock.stateChanged.connect(self._on_param_changed)
         u.verbose.stateChanged.connect(self._on_param_changed)
@@ -234,16 +266,20 @@ class LlamaGUI:
         u.integration_target.currentIndexChanged.connect(self.check_integration_models)
         u.opencode_config_path.editingFinished.connect(self._on_config_path_changed)
         u.pi_config_path.editingFinished.connect(self._on_config_path_changed)
+        u.claude_config_path.editingFinished.connect(self._on_config_path_changed)
         u.exe_path.textChanged.connect(self.auto_detect_bench)
         u.exe_path.textChanged.connect(self.update_cli_preview)
         u.copy_model_btn.clicked.connect(self._copy_model_path)
         u.cli_manual_mode.toggled.connect(self._on_cli_manual_mode_toggled)
         u.cli_apply_btn.clicked.connect(self.apply_cli_preview)
+        u.cli_copy_btn.clicked.connect(self.copy_cli_preview)
+        u.cli_import_btn.clicked.connect(self.import_cli_from_clipboard)
         u._browse_exe_clicked = self.browse_exe
         u._browse_bench_clicked = self.browse_bench
         u._browse_model_dir_clicked = self.browse_model_dir
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
+        u._browse_claude_clicked = self.browse_claude_config
         u._browse_chat_template_clicked = self.browse_chat_template
         u._browse_mtp_draft_clicked = self.browse_mtp_draft_model
         u.save_preset_btn.clicked.connect(self.save_preset)
@@ -392,6 +428,89 @@ class LlamaGUI:
             self._request_token_base[slot_id] = tuple(base_values)
             return value
         return max(value - base_value, 0)
+
+    def _current_request_token_counts(self) -> tuple[int, int]:
+        slots = list(getattr(self, "_last_slots", []) or [])
+        active = [slot for slot in slots if getattr(slot, "is_processing", False)]
+        visible = active or [
+            slot
+            for slot in slots
+            if getattr(slot, "n_prompt_tokens", 0) or getattr(slot, "n_decoded", 0)
+        ]
+        if not visible:
+            return 0, 0
+
+        prompt = sum(
+            self._request_counter_value(slot, "n_prompt_tokens", 0)
+            for slot in visible
+        )
+        generated = sum(
+            self._request_counter_value(slot, "n_decoded", 1) for slot in visible
+        )
+        return max(int(prompt), 0), max(int(generated), 0)
+
+    def _plain_label_text(self, label) -> str:
+        text = str(label.text() if label is not None else "")
+        text = re.sub(r"<[^>]+>", "", text)
+        return (
+            text.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+        )
+
+    def runtime_stats_snapshot(self) -> dict:
+        self._sync_latest_token_totals()
+        request_prompt, request_generated = self._current_request_token_counts()
+        total = max(self._latest_token_total - self._session_base_total, 0)
+        task_total = max(self._latest_token_total - self._token_baseline_total, 0)
+        prompt = max(self._latest_prompt_total - self._session_base_prompt, 0)
+        generated = max(
+            self._latest_predicted_total - self._session_base_predicted, 0
+        )
+        active_prompt_s = max(self._active_prompt_s - self._session_base_active_pp, 0.0)
+        active_generated_s = max(
+            self._active_predicted_s - self._session_base_active_tg, 0.0
+        )
+        model_path = self._current_model_path()
+        return {
+            "schema_version": 1,
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "server": {
+                "running": self.server.is_server_running(),
+                "base_url": self._server_metrics_url(),
+            },
+            "model": {
+                "path": model_path,
+                "id": self.ui.current_model_id(),
+            },
+            "tokens": {
+                "total": int(total),
+                "task": int(task_total),
+                "prompt": int(prompt),
+                "generated": int(generated),
+                "request_prompt": int(request_prompt),
+                "request_generated": int(request_generated),
+                "saved_last": int(getattr(self, "_saved_last_total", 0) or 0),
+                "saved_total": int(getattr(self, "_saved_token_total", 0) or 0),
+            },
+            "time_seconds": {
+                "active_total": active_prompt_s + active_generated_s,
+                "active_prompt": active_prompt_s,
+                "active_generated": active_generated_s,
+                "current_total": self._cur_prompt_s + self._cur_predicted_s,
+                "current_prompt": self._cur_prompt_s,
+                "current_generated": self._cur_predicted_s,
+            },
+            "labels": {
+                "speed": self._plain_label_text(self.ui.speed_label),
+                "tokens": self._plain_label_text(self.ui.tokens_label),
+                "request": self._plain_label_text(self.ui.request_tokens_label),
+                "saved": self._plain_label_text(self.ui.tokens_saved_label),
+                "active_time": self._plain_label_text(self.ui.active_time_label),
+                "current_time": self._plain_label_text(self.ui.current_time_label),
+            },
+        }
 
     def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
         """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
@@ -660,6 +779,7 @@ class LlamaGUI:
 
     def _set_saved_label(self, last_total=None):
         last = max(int(last_total or 0), 0)
+        self._saved_last_total = last
         self.ui.tokens_saved_label.setText(
             "Saved: "
             + stat_sep().join(
@@ -673,6 +793,29 @@ class LlamaGUI:
                 ]
             )
         )
+
+    def export_runtime_stats(self):
+        default_name = f"runtime-stats-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        file_name, _ = QFileDialog.getSaveFileName(
+            self.ui,
+            "Export runtime stats",
+            str(Path.cwd() / default_name),
+            "JSON (*.json);;All files (*.*)",
+        )
+        if not file_name:
+            return
+
+        path = Path(file_name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.runtime_stats_snapshot(), f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except OSError as exc:
+            QMessageBox.critical(self.ui, "Export failed", str(exc))
+            return
+
+        self.log_mgr.append(f"Runtime stats exported: {path}")
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -689,6 +832,19 @@ class LlamaGUI:
         )
         if f:
             self.ui.pi_config_path.setText(f)
+            self.save_settings()
+            self.check_integration_models(silent=True)
+
+    def browse_claude_config(self):
+        start = self.ui.claude_config_path.text().strip()
+        f, _ = QFileDialog.getOpenFileName(
+            self.ui,
+            "Select Claude Code settings.json",
+            start,
+            "JSON (*.json);;All files (*.*)",
+        )
+        if f:
+            self.ui.claude_config_path.setText(f)
             self.save_settings()
             self.check_integration_models(silent=True)
 
@@ -711,6 +867,126 @@ class LlamaGUI:
             else self.ui.showNormal()
         )
         self.tray.show()
+
+    def _shutdown_warn(self, message: str):
+        try:
+            self.log_mgr.append(message, "warn")
+        except Exception:
+            pass
+
+    def _stop_qthread(self, thread, name: str, timeout_ms: int, stop=None) -> bool:
+        if thread is None:
+            return True
+        try:
+            running = thread.isRunning()
+        except RuntimeError:
+            return True
+        if not running:
+            return True
+        try:
+            if stop:
+                stop(thread)
+            else:
+                thread.requestInterruption()
+        except RuntimeError:
+            return True
+        except Exception as exc:
+            self._shutdown_warn(f"{name}: stop request failed: {exc}")
+        try:
+            stopped = thread.wait(timeout_ms)
+        except RuntimeError:
+            return True
+        if not stopped:
+            self._shutdown_warn(
+                f"{name}: still running after {timeout_ms} ms; waiting before exit"
+            )
+            try:
+                thread.wait()
+                stopped = True
+            except RuntimeError:
+                stopped = True
+        return bool(stopped)
+
+    def _dispose_qthread_attr(
+        self, attr_name: str, name: str, timeout_ms: int = 5000, stop=None
+    ) -> bool:
+        thread = getattr(self, attr_name, None)
+        if thread is None:
+            return True
+        stopped = self._stop_qthread(thread, name, timeout_ms, stop=stop)
+        if stopped:
+            try:
+                thread.deleteLater()
+            except RuntimeError:
+                pass
+            if getattr(self, attr_name, None) is thread:
+                setattr(self, attr_name, None)
+        return stopped
+
+    def _stop_hf_downloaders_for_shutdown(self):
+        workers = []
+        for key, task in list(self.hf_downloaders.items()):
+            worker = task.get("worker")
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    task["status"] = "pausing"
+                    worker.pause()
+            except RuntimeError:
+                task["worker"] = None
+                continue
+            workers.append((key, task, worker))
+
+        for key, task, worker in workers:
+            stopped = self._stop_qthread(
+                worker,
+                f"Hugging Face download {key}",
+                65000,
+                stop=lambda thread: thread.pause(),
+            )
+            if stopped:
+                try:
+                    worker.deleteLater()
+                except RuntimeError:
+                    pass
+                task["worker"] = None
+
+    def shutdown_background_work(self):
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._restart_pending = False
+        self._pending_restart_launch = None
+        try:
+            self.save_settings()
+            self.ui.save_ui_state()
+        except Exception as exc:
+            self._shutdown_warn(f"Shutdown settings save failed: {exc}")
+        try:
+            self.metrics.stop()
+        except Exception as exc:
+            self._shutdown_warn(f"Metrics shutdown failed: {exc}")
+        self._dispose_qthread_attr(
+            "autotune",
+            "AutoTune",
+            10000,
+            stop=lambda thread: thread.cancel(),
+        )
+        self._dispose_qthread_attr("scanner", "model scanner", 10000)
+        self._dispose_qthread_attr("hf_scanner", "Hugging Face scanner", 35000)
+        self._dispose_qthread_attr("updater", "llama.cpp updater", 65000)
+        self._stop_hf_downloaders_for_shutdown()
+        try:
+            self.server.terminate_all()
+        except Exception as exc:
+            self._shutdown_warn(f"Server shutdown failed: {exc}")
+        try:
+            self.log_mgr.stop()
+        except Exception:
+            pass
+        if hasattr(self, "tray"):
+            self.tray.hide()
 
     def save_settings(self):
         self.auto_detect_bench()
@@ -856,6 +1132,52 @@ class LlamaGUI:
 
         return None
 
+    def _current_perf_preset_name(self) -> str:
+        combo = getattr(self.ui, "preset_name_combo", None)
+        if combo is None:
+            return "default"
+        return combo.currentText().strip() or "default"
+
+    def _refresh_perf_preset_names(self, selected_name: str = ""):
+        combo = getattr(self.ui, "preset_name_combo", None)
+        if combo is None:
+            return
+
+        selected_name = (selected_name or combo.currentText()).strip() or "default"
+        model_path = self._current_model_path()
+        names = self.config.list_perf_preset_names(model_path) if model_path else ["default"]
+        if selected_name not in names:
+            names.append(selected_name)
+
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(selected_name)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_preset_selected(self):
+        if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
+            return
+
+        model_path = self._current_model_path()
+        if not model_path:
+            return
+
+        preset_name = self._current_perf_preset_name()
+        if self._try_load_perf_preset(
+            model_path,
+            self.ui.ctx_size.value(),
+            preset_name=preset_name,
+        ):
+            self._mark_restart_needed()
+            return
+
+        if hasattr(self.ui, "preset_status"):
+            self.ui.preset_status.setText(f"Preset: none ({preset_name})")
+            self.ui.preset_status.setStyleSheet("color: #888;")
+
     def save_preset(self):
         model_path = self._current_model_path()
         if not model_path:
@@ -883,11 +1205,13 @@ class LlamaGUI:
             autotune_params = self._best_autotune_params()
 
         try:
+            preset_name = self._current_perf_preset_name()
             self.config.save_perf_preset(
                 model_path,
                 ctx,
                 self.ui,
                 autotune_params=autotune_params,
+                preset_name=preset_name,
             )
         except ValueError as e:
             QMessageBox.warning(self.ui, "Error", str(e))
@@ -901,39 +1225,57 @@ class LlamaGUI:
             return
 
         self.log_mgr.append(
-            f"Preset saved: {os.path.basename(model_path)} | ctx={ctx:,}"
+            f"Preset saved: {preset_name} | {os.path.basename(model_path)} | ctx={ctx:,}"
         )
+        self._refresh_perf_preset_names(preset_name)
         if hasattr(self.ui, "preset_status"):
-            self.ui.preset_status.setText(f"Preset: saved ctx={ctx:,}")
+            self.ui.preset_status.setText(f"Preset: saved {preset_name} | ctx={ctx:,}")
             self.ui.preset_status.setStyleSheet("color: #4CAF50;")
         QMessageBox.information(
             self.ui,
             "Saved",
-            f"Parameters for ctx={ctx:,} saved.",
+            f"Parameters for preset '{preset_name}' saved.",
         )
 
-    def _try_load_perf_preset(self, model_path: str, ctx_size: int) -> bool:
-        if not model_path or ctx_size <= 0:
+    def _try_load_perf_preset(
+        self,
+        model_path: str,
+        ctx_size: int,
+        preset_name: str = "",
+    ) -> bool:
+        if not model_path:
             return False
 
         if getattr(self, "_loading_preset", False):
             return False
 
+        preset_name = (preset_name or self._current_perf_preset_name()).strip() or "default"
+        if preset_name == "default" and ctx_size <= 0:
+            return False
+
         self._loading_preset = True
         try:
-            loaded = self.config.load_perf_preset(model_path, ctx_size, self.ui)
+            loaded = self.config.load_perf_preset(
+                model_path,
+                ctx_size,
+                self.ui,
+                preset_name=preset_name,
+            )
         finally:
             self._loading_preset = False
 
         if not loaded:
             return False
 
+        loaded_ctx = self.ui.ctx_size.value()
         self.log_mgr.append(
-            f"Loaded preset: {os.path.basename(model_path)} | ctx={ctx_size:,}"
+            f"Loaded preset: {preset_name} | {os.path.basename(model_path)} | ctx={loaded_ctx:,}"
         )
 
         if hasattr(self.ui, "preset_status"):
-            self.ui.preset_status.setText(f"Preset: loaded ctx={ctx_size:,}")
+            self.ui.preset_status.setText(
+                f"Preset: loaded {preset_name} | ctx={loaded_ctx:,}"
+            )
             self.ui.preset_status.setStyleSheet("color: #4CAF50;")
 
         info = self.ui.models_by_path.get(model_path)
@@ -997,6 +1339,7 @@ class LlamaGUI:
             "GGUF (*.gguf);;All files (*.*)",
         )
         if f:
+            self._set_mtp_manual_draft_path(f)
             self.ui.spec_draft_model_path.setText(f)
             self.ui.speculative_mtp.setChecked(True)
             self.save_settings()
@@ -1120,11 +1463,11 @@ class LlamaGUI:
         entry = self._selected_local_model_entry()
         if not entry:
             return
-        if self.hf_downloader and self.hf_downloader.isRunning():
+        if self._active_hf_downloads():
             QMessageBox.warning(
                 self.ui,
                 "Delete local model",
-                "Stop the Hugging Face download before deleting local models.",
+                "Pause or cancel active Hugging Face downloads before deleting local models.",
             )
             return
 
@@ -1233,6 +1576,12 @@ class LlamaGUI:
             partial = self._hf_partial_info(file_info)
             if partial:
                 partial_count += 1
+                self._upsert_hf_partial_task(
+                    result.get("repo_id") or "",
+                    file_info,
+                    partial,
+                    model_dir=self.ui.model_dir.text().strip(),
+                )
             self.ui.hf_files.addItem(self._hf_file_display(file_info))
             item = self.ui.hf_files.item(self.ui.hf_files.count() - 1)
             item.setData(Qt.ItemDataRole.UserRole, file_info)
@@ -1292,23 +1641,29 @@ class LlamaGUI:
 
     def _refresh_hf_partial_status(self):
         model_dir = self.ui.model_dir.text().strip()
-        repo_text = self.ui.hf_repo.text().strip()
-        if not model_dir or not repo_text:
+        if not model_dir:
             return
         try:
-            repo_id = normalize_hf_repo_id(repo_text)
-            partials = find_partial_downloads(Path(model_dir), repo_id)
+            partials = list_all_partial_downloads(Path(model_dir))
         except Exception:
             return
         if not partials:
             return
+        for partial in partials:
+            file_info = {
+                "name": partial.get("name") or "",
+                "rfilename": partial.get("rfilename") or "",
+                "size": 0,
+            }
+            self._upsert_hf_partial_task(
+                partial.get("repo_id") or "", file_info, partial, model_dir=model_dir
+            )
         total = sum(int(p.get("partial_size") or 0) for p in partials)
         self.ui.hf_status.setText(
-            f"Найдены незавершённые HF загрузки: {len(partials)}, "
-            f"сохранено {format_bytes(total)}. Нажмите Scan HF, затем Download selected — "
-            "загрузка продолжится с .part."
+            f"Незавершённые загрузки: {len(partials)}, сохранено {format_bytes(total)}. "
+            "Они уже показаны в списке; Scan HF добавит полный размер и точный процент."
         )
-        self.refresh_hf_local_files(silent=True)
+        self._update_hf_download_button()
 
     def _current_hf_repo_id(self):
         if self.hf_scan_result and self.hf_scan_result.get("repo_id"):
@@ -1356,13 +1711,15 @@ class LlamaGUI:
             self.ui.hf_status.setText(f"Local folder not found: {info.get('root')}")
 
     def delete_hf_local_folder(self):
-        if self.hf_downloader and self.hf_downloader.isRunning():
+        repo_id = self._current_hf_repo_id()
+        if self._active_hf_downloads(repo_id):
             QMessageBox.warning(
-                self.ui, "Hugging Face", "Stop the download before deleting local files"
+                self.ui,
+                "Hugging Face",
+                "Stop all downloads for this repository before deleting local files",
             )
             return
         model_dir = self.ui.model_dir.text().strip()
-        repo_id = self._current_hf_repo_id()
         if not model_dir or not repo_id:
             return
         target_root = lmstudio_repo_dir(Path(model_dir), repo_id)
@@ -1398,40 +1755,115 @@ class LlamaGUI:
         return self._hf_partial_info(file_info) if file_info else {}
 
     def _update_hf_download_button(self):
-        is_running = bool(self.hf_downloader and self.hf_downloader.isRunning())
         has_selection = bool(self.ui.hf_files.selectedItems())
         has_partial = bool(self._selected_hf_partial_info())
+        count = len(self.ui.hf_files.selectedItems())
         self.ui.hf_download_btn.setText(
-            "Resume selected" if has_partial and not is_running else "Download selected"
+            f"{'Resume' if has_partial else 'Download'} selected models"
+            + (f" ({count})" if count > 1 else "")
         )
-        self.ui.hf_download_btn.setEnabled(has_selection and not is_running)
-        self.ui.hf_pause_btn.setEnabled(is_running)
-        self.ui.hf_cancel_btn.setEnabled(is_running or (has_partial and not is_running))
-        self.ui.hf_cancel_btn.setToolTip(
-            "Cancel running download and delete .part"
-            if is_running
-            else "Delete saved .part for selected file"
-            if has_partial
-            else "No partial download selected"
+        self.ui.hf_download_btn.setEnabled(has_selection)
+
+        selected_task_keys = self._selected_hf_task_keys()
+        selected_running = any(
+            self.hf_downloaders.get(key, {}).get("worker")
+            and self.hf_downloaders[key]["worker"].isRunning()
+            for key in selected_task_keys
+        )
+        self.ui.hf_pause_btn.setEnabled(selected_running)
+        self.ui.hf_cancel_btn.setEnabled(
+            bool(selected_task_keys) or (has_partial and not selected_running)
         )
 
-    def _set_hf_download_controls_locked(self, locked):
-        for widget in (
-            self.ui.hf_repo,
-            self.ui.hf_quant_filter,
-            self.ui.hf_scan_btn,
-            self.ui.hf_include_mmproj,
-            self.ui.hf_files,
-        ):
-            widget.setEnabled(not locked)
-        if locked:
-            self.ui.hf_download_btn.setText("Download selected")
-            self.ui.hf_download_btn.setEnabled(False)
-            self.ui.hf_pause_btn.setEnabled(True)
-            self.ui.hf_cancel_btn.setEnabled(True)
-            self.ui.hf_cancel_btn.setToolTip("Cancel running download and delete .part")
-        else:
-            self._update_hf_download_button()
+    @staticmethod
+    def _hf_task_key(repo_id, file_info):
+        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
+        return f"{repo_id}::{filename}"
+
+    def _selected_hf_task_keys(self):
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole) or "")
+            for item in self.ui.hf_downloads.selectedItems()
+            if item.data(Qt.ItemDataRole.UserRole)
+        ]
+
+    def _active_hf_downloads(self, repo_id=None):
+        active = []
+        for task in self.hf_downloaders.values():
+            worker = task.get("worker")
+            if worker and worker.isRunning() and (
+                repo_id is None or task.get("repo_id") == repo_id
+            ):
+                active.append(task)
+        return active
+
+    def _set_hf_task_display(self, task_key):
+        task = self.hf_downloaders.get(task_key)
+        if not task:
+            return
+        item = task.get("item")
+        if item is None:
+            return
+        name = task.get("name") or task_key
+        percent_value = task.get("percent")
+        percent = f"{int(percent_value):3d}%" if percent_value is not None else "  —%"
+        status = task.get("status") or "queued"
+        message = str(task.get("message") or "").strip()
+        headline = f"{name}  |  {percent}  |  {status}"
+        item.setText(f"{headline}\n{message}" if message else headline)
+        item.setToolTip(message)
+
+    def _upsert_hf_partial_task(self, repo_id, file_info, partial, model_dir=None):
+        """Show a saved .part immediately, even before its repository is scanned."""
+        if not repo_id or not file_info or not partial:
+            return
+        task_key = self._hf_task_key(repo_id, file_info)
+        previous = self.hf_downloaders.get(task_key, {})
+        worker = previous.get("worker")
+        if worker and worker.isRunning():
+            return
+
+        item = previous.get("item")
+        if item is None:
+            self.ui.hf_downloads.addItem("")
+            item = self.ui.hf_downloads.item(self.ui.hf_downloads.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, task_key)
+
+        saved = int(partial.get("partial_size") or 0)
+        expected = int(file_info.get("size") or partial.get("expected_size") or 0)
+        percent = min(99, int(saved * 100 / expected)) if expected else None
+        saved_text = partial.get("partial_size_text") or format_bytes(saved)
+        total_text = format_bytes(expected) if expected else "размер уточняется"
+        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
+        self.hf_downloaders[task_key] = {
+            "worker": None,
+            "repo_id": repo_id,
+            "file_info": dict(file_info),
+            "model_dir": model_dir or self.ui.model_dir.text().strip(),
+            "name": f"{repo_id} / {filename}",
+            "percent": percent,
+            "status": "paused / resumable",
+            "message": (
+                f"Сохранено: {saved_text} / {total_text}\n"
+                f"{partial.get('partial_path') or ''}"
+            ),
+            "item": item,
+        }
+        self._set_hf_task_display(task_key)
+
+    def _refresh_hf_download_summary(self):
+        active = self._active_hf_downloads()
+        if active:
+            average = int(sum(int(task.get("percent") or 0) for task in active) / len(active))
+            self.ui.hf_progress.setRange(0, 100)
+            self.ui.hf_progress.setValue(average)
+            self.ui.hf_progress.setVisible(True)
+            self.ui.hf_status.setText(
+                f"Параллельные загрузки: {len(active)} | общий прогресс ~{average}%"
+            )
+        elif self.hf_downloaders:
+            self.ui.hf_progress.setVisible(False)
+        self._update_hf_download_button()
 
     def _select_hf_projector(self):
         if not self.hf_scan_result:
@@ -1458,9 +1890,6 @@ class LlamaGUI:
         return projectors[0]
 
     def download_hf_selection(self):
-        if self.hf_downloader and self.hf_downloader.isRunning():
-            return
-
         if not self.hf_scan_result:
             QMessageBox.warning(
                 self.ui, "Hugging Face", "Сначала просканируйте репозиторий"
@@ -1472,77 +1901,186 @@ class LlamaGUI:
                 self.ui, "Hugging Face", "Выберите GGUF файл для скачивания"
             )
             return
-        selected_partial = self._selected_hf_partial_info()
         model_dir = self.ui.model_dir.text().strip()
         if not model_dir:
             QMessageBox.warning(self.ui, "Hugging Face", "Укажите базовую папку Models")
             return
 
-        main_file = selected[0].data(Qt.ItemDataRole.UserRole)
-        files = [main_file]
+        files = [item.data(Qt.ItemDataRole.UserRole) for item in selected]
         if self.ui.hf_include_mmproj.isChecked():
             projector = self._select_hf_projector()
-            if projector and projector.get("rfilename") != main_file.get("rfilename"):
+            selected_names = {
+                str(file_info.get("rfilename") or file_info.get("name") or "")
+                for file_info in files
+            }
+            projector_name = str(
+                (projector or {}).get("rfilename") or (projector or {}).get("name") or ""
+            )
+            if projector and projector_name not in selected_names:
                 files.append(projector)
 
         repo_id = self.hf_scan_result.get("repo_id") or ""
+        files = [
+            file_info
+            for file_info in files
+            if file_info
+            and not (
+                self.hf_downloaders.get(self._hf_task_key(repo_id, file_info), {}).get("worker")
+                and self.hf_downloaders[self._hf_task_key(repo_id, file_info)]["worker"].isRunning()
+            )
+        ]
+        if not files:
+            self.ui.hf_status.setText("Все выбранные файлы уже скачиваются")
+            return
         target_root = lmstudio_repo_dir(Path(model_dir), repo_id)
         total_size = sum(int(f.get("size") or 0) for f in files)
         names = "\n".join(f"• {self._hf_file_display(f)}" for f in files)
         size_line = f"\nTotal: {format_bytes(total_size)}" if total_size else ""
-        action_title = "Resume GGUF" if selected_partial else "Download GGUF"
-        action_text = "Продолжить загрузку" if selected_partial else "Скачать"
-        resume_line = (
-            f"\nResume from: {selected_partial.get('partial_size_text')}"
-            if selected_partial
-            else ""
-        )
         reply = QMessageBox.question(
             self.ui,
-            action_title,
-            f"{action_text} в LM Studio-compatible папку:\n{target_root}\n\n"
-            f"{names}{size_line}{resume_line}",
+            "Download GGUF models",
+            f"Запустить {len(files)} параллельных загрузок в LM Studio-compatible папку:\n"
+            f"{target_root}\n\n{names}{size_line}",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self.ui.hf_download_btn.setText("Download selected")
-        self._set_hf_download_controls_locked(True)
-        self.ui.hf_progress.setRange(0, 100)
-        self.ui.hf_progress.setValue(0)
-        self.ui.hf_progress.setVisible(True)
-        self.ui.hf_status.setText(
-            f"Начало скачивания: {len(files)} файл(а), total {format_bytes(total_size)}"
-        )
+        self.ui.hf_downloads.clearSelection()
+        for file_info in files:
+            self._start_hf_download_task(repo_id, file_info, model_dir)
+        self._refresh_hf_download_summary()
 
-        self.hf_downloader = HfModelDownloader(repo_id, files, model_dir)
-        self.hf_downloader.progress.connect(self.ui.hf_status.setText)
-        self.hf_downloader.percent.connect(self.ui.hf_progress.setValue)
-        self.hf_downloader.completed.connect(self._on_hf_download_completed)
-        self.hf_downloader.finished.connect(self._on_hf_download_finished)
-        self.hf_downloader.start()
+    def _start_hf_download_task(self, repo_id, file_info, model_dir):
+        task_key = self._hf_task_key(repo_id, file_info)
+        previous = self.hf_downloaders.get(task_key, {})
+        item = previous.get("item")
+        if item is None:
+            self.ui.hf_downloads.addItem("")
+            item = self.ui.hf_downloads.item(self.ui.hf_downloads.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, task_key)
+
+        worker = HfModelDownloader(repo_id, [file_info], model_dir)
+        filename = str(file_info.get("rfilename") or file_info.get("name") or "")
+        self.hf_downloaders[task_key] = {
+            "worker": worker,
+            "repo_id": repo_id,
+            "file_info": file_info,
+            "model_dir": model_dir,
+            "name": filename,
+            "percent": 0,
+            "status": "starting",
+            "message": "",
+            "item": item,
+        }
+        item.setSelected(True)
+        self._set_hf_task_display(task_key)
+        worker.progress.connect(
+            lambda message, key=task_key: self._on_hf_task_progress(key, message)
+        )
+        worker.percent.connect(
+            lambda percent, key=task_key: self._on_hf_task_percent(key, percent)
+        )
+        worker.completed.connect(
+            lambda ok, message, key=task_key: self._on_hf_task_completed(key, ok, message)
+        )
+        worker.finished.connect(lambda key=task_key: self._on_hf_task_finished(key))
+        worker.start()
+
+    def _on_hf_task_progress(self, task_key, message):
+        task = self.hf_downloaders.get(task_key)
+        if not task:
+            return
+        task["status"] = "downloading"
+        task["message"] = message
+        self._set_hf_task_display(task_key)
+
+    def _on_hf_task_percent(self, task_key, percent):
+        task = self.hf_downloaders.get(task_key)
+        if not task:
+            return
+        task["percent"] = int(percent)
+        self._set_hf_task_display(task_key)
+        self._refresh_hf_download_summary()
 
     def pause_hf_download(self):
-        if self.hf_downloader and self.hf_downloader.isRunning():
-            self.hf_downloader.pause()
-            self.ui.hf_pause_btn.setEnabled(False)
-            self.ui.hf_cancel_btn.setEnabled(False)
-            self.ui.hf_status.setText("Пауза: сохраняю .part для докачки...")
+        paused = 0
+        for key in self._selected_hf_task_keys():
+            task = self.hf_downloaders.get(key, {})
+            worker = task.get("worker")
+            if worker and worker.isRunning():
+                task["status"] = "pausing"
+                worker.pause()
+                self._set_hf_task_display(key)
+                paused += 1
+        if paused:
+            self.ui.hf_status.setText(
+                f"Пауза {paused} загрузок: сохраняю .part для докачки..."
+            )
 
     def cancel_hf_download(self):
-        if self.hf_downloader and self.hf_downloader.isRunning():
+        selected_keys = self._selected_hf_task_keys()
+        running_keys = [
+            key
+            for key in selected_keys
+            if self.hf_downloaders.get(key, {}).get("worker")
+            and self.hf_downloaders[key]["worker"].isRunning()
+        ]
+        if running_keys:
             reply = QMessageBox.question(
                 self.ui,
-                "Cancel download",
-                "Прервать текущую загрузку и удалить частичный .part файл?\n\n"
+                "Cancel downloads",
+                f"Прервать выбранные загрузки ({len(running_keys)}) и удалить их .part?\n\n"
                 "Если хотите продолжить позже — нажмите Pause вместо Cancel.",
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            self.hf_downloader.cancel_and_delete()
-            self.ui.hf_pause_btn.setEnabled(False)
-            self.ui.hf_cancel_btn.setEnabled(False)
-            self.ui.hf_status.setText("Отмена: удаляю частичный .part файл...")
+            for key in running_keys:
+                task = self.hf_downloaders[key]
+                task["status"] = "cancelling"
+                task["worker"].cancel_and_delete()
+                self._set_hf_task_display(key)
+            self.ui.hf_status.setText(
+                f"Отмена {len(running_keys)} загрузок: удаляю частичные .part..."
+            )
+            return
+
+        saved_partials = []
+        for key in selected_keys:
+            task = self.hf_downloaders.get(key, {})
+            file_info = task.get("file_info") or {}
+            filename = str(
+                file_info.get("rfilename") or file_info.get("name") or ""
+            )
+            if not filename:
+                continue
+            partial_info = partial_download_info(
+                Path(task.get("model_dir") or self.ui.model_dir.text().strip()),
+                str(task.get("repo_id") or ""),
+                filename,
+                int(file_info.get("size") or 0),
+            )
+            if partial_info:
+                saved_partials.append((key, partial_info))
+        if saved_partials:
+            reply = QMessageBox.question(
+                self.ui,
+                "Delete partial downloads",
+                f"Удалить сохранённые .part выбранных задач ({len(saved_partials)})?",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for key, partial_info in saved_partials:
+                delete_file_safely(Path(partial_info.get("partial_path") or ""))
+                task = self.hf_downloaders.get(key, {})
+                task["status"] = "cancelled"
+                task["percent"] = 0
+                task["message"] = "Частичный .part удалён"
+                self._set_hf_task_display(key)
+            self.ui.hf_status.setText(
+                f"Удалено частичных загрузок: {len(saved_partials)}"
+            )
+            self.refresh_hf_local_files(silent=True)
+            self._update_hf_download_button()
             return
 
         partial = self._selected_hf_partial_info()
@@ -1569,36 +2107,25 @@ class LlamaGUI:
         self.refresh_hf_local_files(silent=True)
         self._update_hf_download_button()
 
-    def _on_hf_download_finished(self):
-        item = self.ui.hf_files.currentItem()
-        file_info = self._selected_hf_file_info()
-        if item and file_info:
-            partial = self._hf_partial_info(file_info)
-            item.setText(self._hf_file_display(file_info))
-            item.setToolTip(
-                f"Partial file: {partial.get('partial_path')}" if partial else ""
-            )
-        self._set_hf_download_controls_locked(False)
+    def _on_hf_task_finished(self, task_key):
         self.refresh_hf_local_files(silent=True)
         self.refresh_local_model_manager(silent=True)
-        self._update_hf_download_button()
+        self._refresh_hf_download_summary()
 
-    def _on_hf_download_completed(self, ok, message):
-        if ok:
-            self.ui.hf_progress.setValue(100)
-            QTimer.singleShot(1500, self._reset_hf_progress_after_complete)
-        self.ui.hf_status.setText(message)
+    def _on_hf_task_completed(self, task_key, ok, message):
+        task = self.hf_downloaders.get(task_key)
+        if task:
+            task["status"] = "complete" if ok else "stopped"
+            task["message"] = message
+            if ok:
+                task["percent"] = 100
+            self._set_hf_task_display(task_key)
         self.log_mgr.append(message, "info" if ok else "error")
         self.refresh_hf_local_files(silent=True)
         self.refresh_local_model_manager(silent=True)
         if ok:
             self.scan_models(silent=True)
-
-    def _reset_hf_progress_after_complete(self):
-        if self.hf_downloader and self.hf_downloader.isRunning():
-            return
-        self.ui.hf_progress.setValue(0)
-        self.ui.hf_progress.setVisible(False)
+        self._refresh_hf_download_summary()
 
     def on_models_found(self, models):
         self.ui.models = models
@@ -1632,6 +2159,13 @@ class LlamaGUI:
         info = self.ui.models_by_path.get(path) or extract_model_info(path)
         info.setdefault("path", path)
         info.setdefault("_model_path", path)
+        cached_draft = str(info.get("mtp_draft_path") or "").strip()
+        if cached_draft and (
+            not os.path.isfile(cached_draft)
+            or not is_mtp_draft_file(cached_draft)
+        ):
+            # A model scan may have cached a draft that the user deleted later.
+            info["mtp_draft_path"] = ""
         self.ui.models_by_path[path] = info
 
         arch = info.get("architecture") or "?"
@@ -1686,6 +2220,7 @@ class LlamaGUI:
         self._refresh_tooltips(info)
 
         self.config.settings.last_model_path = path
+        self._refresh_perf_preset_names()
 
         if self.ui.auto_params.isChecked() and not self.ui.loading_profile:
             self._loading_preset = True
@@ -1703,9 +2238,18 @@ class LlamaGUI:
 
     def _sync_mtp_controls_for_model(self, info):
         is_mtp = self._is_mtp_model_info(info)
-        draft_path = str(info.get("mtp_draft_path") or "").strip()
+        manual_draft = self._mtp_manual_draft_path(info)
+        detected_draft = str(info.get("mtp_draft_path") or "").strip()
+        auto_draft = ""
+        if (
+            detected_draft
+            and os.path.isfile(detected_draft)
+            and not self._is_mtp_draft_auto_disabled(info)
+        ):
+            auto_draft = detected_draft
         for widget in (
             self.ui.spec_draft_n_max,
+            self.ui.spec_draft_p_min,
             self.ui.spec_draft_gpu_layers,
             self.ui.spec_draft_model_path,
             self.ui.spec_draft_model_btn,
@@ -1714,19 +2258,31 @@ class LlamaGUI:
             widget.setEnabled(is_mtp)
         self.ui.speculative_mtp.setEnabled(is_mtp)
         if is_mtp:
-            current_draft = self.ui.spec_draft_model_path.text().strip()
-            if self._uses_embedded_mtp_mode(info):
-                if current_draft == draft_path or "mtp-gemma" in current_draft.lower():
-                    self.ui.spec_draft_model_path.clear()
+            if manual_draft and os.path.isfile(manual_draft):
+                self.ui.spec_draft_model_path.setText(manual_draft)
+                self.ui.speculative_mtp.setChecked(True)
+                self.ui.spec_draft_model_path.setPlaceholderText(
+                    "Manually selected draft GGUF"
+                )
+            elif self._uses_embedded_mtp_mode(info):
+                self.ui.spec_draft_model_path.clear()
                 self.ui.spec_draft_model_path.setPlaceholderText(
                     "Auto: embedded/package MTP mode, no --model-draft"
                 )
-            elif draft_path and (
-                not current_draft or not os.path.exists(current_draft)
-            ):
-                self.ui.spec_draft_model_path.setText(draft_path)
+            elif auto_draft:
+                self.ui.spec_draft_model_path.setText(auto_draft)
+                self.ui.speculative_mtp.setChecked(True)
+                self.ui.spec_draft_model_path.setPlaceholderText(
+                    "Auto-detected nearby MTP draft GGUF"
+                )
+            else:
+                self.ui.spec_draft_model_path.clear()
+                self.ui.speculative_mtp.setChecked(False)
+                self.ui.spec_draft_model_path.setPlaceholderText(
+                    "No compatible nearby draft detected — choose manually with ..."
+                )
             self.ui.speculative_mtp.setToolTip(
-                "Enable llama.cpp MTP speculative decoding automatically. Gemma 4 regular GGUF uses package/embedded mode; QAT/manual modes can use a separate draft GGUF."
+                "Enable MTP speculative decoding. A nearby draft is auto-detected; clearing the field disables auto-selection for this model."
             )
             return
 
@@ -1788,6 +2344,86 @@ class LlamaGUI:
         ).lower()
         return "mtp" in text
 
+    @staticmethod
+    def _mtp_model_key(model_path):
+        text = str(model_path or "").strip()
+        if not text:
+            return ""
+        return os.path.normcase(os.path.abspath(text))
+
+    def _mtp_info_model_key(self, info=None):
+        info = info or {}
+        model_path = (
+            info.get("path")
+            or info.get("_model_path")
+            or self._current_model_path()
+        )
+        return self._mtp_model_key(model_path)
+
+    def _is_mtp_draft_auto_disabled(self, info=None):
+        model_key = self._mtp_info_model_key(info)
+        disabled = getattr(
+            self.config.settings, "spec_draft_auto_disabled_models", []
+        )
+        if not model_key or not isinstance(disabled, list):
+            return False
+        return model_key in {self._mtp_model_key(path) for path in disabled}
+
+    def _set_mtp_draft_auto_disabled(self, disabled, info=None):
+        model_key = self._mtp_info_model_key(info)
+        if not model_key:
+            return
+        saved = getattr(
+            self.config.settings, "spec_draft_auto_disabled_models", []
+        )
+        saved = saved if isinstance(saved, list) else []
+        normalized = {
+            self._mtp_model_key(path) for path in saved if str(path or "").strip()
+        }
+        if disabled:
+            normalized.add(model_key)
+        else:
+            normalized.discard(model_key)
+        self.config.settings.spec_draft_auto_disabled_models = sorted(normalized)
+
+    def _mtp_manual_draft_path(self, info=None):
+        model_key = self._mtp_info_model_key(info)
+        saved = getattr(self.config.settings, "spec_draft_manual_paths", {})
+        if not model_key or not isinstance(saved, dict):
+            return ""
+        for saved_model, draft_path in saved.items():
+            if self._mtp_model_key(saved_model) == model_key:
+                return str(draft_path or "").strip()
+        return ""
+
+    def _set_mtp_manual_draft_path(self, draft_path, info=None):
+        model_key = self._mtp_info_model_key(info)
+        if not model_key:
+            return
+        saved = getattr(self.config.settings, "spec_draft_manual_paths", {})
+        saved = dict(saved) if isinstance(saved, dict) else {}
+        normalized = {
+            self._mtp_model_key(saved_model): str(path or "").strip()
+            for saved_model, path in saved.items()
+            if str(saved_model or "").strip() and str(path or "").strip()
+        }
+        text = str(draft_path or "").strip()
+        if text:
+            normalized[model_key] = text
+        else:
+            normalized.pop(model_key, None)
+        self.config.settings.spec_draft_manual_paths = normalized
+        self._set_mtp_draft_auto_disabled(not bool(text), info)
+
+    def _on_mtp_draft_path_edited(self, text):
+        # textEdited is emitted only for a user edit, not for automatic setText().
+        # Therefore an empty value is an explicit request not to auto-add draft.
+        self._set_mtp_manual_draft_path(text)
+        if str(text or "").strip() and os.path.isfile(str(text).strip()):
+            self.ui.speculative_mtp.setChecked(True)
+        self.config.read_from_ui(self.ui)
+        self.config.save()
+
     def _uses_embedded_mtp_mode(self, info):
         """True when llama.cpp should use --spec-type draft-mtp without --model-draft."""
         arch = str(info.get("architecture") or "").lower()
@@ -1795,25 +2431,29 @@ class LlamaGUI:
             str(info.get(k) or "") for k in ("path", "name", "display", "_model_path")
         ).lower()
         return (
-            arch.startswith("gemma4")
+            arch.startswith(("gemma4", "qwen"))
             and bool(info.get("mtp_capable"))
             and not info.get("is_qat")
             and "qat" not in name_text
         )
 
     def _auto_mtp_supported(self, info):
-        """Auto-enable MTP only for known-safe embedded mode or a local draft.
-
-        Для LM Studio layout ищем draft только внутри папки выбранной модели.
-        Соседние модели не используются, чтобы не подставить несовместимый
-        Qwen/Gemma draft и не получить GGML_ASSERT по ширине embedding.
-        Если ручной draft всё же несовместим, приложение сделает fallback без MTP.
-        """
-        return bool(self._uses_embedded_mtp_mode(info) or info.get("mtp_draft_path"))
+        """Auto-enable known embedded MTP or an available non-disabled nearby draft."""
+        if self._uses_embedded_mtp_mode(info):
+            return True
+        draft_path = str(info.get("mtp_draft_path") or "").strip()
+        return bool(
+            draft_path
+            and os.path.isfile(draft_path)
+            and not self._is_mtp_draft_auto_disabled(info)
+        )
 
     def _auto_mtp_draft_path(self, info):
         if not self._auto_mtp_supported(info) or self._uses_embedded_mtp_mode(info):
             return ""
+        manual_draft = self._mtp_manual_draft_path(info)
+        if manual_draft and os.path.isfile(manual_draft):
+            return manual_draft
         return str(info.get("mtp_draft_path") or "").strip()
 
     def _apply_mtp_recommended_params(self, info):
@@ -1834,7 +2474,8 @@ class LlamaGUI:
             self.ui.spec_draft_model_path.setText(draft_path)
         else:
             self.ui.spec_draft_model_path.clear()
-        self.ui.spec_draft_n_max.setValue(2)
+        self.ui.spec_draft_n_max.setValue(8)
+        self.ui.spec_draft_p_min.setValue(0.8)
         self.ui.spec_draft_gpu_layers.setText("all")
         self.ui.cuda_device.setText("CUDA0")
         self.ui.spec_draft_device.setText("CUDA0")
@@ -1864,7 +2505,7 @@ class LlamaGUI:
             self.ui.speculative_mtp.setChecked(False)
             self.ui.spec_draft_model_path.clear()
             self.log_mgr.append(
-                "MTP auto: not enabled. No embedded MTP metadata and no nearby MTP draft GGUF was found.",
+                "MTP auto: not enabled. Separate draft GGUF files require explicit manual selection.",
                 "warn",
             )
         if str(info.get("architecture") or "").lower().startswith("gemma4") or info.get(
@@ -1937,7 +2578,7 @@ class LlamaGUI:
 
         preset_loaded = False
         model_path = self._current_model_path()
-        if model_path:
+        if model_path and self._current_perf_preset_name() == "default":
             preset_loaded = self._try_load_perf_preset(model_path, ctx_size)
 
         if not preset_loaded:
@@ -2036,6 +2677,9 @@ class LlamaGUI:
             settings = dict(parsed.settings)
             settings["extra_args"] = parsed.extra_args
             self.config.apply_values_to_ui(self.ui, settings)
+            self._set_mtp_manual_draft_path(
+                settings.get("spec_draft_model_path", "")
+            )
         finally:
             self._applying_cli = False
 
@@ -2057,6 +2701,29 @@ class LlamaGUI:
             self.log_mgr.append(f"CLI applied; extra params: {parsed.extra_args}")
         else:
             self.log_mgr.append("CLI applied")
+
+    def copy_cli_preview(self):
+        self.update_cli_preview(force=True)
+        text = self.ui.cli_preview.text().strip()
+        if not text:
+            self.ui.cli_status.setText("CLI is empty")
+            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            return
+
+        QApplication.clipboard().setText(text)
+        self.ui.cli_status.setText("CLI copied")
+        self.ui.cli_status.setStyleSheet("color: #4CAF50;")
+        self.log_mgr.append("CLI copied to clipboard")
+
+    def import_cli_from_clipboard(self):
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            self.ui.cli_status.setText("Clipboard is empty")
+            self.ui.cli_status.setStyleSheet("color: #f44336;")
+            return
+
+        self.ui.cli_preview.setText(text)
+        self.apply_cli_preview()
 
     def update_cli_preview(self, force: bool = False):
         if self._cli_manual_enabled() and not force:
@@ -2407,8 +3074,14 @@ class LlamaGUI:
             self._mark_mtp_launch_failed("failed to create MTP context", fatal=True)
         elif (
             "failed to load draft model" in lower_text
-            or "common_speculative_init_result" in lower_text
             or "invalid vector subscript" in lower_text
+            or (
+                "common_speculative_init_result" in lower_text
+                and any(
+                    marker in lower_text
+                    for marker in ("failed", "error", "invalid", "exception")
+                )
+            )
         ):
             self._mark_mtp_launch_failed("draft GGUF failed to load", fatal=True)
         elif (
@@ -2520,14 +3193,155 @@ class LlamaGUI:
         )
         return True
 
+    def _record_server_diagnostic(self, exit_code: int):
+        output = self.server.recent_server_output()
+        result = analyze_server_failure(
+            exit_code,
+            output,
+            crash_exit=self.server.server_last_crash_exit,
+            stop_requested=self.server.server_last_stop_requested,
+            process_error=self.server.server_last_process_error,
+        )
+        if not result:
+            return None
+
+        exe = ""
+        args = []
+        env = {}
+        if self._last_server_launch:
+            exe, args, env = self._last_server_launch
+        report_path = ""
+        try:
+            report_path = str(
+                write_server_report(
+                    result,
+                    executable=exe,
+                    args=args,
+                    env=env,
+                    output=output,
+                    process_error=self.server.server_last_process_error,
+                    runtime_seconds=self.server.server_last_runtime_seconds,
+                )
+            )
+        except OSError as exc:
+            result["action"] += f" Не удалось записать отчёт: {exc}"
+
+        summary = format_diagnostic_summary(result, report_path)
+        self.last_diagnostic_path = report_path
+        self.last_diagnostic_summary = summary
+        self.ui.copy_last_error_btn.setEnabled(True)
+        self.log_mgr.append(summary, "error")
+        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
+        return result
+
+    def _record_preflight_diagnostic(self, cause: str, action: str):
+        result = {
+            "cause": cause,
+            "action": action,
+            "exit_code": "процесс не запущен",
+        }
+        summary = format_diagnostic_summary(result)
+        self.last_diagnostic_path = ""
+        self.last_diagnostic_summary = summary
+        self.ui.copy_last_error_btn.setEnabled(True)
+        self.log_mgr.append(summary, "error")
+        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
+
+    def copy_last_error(self):
+        if not self.last_diagnostic_summary:
+            return
+        text = self.last_diagnostic_summary
+        if self.last_diagnostic_path:
+            try:
+                report = Path(self.last_diagnostic_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                text += f"\n\n{report}"
+            except OSError:
+                pass
+        QApplication.clipboard().setText(text)
+        self.ui.copy_last_error_btn.setText("Copied")
+        QTimer.singleShot(1500, lambda: self.ui.copy_last_error_btn.setText("Copy last error"))
+
+    def open_diagnostics_folder(self):
+        folder = diagnostics_dir()
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            QMessageBox.warning(self.ui, "Diagnostics", str(exc))
+
+    def show_previous_native_crash(self, report_path: Path):
+        self.last_diagnostic_path = str(report_path)
+        self.last_diagnostic_summary = (
+            "❌ ДИАГНОСТИКА\n"
+            "Причина: в предыдущем сеансе аварийно завершилось само приложение.\n"
+            "Что сделать: откройте отчёт; там сохранены Python-потоки на момент сбоя.\n"
+            f"Полный отчёт: {report_path}"
+        )
+        self.ui.copy_last_error_btn.setEnabled(True)
+        self.log_mgr.append(self.last_diagnostic_summary, "error")
+        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
+
+    def handle_unhandled_exception(self, exc_type, exc_value, exc_traceback):
+        exception_text = "".join(
+            traceback.format_exception(exc_type, exc_value, exc_traceback)
+        )
+        try:
+            report_path = write_app_exception_report(exception_text)
+            self.last_diagnostic_path = str(report_path)
+        except OSError:
+            self.last_diagnostic_path = ""
+        self.last_diagnostic_summary = (
+            "❌ ДИАГНОСТИКА\n"
+            f"Причина: необработанная ошибка интерфейса: {exc_value}\n"
+            "Что сделать: скопируйте отчёт кнопкой Copy last error.\n"
+            f"Полный отчёт: {self.last_diagnostic_path or 'записать не удалось'}"
+        )
+        self.ui.copy_last_error_btn.setEnabled(True)
+        self.log_mgr.append(self.last_diagnostic_summary, "error")
+        self.log_mgr.append(exception_text, "error")
+        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
+
+    def handle_qt_message(self, message_type, context, message):
+        location = ""
+        if getattr(context, "file", None):
+            location = f" ({context.file}:{getattr(context, 'line', 0)})"
+        text = f"Qt: {message}{location}"
+        serious = message_type in {
+            QtMsgType.QtCriticalMsg,
+            QtMsgType.QtFatalMsg,
+        } or "destroyed while thread is still running" in message.lower()
+        self.log_mgr.append(text, "error" if serious else "warn")
+        if not serious:
+            return
+        stack = "".join(traceback.format_stack())
+        try:
+            report_path = write_app_exception_report(f"{text}\n\n{stack}")
+            self.last_diagnostic_path = str(report_path)
+        except OSError:
+            self.last_diagnostic_path = ""
+        self.last_diagnostic_summary = (
+            "❌ ДИАГНОСТИКА\n"
+            f"Причина: критическая ошибка Qt: {message}\n"
+            "Что сделать: откройте отчёт; в нём сохранён стек приложения.\n"
+            f"Полный отчёт: {self.last_diagnostic_path or 'записать не удалось'}"
+        )
+        self.ui.copy_last_error_btn.setEnabled(True)
+
     def _on_server_stopped(self):
         """Обработчик остановки сервера."""
         self._stop_metrics_polling()
+        exit_code = self.server.server_last_exit_code
+        self._record_server_diagnostic(exit_code)
         if self._restart_pending:
             self._reset_mem_viz("Сервер остановлен, перезапуск с новыми параметрами...")
             QTimer.singleShot(150, self._start_pending_restart)
             return
-        exit_code = self.server.server_proc.exitCode()
         if self._retry_without_mtp_if_needed(exit_code):
             return
         self._finalize_mem_viz_after_stop(
@@ -2540,6 +3354,10 @@ class LlamaGUI:
 
     def _prepare_server_launch(self):
         if self.server.is_bench_running():
+            self._record_preflight_diagnostic(
+                "модель не запущена: сейчас выполняется benchmark",
+                "Остановите benchmark и повторите запуск.",
+            )
             QMessageBox.warning(
                 self.ui,
                 "Benchmark running",
@@ -2548,6 +3366,10 @@ class LlamaGUI:
             return None
         exe = self._resolve_llamacpp_executable("server")
         if not exe or not os.path.exists(exe):
+            self._record_preflight_diagnostic(
+                "llama-server.exe не найден в выбранной CUDA-сборке",
+                "Проверьте папку llama.cpp и выбранную версию CUDA.",
+            )
             QMessageBox.critical(
                 self.ui,
                 "Error",
@@ -2562,6 +3384,25 @@ class LlamaGUI:
             info.setdefault("path", model_path)
             info.setdefault("_model_path", model_path)
         is_mtp_model = self._is_mtp_model_info(info)
+        manual_draft = self._mtp_manual_draft_path(info)
+        configured_draft = str(
+            self.config.settings.spec_draft_model_path or ""
+        ).strip()
+        manual_draft_selected = bool(
+            manual_draft
+            and os.path.isfile(manual_draft)
+            and self._mtp_model_key(manual_draft)
+            == self._mtp_model_key(configured_draft)
+        )
+        auto_draft = self._auto_mtp_draft_path(info)
+        auto_draft_selected = bool(
+            auto_draft
+            and os.path.isfile(auto_draft)
+            and self._mtp_model_key(auto_draft)
+            == self._mtp_model_key(configured_draft)
+        )
+        if configured_draft and not (manual_draft_selected or auto_draft_selected):
+            self.config.settings.spec_draft_model_path = ""
         if not is_mtp_model:
             # Сохранённый MTP-чекбокс/пресет не должен ломать обычные GGUF.
             # Пользовательские эксперименты всё ещё можно задать вручную в Extra params.
@@ -2570,11 +3411,12 @@ class LlamaGUI:
             self.ui.auto_params.isChecked()
             and is_mtp_model
             and not self._auto_mtp_supported(info)
+            and not manual_draft_selected
         ):
             self.config.settings.speculative_mtp = False
             self.config.settings.spec_draft_model_path = ""
             self.log_mgr.append(
-                "MTP auto: skipped because no embedded MTP metadata and no nearby MTP draft GGUF was found.",
+                "MTP auto: disabled because no usable embedded or nearby draft was found, or auto-selection was manually disabled.",
                 "warn",
             )
         if self.ui.auto_params.isChecked() and self._auto_mtp_supported(info):
@@ -2597,7 +3439,8 @@ class LlamaGUI:
                 )
             elif self._uses_embedded_mtp_mode(info):
                 self.config.settings.spec_draft_model_path = ""
-            self.config.settings.spec_draft_n_max = 2
+            self.config.settings.spec_draft_n_max = 8
+            self.config.settings.spec_draft_p_min = 0.8
             self.config.settings.spec_draft_gpu_layers = "all"
             self.config.settings.cuda_device = (
                 self.config.settings.cuda_device or "CUDA0"
@@ -2626,9 +3469,17 @@ class LlamaGUI:
         try:
             args = build_args(self.config.settings, self.ui.model_combo.currentData())
         except ValueError as e:
+            self._record_preflight_diagnostic(
+                f"ошибка параметров запуска: {e}",
+                "Исправьте указанный параметр в Launch settings и повторите запуск.",
+            )
             QMessageBox.warning(self.ui, "Error", str(e))
             return None
         if not args:
+            self._record_preflight_diagnostic(
+                "не удалось сформировать команду llama-server",
+                "Проверьте выбранную модель и Launch settings.",
+            )
             return None
         if getattr(self.config.settings, "speculative_mtp", False):
             if self.config.settings.spec_draft_model_path:
@@ -3043,6 +3894,9 @@ class LlamaGUI:
             self.ui.spec_draft_n_max.setValue(
                 int(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value()))
             )
+            self.ui.spec_draft_p_min.setValue(
+                float(params.get("spec_draft_p_min", self.ui.spec_draft_p_min.value()))
+            )
             self.ui.flash_attn.setChecked(
                 bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))
             )
@@ -3268,18 +4122,21 @@ class LlamaGUI:
             "results_dir": self.autotune_results_dir,
         }
         try:
+            preset_name = self._current_perf_preset_name()
             self.config.save_perf_preset(
                 model_path,
                 ctx,
                 self.ui,
                 metadata=metadata,
                 autotune_params=self._best_autotune_params(),
+                preset_name=preset_name,
             )
         except (ValueError, OSError) as e:
             QMessageBox.warning(self.ui, "AutoTune", str(e))
             return
+        self._refresh_perf_preset_names(preset_name)
         self.log_mgr.append(
-            f"AutoTune preset saved: {Path(model_path).name} | ctx={ctx:,}"
+            f"AutoTune preset saved: {preset_name} | {Path(model_path).name} | ctx={ctx:,}"
         )
         QMessageBox.information(self.ui, "AutoTune", "Best AutoTune preset saved")
 
@@ -3378,6 +4235,14 @@ class LlamaGUI:
                 w.setEnabled(not lock)
             except RuntimeError:
                 pass
+        # Шаблон читается только при следующем запуске llama-server. Его можно
+        # безопасно выбрать/заменить заранее, не останавливая текущую модель.
+        for w in (
+            self.ui.use_chat_template,
+            self.ui.chat_template_file,
+            self.ui.chat_template_btn,
+        ):
+            w.setEnabled(True)
         self.ui.reload_btn.setEnabled(
             srv
             and not bnch
@@ -3399,6 +4264,12 @@ class LlamaGUI:
         if self.server.is_server_running() or self.server.is_bench_running():
             QMessageBox.warning(self.ui, "Updater", "Stop processes before updating.")
             return
+        if self.updater and self.updater.isRunning():
+            QMessageBox.information(self.ui, "Updater", "Update is already running.")
+            return
+        if self.updater:
+            self.updater.deleteLater()
+            self.updater = None
         exe = self.ui.exe_path.text().strip()
         if not exe:
             QMessageBox.critical(
@@ -3453,6 +4324,11 @@ class LlamaGUI:
         result = mgr.add_model(config_path, target, model_id)
         self.ui.integration_status.setText(result.message)
         if result.success:
+            if target == "claude":
+                # Tool use through llama-server's Anthropic-compatible endpoint
+                # requires Jinja chat templates.
+                self.ui.jinja.setChecked(True)
+                self.save_settings()
             self.ui.integration_models_list.clear()
             self.ui.integration_models_list.addItems(result.model_ids)
         else:
@@ -3476,31 +4352,32 @@ class LlamaGUI:
             QMessageBox.warning(self.ui, "Integration Error", result.message)
 
     def quit_app(self):
-        self.save_settings()
-        self.ui.save_ui_state()
-        self.metrics.stop()
-        self.log_mgr.stop()
-        self.server.terminate_all()
-        if self.scanner and self.scanner.isRunning():
-            self.scanner.requestInterruption()
-            self.scanner.wait(1000)
-        if self.autotune and self.autotune.isRunning():
-            self.autotune.cancel()
-            self.autotune.wait(2000)
-        if hasattr(self, "tray"):
-            self.tray.hide()
+        self.shutdown_background_work()
         QApplication.instance().quit()
 
 
 def main():
+    previous_native_crash = consume_previous_native_crash()
+    native_log_path, native_log_stream = start_native_crash_capture()
     app = QApplication(sys.argv)
     icon_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     icon_path = icon_root / "assets" / "llama_server_icon.svg"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     gui = LlamaGUI()
+    sys.excepthook = gui.handle_unhandled_exception
+    qInstallMessageHandler(gui.handle_qt_message)
+    app.aboutToQuit.connect(gui.shutdown_background_work)
     gui.ui.show()
-    sys.exit(app.exec())
+    if previous_native_crash:
+        gui.show_previous_native_crash(previous_native_crash)
+    exit_code = 0
+    try:
+        exit_code = app.exec()
+    finally:
+        qInstallMessageHandler(None)
+        finish_native_crash_capture(native_log_path, native_log_stream)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

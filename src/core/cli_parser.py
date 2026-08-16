@@ -111,13 +111,25 @@ _VALUE_FLAGS = {
     "--ctx-checkpoints",
     "--cache-ram",
     "--temp",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+    "--min-p",
+    "--typical",
+    "--typical-p",
     "--repeat-penalty",
+    "--repeat-last-n",
+    "--presence-penalty",
+    "--frequency-penalty",
+    "-s",
+    "--seed",
     "-mm",
     "--mmproj",
     "-md",
     "--model-draft",
     "--spec-type",
     "--spec-draft-n-max",
+    "--spec-draft-p-min",
     "--spec-draft-ngl",
     "-ngld",
     "--chat-template-file",
@@ -230,10 +242,26 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
                 result.settings["ctx_checkpoints"] = int(value)
             elif flag == "--cache-ram":
                 result.settings["cache_ram"] = int(value)
-            elif flag == "--temp":
+            elif flag in {"--temp", "--temperature"}:
                 result.settings["temperature"] = float(value)
+            elif flag == "--top-k":
+                result.settings["top_k"] = int(value)
+            elif flag == "--top-p":
+                result.settings["top_p"] = float(value)
+            elif flag == "--min-p":
+                result.settings["min_p"] = float(value)
+            elif flag in {"--typical", "--typical-p"}:
+                result.settings["typical_p"] = float(value)
             elif flag == "--repeat-penalty":
                 result.settings["repeat_penalty"] = float(value)
+            elif flag == "--repeat-last-n":
+                result.settings["repeat_last_n"] = int(value)
+            elif flag == "--presence-penalty":
+                result.settings["presence_penalty"] = float(value)
+            elif flag == "--frequency-penalty":
+                result.settings["frequency_penalty"] = float(value)
+            elif flag in {"-s", "--seed"}:
+                result.settings["seed"] = int(value)
             elif flag in {"-fa", "--flash-attn"}:
                 result.settings["flash_attn"] = _as_bool(value, default=True)
             elif flag in {"-mm", "--mmproj"}:
@@ -249,6 +277,8 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
                     extra.extend([flag, str(value)])
             elif flag == "--spec-draft-n-max":
                 result.settings["spec_draft_n_max"] = int(value)
+            elif flag == "--spec-draft-p-min":
+                result.settings["spec_draft_p_min"] = float(value)
             elif flag in {"--spec-draft-ngl", "-ngld"}:
                 result.settings["spec_draft_gpu_layers"] = str(value)
             elif flag == "--chat-template-file":

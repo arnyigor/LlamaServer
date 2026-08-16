@@ -140,7 +140,18 @@ def _filter_duplicate_extra_args(
         "--spec-draft-type-v",
         "-ctvd",
         "--temp",
+        "--temperature",
+        "--top-k",
+        "--top-p",
+        "--min-p",
+        "--typical",
+        "--typical-p",
         "--repeat-penalty",
+        "--repeat-last-n",
+        "--presence-penalty",
+        "--frequency-penalty",
+        "-s",
+        "--seed",
         "--flash-attn",
         "-fa",
         "-mm",
@@ -347,10 +358,22 @@ def build_args(
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:
             args += ["--cache-ram", str(cfg.cache_ram)]
-        if cfg.temperature >= 0:
-            args += ["--temp", str(cfg.temperature)]
-        if cfg.repeat_penalty >= 0:
-            args += ["--repeat-penalty", str(cfg.repeat_penalty)]
+        sampling_values = (
+            ("--temp", "temperature", -1.0),
+            ("--top-k", "top_k", -1),
+            ("--top-p", "top_p", -1.0),
+            ("--min-p", "min_p", -1.0),
+            ("--typical", "typical_p", -1.0),
+            ("--repeat-penalty", "repeat_penalty", -1.0),
+            ("--repeat-last-n", "repeat_last_n", -2),
+            ("--presence-penalty", "presence_penalty", -3.0),
+            ("--frequency-penalty", "frequency_penalty", -3.0),
+            ("--seed", "seed", -2),
+        )
+        for flag, field_name, auto_value in sampling_values:
+            value = getattr(cfg, field_name, auto_value)
+            if value > auto_value:
+                args += [flag, str(value)]
         if cfg.flash_attn:
             args += ["--flash-attn", "on"]
         if getattr(cfg, "speculative_mtp", False):
@@ -364,7 +387,9 @@ def build_args(
                 "--spec-type",
                 "draft-mtp",
                 "--spec-draft-n-max",
-                str(max(1, int(getattr(cfg, "spec_draft_n_max", 2) or 2))),
+                str(max(1, int(getattr(cfg, "spec_draft_n_max", 8) or 8))),
+                "--spec-draft-p-min",
+                str(min(1.0, max(0.0, float(getattr(cfg, "spec_draft_p_min", 0.8))))),
             ]
 
         # mmproj logic expects model_info dict, passed separately if needed
@@ -415,6 +440,7 @@ def build_args(
                     "--model-draft",
                     "--spec-type",
                     "--spec-draft-n-max",
+                    "--spec-draft-p-min",
                     "--spec-draft-ngl",
                     "--spec-draft-device",
                 ]

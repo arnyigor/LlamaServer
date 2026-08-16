@@ -35,7 +35,9 @@ Windows GUI-менеджер для локального запуска `llama-s
   - файлы сохраняются как `<Models>/<author>/<model>/<file>.gguf` — совместимо с LM Studio;
   - `Scan HF` — сканирование репозитория через Hugging Face API, список `.gguf` файлов с фильтром по квантованию (например, `Q4_K_M`, `IQ4`, `Q3-BF16` — от Q3 до BF16);
   - опция `also vision/mmproj` — включить в список projector-файлы;
-  - `Download selected` с прогрессом, `Pause` / `Cancel` (отмена удаляет частично скачанные файлы);
+  - множественный выбор через `Ctrl`/`Shift`: каждый GGUF скачивается отдельной параллельной задачей, как в LM Studio;
+  - список загрузок показывает независимый прогресс и позволяет поставить на паузу или отменить выбранные задачи (отмена удаляет их `.part`);
+  - при запуске незавершённые `.gguf.part` сразу восстанавливаются в списке со статусом и сохранённым объёмом; `Scan HF` затем уточняет полный размер и процент;
   - блок `Local files:` показывает уже скачанные файлы для репозитория; `Delete local folder` удаляет всю папку репо включая vision-файлы;
   - фоновая загрузка в `QThread` (`HfRepoScanner` / `HfModelDownloader`), UI не блокируется.
 
@@ -70,9 +72,14 @@ Windows GUI-менеджер для локального запуска `llama-s
   - `-mm`, `--no-mmproj`, `--no-mmproj-offload`.
 - **MTP speculative decoding** (чекбокс `MTP speculative` в Launch settings):
   - `--spec-type`, `--spec-draft-n-max`, `--spec-draft-n-min`, `--spec-draft-p-min`, `--spec-draft-ngl`, `--spec-draft-device`, `--spec-draft-type-k` / `-ctkd`, `--spec-draft-type-v` / `-ctvd`;
-  - отдельный draft GGUF через `--model-draft` (поле `MTP draft GGUF`);
+  - Qwen/Gemma GGUF со встроенными MTP tensors запускаются через `--spec-type draft-mtp` без `--model-draft`;
+  - coding/agent-профиль MTP по умолчанию использует `--spec-draft-n-max 8 --spec-draft-p-min 0.8`; оба значения доступны отдельными полями, `n-max` можно увеличить до 32;
+  - отдельный draft GGUF через `--model-draft` определяется только по явным признакам `draft`/`assistant`/`speculator` или специальной MTP-папке; соседняя квантизация той же модели draft-файлом не считается;
   - минималистичный CLI намеренно: лишние draft KV/device/ngl флаги могут конфликтовать с Gemma4Assistant draft GGUF в текущих сборках `llama.cpp`.
 - Позволяет добавить дополнительные аргументы вручную.
+- Основные параметры генерации вынесены в отдельную группу **Generation: Sampling and Penalties**: `temperature`, `top-k`, `top-p`, `min-p`, `typical-p`, `seed`, repeat/presence/frequency penalties.
+- Колесо мыши прокручивает форму и никогда не меняет значения числовых полей или выпадающих списков; значения вводятся вручную либо кнопками/стрелками.
+- Путь к `--chat-template-file` остаётся редактируемым при запущенной модели и применяется при следующем перезапуске.
 - Для дополнительных аргументов выполняется базовая защита:
   - проверка путей у path-like флагов (`--grammar-file`, `--lora`, `--mmproj`, `--chat-template-file` и др.);
   - запрет `--host 0.0.0.0`, `--host ::`, потому что это открывает сервер на все интерфейсы.
@@ -154,6 +161,9 @@ Windows GUI-менеджер для локального запуска `llama-s
 - Ограничение количества строк (`MAX_LOG_LINES = 10000`).
 - Автоопределение уровней: info/warn/error/bench.
 - Автоскролл можно выключить при ручном просмотре старых строк.
+- При неудачном запуске или аварийной выгрузке появляется блок `ДИАГНОСТИКА`: понятная причина, исходная строка `llama.cpp`, код завершения и рекомендуемое действие.
+- Полные отчёты с командой запуска и последними 300 строками процесса сохраняются в `%LOCALAPPDATA%\LlamaServerGUI\diagnostics`; в Logs есть кнопки `Copy last error` и `Open diagnostics`.
+- Необработанные Python/Qt/native-сбои самого GUI записываются отдельно; native-сбой предыдущего сеанса показывается при следующем запуске.
 
 ### Runtime stats
 
@@ -216,9 +226,9 @@ Performance preset сохраняется для пары:
 
 Хранится до 5 последних backup-каталогов.
 
-### Интеграция с OpenCode и PI
+### Интеграция с OpenCode, PI и Claude Code
 
-Приложение может добавить текущую модель как локальную OpenAI-compatible модель в JSON-конфиги OpenCode/PI.
+Приложение может добавить текущую модель как локальную OpenAI-compatible модель в JSON-конфиги OpenCode/PI или настроить Claude Code на Anthropic-compatible endpoint `llama-server`.
 
 Для OpenCode добавляется provider:
 
@@ -257,6 +267,8 @@ Performance preset сохраняется для пары:
 
 Фактический контейнер provider определяется гибко: `provider`, `providers` или корневой объект.
 
+Для Claude Code в `~/.claude/settings.json` добавляются `ANTHROPIC_BASE_URL`, локальный auth token, `ANTHROPIC_MODEL` и `ANTHROPIC_SMALL_FAST_MODEL`. Остальные пользовательские ключи `env` сохраняются. Для tool use автоматически включается `--jinja`.
+
 ## Структура окна
 
 Левая панель собрана в `src/ui/main_window.py` в следующем порядке:
@@ -267,11 +279,13 @@ Performance preset сохраняется для пары:
 4. **Launch settings** — видимый блок сразу за Model (context size с быстрыми кнопками, GPU offload, batch/ubatch, threads, Save Preset, MTP speculative);
 5. **Runtime stats** — живые метрики и кнопки Reset;
 6. **Advanced: Paths and llama.cpp** — спойлер с путями и обновлением;
-7. **Advanced: Memory, Sampling, Server** — спойлер со всеми параметрами производительности и памяти;
-8. **Local model manager and download** — менеджер моделей + HF;
-9. **Integration (OpenCode / PI)**;
-10. **Benchmark** — `Test Speed`, `AutoTune...` + AutoTune widget;
-11. **CLI Preview** — финальная строка запуска.
+7. **Advanced: Performance, Memory and MTP** — параметры производительности, памяти и speculative decoding;
+8. **Generation: Sampling and Penalties** — основные параметры генерации;
+9. **Server, Templates and Diagnostics** — server flags, chat template, Jinja и редкие extra args;
+10. **Local model manager and download** — менеджер моделей + параллельные HF-загрузки;
+11. **Integration (OpenCode / PI / Claude Code)**;
+12. **Benchmark** — `Test Speed`, `AutoTune...` + AutoTune widget;
+13. **CLI Preview** — финальная строка запуска.
 
 Правая панель — вкладки **Logs** и **AutoTune** (`MemoryVisualizationWidget` скрыт).
 

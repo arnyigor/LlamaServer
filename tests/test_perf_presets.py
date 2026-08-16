@@ -1,5 +1,6 @@
 """Тесты сохранения/загрузки performance presets и быстрых кнопок Context Size."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, BenchmarkResult
@@ -64,13 +67,24 @@ class TestPerfPresetsUI(unittest.TestCase):
         u.batch_size.setValue(1024)
         u.ubatch_size.setValue(512)
         u.parallel_slots.setValue(2)
+        u.speculative_mtp.setChecked(True)
+        u.spec_draft_n_max.setValue(8)
+        u.spec_draft_p_min.setValue(0.8)
         u.flash_attn.setChecked(False)
         u.fit_off.setChecked(False)
         u.reasoning_mode.setCurrentText("on")
         u.ctx_checkpoints.setValue(4)
         u.cache_ram.setValue(2048)
         u.temperature.setValue(0.7)
+        u.top_k.setValue(20)
+        u.top_p.setValue(0.9)
+        u.min_p.setValue(0.05)
+        u.typical_p.setValue(0.95)
         u.repeat_penalty.setValue(1.2)
+        u.repeat_last_n.setValue(128)
+        u.presence_penalty.setValue(0.2)
+        u.frequency_penalty.setValue(0.1)
+        u.seed.setValue(42)
         u.use_mmap.setChecked(False)
         u.use_mlock.setChecked(True)
         u.verbose.setChecked(True)
@@ -82,7 +96,7 @@ class TestPerfPresetsUI(unittest.TestCase):
         u.jinja.setChecked(True)
         u.use_mmproj.setChecked(False)
         u.mmproj_offload.setChecked(False)
-        u.extra_args.setText("--seed 1")
+        u.extra_args.setText("--dry-multiplier 0.8")
         u.enable_thinking.setCurrentText("false")
 
     def _set_different_values(self):
@@ -97,13 +111,24 @@ class TestPerfPresetsUI(unittest.TestCase):
         u.batch_size.setValue(-1)
         u.ubatch_size.setValue(-1)
         u.parallel_slots.setValue(-1)
+        u.speculative_mtp.setChecked(False)
+        u.spec_draft_n_max.setValue(2)
+        u.spec_draft_p_min.setValue(0.1)
         u.flash_attn.setChecked(True)
         u.fit_off.setChecked(True)
         u.reasoning_mode.setCurrentText("off")
         u.ctx_checkpoints.setValue(-1)
         u.cache_ram.setValue(-2)
         u.temperature.setValue(-1.0)
+        u.top_k.setValue(-1)
+        u.top_p.setValue(-1.0)
+        u.min_p.setValue(-1.0)
+        u.typical_p.setValue(-1.0)
         u.repeat_penalty.setValue(-1.0)
+        u.repeat_last_n.setValue(-2)
+        u.presence_penalty.setValue(-3.0)
+        u.frequency_penalty.setValue(-3.0)
+        u.seed.setValue(-2)
         u.use_mmap.setChecked(True)
         u.use_mlock.setChecked(False)
         u.verbose.setChecked(False)
@@ -131,13 +156,24 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertEqual(u.batch_size.value(), 1024)
         self.assertEqual(u.ubatch_size.value(), 512)
         self.assertEqual(u.parallel_slots.value(), 2)
+        self.assertTrue(u.speculative_mtp.isChecked())
+        self.assertEqual(u.spec_draft_n_max.value(), 8)
+        self.assertAlmostEqual(u.spec_draft_p_min.value(), 0.8)
         self.assertFalse(u.flash_attn.isChecked())
         self.assertFalse(u.fit_off.isChecked())
         self.assertEqual(u.reasoning_mode.currentText(), "on")
         self.assertEqual(u.ctx_checkpoints.value(), 4)
         self.assertEqual(u.cache_ram.value(), 2048)
         self.assertAlmostEqual(u.temperature.value(), 0.7)
+        self.assertEqual(u.top_k.value(), 20)
+        self.assertAlmostEqual(u.top_p.value(), 0.9)
+        self.assertAlmostEqual(u.min_p.value(), 0.05)
+        self.assertAlmostEqual(u.typical_p.value(), 0.95)
         self.assertAlmostEqual(u.repeat_penalty.value(), 1.2)
+        self.assertEqual(u.repeat_last_n.value(), 128)
+        self.assertAlmostEqual(u.presence_penalty.value(), 0.2)
+        self.assertAlmostEqual(u.frequency_penalty.value(), 0.1)
+        self.assertEqual(u.seed.value(), 42)
         self.assertFalse(u.use_mmap.isChecked())
         self.assertTrue(u.use_mlock.isChecked())
         self.assertTrue(u.verbose.isChecked())
@@ -149,7 +185,7 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertTrue(u.jinja.isChecked())
         self.assertFalse(u.use_mmproj.isChecked())
         self.assertFalse(u.mmproj_offload.isChecked())
-        self.assertEqual(u.extra_args.text(), "--seed 1")
+        self.assertEqual(u.extra_args.text(), "--dry-multiplier 0.8")
         self.assertEqual(u.enable_thinking.currentText(), "false")
 
     def test_save_button_saves_and_context_input_loads_all_perf_params(self):
@@ -191,10 +227,294 @@ class TestPerfPresetsUI(unittest.TestCase):
 
         self._assert_saved_values_loaded()
 
+    def test_named_presets_keep_distinct_task_values_and_saved_context(self):
+        self.ui.preset_name_combo.setCurrentText("coding")
+        self._set_saved_values()
+        with patch.object(QMessageBox, "information", return_value=None):
+            self.gui.save_preset()
+
+        self.ui.preset_name_combo.setCurrentText("rag")
+        self._set_saved_values()
+        self.ui.ctx_size.setValue(32768)
+        self.ui.gpu_layers.setValue(55)
+        self.ui.threads.setValue(9)
+        self.ui.cache_type_k.setCurrentText("q4_1")
+        with patch.object(QMessageBox, "information", return_value=None):
+            self.gui.save_preset()
+
+        self._set_different_values()
+        self.ui.ctx_size.setValue(-1)
+        self.ui.preset_name_combo.setCurrentText("coding")
+        self.gui._on_preset_selected()
+
+        self._assert_saved_values_loaded()
+
+        self._set_different_values()
+        self.ui.ctx_size.setValue(-1)
+        self.ui.preset_name_combo.setCurrentText("rag")
+        self.gui._on_preset_selected()
+
+        self.assertEqual(self.ui.ctx_size.value(), 32768)
+        self.assertEqual(self.ui.gpu_layers.value(), 55)
+        self.assertEqual(self.ui.threads.value(), 9)
+        self.assertEqual(self.ui.cache_type_k.currentText(), "q4_1")
+
     def test_force_stop_is_available_even_without_owned_process(self):
         self.gui.update_action_buttons()
 
         self.assertTrue(self.ui.force_stop_btn.isEnabled())
+
+    def test_chat_template_controls_stay_editable_while_server_runs(self):
+        with patch.object(self.gui.server, "is_server_running", return_value=True):
+            self.gui.update_action_buttons()
+
+        self.assertTrue(self.ui.use_chat_template.isEnabled())
+        self.assertTrue(self.ui.chat_template_file.isEnabled())
+        self.assertTrue(self.ui.chat_template_btn.isEnabled())
+        self.assertFalse(self.ui.temperature.isEnabled())
+
+    def test_mouse_wheel_does_not_change_numeric_fields(self):
+        self.ui.port.setValue(8080)
+        event = QWheelEvent(
+            QPointF(5, 5),
+            QPointF(5, 5),
+            QPoint(),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(self.ui.port, event)
+        self.assertEqual(self.ui.port.value(), 8080)
+
+    def test_multiple_hf_models_start_as_parallel_independent_tasks(self):
+        class FakeSignal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+        class FakeDownloader:
+            instances = []
+
+            def __init__(self, repo_id, files, model_dir):
+                self.repo_id = repo_id
+                self.files = files
+                self.model_dir = model_dir
+                self.progress = FakeSignal()
+                self.percent = FakeSignal()
+                self.completed = FakeSignal()
+                self.finished = FakeSignal()
+                self.running = False
+                self.paused = False
+                self.__class__.instances.append(self)
+
+            def start(self):
+                self.running = True
+
+            def isRunning(self):
+                return self.running
+
+            def pause(self):
+                self.paused = True
+
+            def cancel_and_delete(self):
+                self.running = False
+
+        files = [
+            {"name": "model-Q4.gguf", "rfilename": "model-Q4.gguf", "size": 100},
+            {"name": "model-Q8.gguf", "rfilename": "model-Q8.gguf", "size": 200},
+        ]
+        self.ui.model_dir.setText(self.tmp.name)
+        self.ui.hf_include_mmproj.setChecked(False)
+        self.gui.hf_scan_result = {
+            "repo_id": "author/model",
+            "files": files,
+            "projectors": [],
+        }
+        self.ui.hf_files.clear()
+        for file_info in files:
+            self.ui.hf_files.addItem(file_info["name"])
+            item = self.ui.hf_files.item(self.ui.hf_files.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, file_info)
+            item.setSelected(True)
+
+        with patch("main.HfModelDownloader", FakeDownloader), patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.gui.download_hf_selection()
+
+        self.assertEqual(len(FakeDownloader.instances), 2)
+        self.assertEqual(len(self.gui.hf_downloaders), 2)
+        self.assertTrue(all(worker.running for worker in FakeDownloader.instances))
+        self.assertEqual(self.ui.hf_downloads.count(), 2)
+
+        task_key = next(iter(self.gui.hf_downloaders))
+        progress_text = (
+            "model-Q4.gguf (1/1): 25 MiB / 100 MiB; всего 25 MiB / 100 MiB, "
+            "осталось 75 MiB, ETA 00:30; скорость 2.5 MiB/s"
+        )
+        self.gui._on_hf_task_progress(task_key, progress_text)
+        task_item = self.gui.hf_downloaders[task_key]["item"]
+        self.assertIn("25 MiB / 100 MiB", task_item.text())
+        self.assertIn("осталось 75 MiB", task_item.text())
+        self.assertIn("ETA 00:30", task_item.text())
+        self.assertIn("скорость 2.5 MiB/s", task_item.text())
+
+        self.gui.pause_hf_download()
+        self.assertTrue(all(worker.paused for worker in FakeDownloader.instances))
+
+    def test_partial_download_is_visible_before_hf_scan(self):
+        model_dir = Path(self.tmp.name) / "Models"
+        partial = model_dir / "author" / "model" / "model-Q4.gguf.part"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"x" * 2048)
+        self.ui.model_dir.setText(str(model_dir))
+
+        self.gui._refresh_hf_partial_status()
+
+        self.assertEqual(self.ui.hf_downloads.count(), 1)
+        text = self.ui.hf_downloads.item(0).text()
+        self.assertIn("author/model / model-Q4.gguf", text)
+        self.assertIn("paused / resumable", text)
+        self.assertIn("2.05 KB", text)
+        self.assertIn(str(partial), text)
+
+        file_info = {
+            "name": "model-Q4.gguf",
+            "rfilename": "model-Q4.gguf",
+            "size": 4096,
+        }
+        self.gui._on_hf_scan_completed(
+            {
+                "repo_id": "author/model",
+                "files": [file_info],
+                "projectors": [],
+                "all_files": [file_info],
+            }
+        )
+        self.assertIn("50%", self.ui.hf_downloads.item(0).text())
+        self.assertIn("4.10 KB", self.ui.hf_downloads.item(0).text())
+
+    def test_auto_detected_separate_mtp_draft_can_be_manually_disabled(self):
+        draft_path = Path(self.tmp.name) / "model-MTP-draft.gguf"
+        draft_path.write_bytes(b"draft")
+        info = {
+            "path": self.model_path,
+            "_model_path": self.model_path,
+            "mtp_capable": True,
+            "mtp_draft_path": str(draft_path),
+            "architecture": "custommtp",
+        }
+        self.ui.models_by_path[self.model_path] = info
+
+        self.gui._sync_mtp_controls_for_model(info)
+        self.assertEqual(self.ui.spec_draft_model_path.text(), str(draft_path))
+        self.assertTrue(self.ui.speculative_mtp.isChecked())
+        self.gui.update_cli_preview(force=True)
+        self.assertIn("--model-draft", self.ui.cli_preview.text())
+        self.assertIn("--spec-type", self.ui.cli_preview.text())
+
+        self.gui._set_mtp_manual_draft_path(str(draft_path), info)
+        self.gui._sync_mtp_controls_for_model(info)
+        self.assertEqual(self.ui.spec_draft_model_path.text(), str(draft_path))
+        self.assertTrue(self.ui.speculative_mtp.isChecked())
+
+        self.ui.spec_draft_model_path.clear()
+        self.gui._on_mtp_draft_path_edited("")
+        self.ui.speculative_mtp.setChecked(True)
+        self.gui._sync_mtp_controls_for_model(info)
+
+        self.assertEqual(self.ui.spec_draft_model_path.text(), "")
+        self.assertFalse(self.ui.speculative_mtp.isChecked())
+        self.assertFalse(self.gui._auto_mtp_supported(info))
+
+        reloaded = ConfigManager(self.settings_path, self.profiles_path)
+        reloaded.load()
+        self.assertIn(
+            os.path.normcase(os.path.abspath(self.model_path)),
+            reloaded.settings.spec_draft_auto_disabled_models,
+        )
+        self.assertNotIn(
+            os.path.normcase(os.path.abspath(self.model_path)),
+            reloaded.settings.spec_draft_manual_paths,
+        )
+
+    def test_qwen_mtp_uses_embedded_speculation_without_neighbor_as_draft(self):
+        other_quant = Path(self.tmp.name) / "Qwen3.6-27B-UD-IQ3_XXS.gguf"
+        other_quant.write_bytes(b"another quant")
+        info = {
+            "path": self.model_path,
+            "_model_path": self.model_path,
+            "mtp_capable": True,
+            "mtp_draft_path": str(other_quant),  # stale cache from an older scan
+            "architecture": "qwen35moe",
+            "block_count": 65,
+        }
+        self.ui.models_by_path[self.model_path] = info
+
+        self.gui.apply_recommended_params(info)
+        self.gui._sync_mtp_controls_for_model(info)
+        self.gui.update_cli_preview(force=True)
+
+        command = self.ui.cli_preview.text()
+        self.assertTrue(self.ui.speculative_mtp.isChecked())
+        self.assertEqual(self.ui.spec_draft_model_path.text(), "")
+        self.assertIn("--spec-type draft-mtp", command)
+        self.assertIn("--spec-draft-n-max 8", command)
+        self.assertIn("--spec-draft-p-min 0.8", command)
+        self.assertNotIn("--model-draft", command)
+
+    def test_loading_draft_log_line_is_not_treated_as_mtp_failure(self):
+        self.gui._mtp_draft_error_seen = False
+
+        self.gui._on_log_for_mem_viz(
+            "common_speculative_init_result: loading draft model 'draft.gguf'",
+            "info",
+        )
+
+        self.assertFalse(self.gui._mtp_draft_error_seen)
+
+    def test_missing_external_draft_is_not_added_but_qwen_embedded_mtp_remains_supported(self):
+        missing_draft = Path(self.tmp.name) / "deleted-MTP-draft.gguf"
+        info = {
+            "path": self.model_path,
+            "_model_path": self.model_path,
+            "mtp_capable": True,
+            "mtp_draft_path": str(missing_draft),
+            "architecture": "qwen3",
+        }
+
+        self.gui._sync_mtp_controls_for_model(info)
+
+        self.assertEqual(self.ui.spec_draft_model_path.text(), "")
+        self.assertTrue(self.gui._auto_mtp_supported(info))
+
+    def test_legacy_sampling_extra_args_are_migrated(self):
+        legacy_path = Path(self.tmp.name) / "legacy-settings.json"
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "extra_args": "--top-k 20 --top-p 0.9 --min-p 0.05 "
+                    "--presence-penalty -0.2 --seed 42 --dry-multiplier 0.8"
+                }
+            ),
+            encoding="utf-8",
+        )
+        manager = ConfigManager(str(legacy_path), self.profiles_path)
+
+        manager.load()
+
+        self.assertEqual(manager.settings.top_k, 20)
+        self.assertEqual(manager.settings.top_p, 0.9)
+        self.assertEqual(manager.settings.min_p, 0.05)
+        self.assertEqual(manager.settings.presence_penalty, -0.2)
+        self.assertEqual(manager.settings.seed, 42)
+        self.assertEqual(manager.settings.extra_args, "--dry-multiplier 0.8")
 
     def test_left_autotune_button_opens_benchmark_section_and_builds_plan(self):
         self.ui.ctx_size.setValue(16384)

@@ -59,13 +59,22 @@ class MockConfig:
     use_chat_template: bool = False
     chat_template_file: str = ""
     temperature: float = -1.0
+    top_k: int = -1
+    top_p: float = -1.0
+    min_p: float = -1.0
+    typical_p: float = -1.0
     repeat_penalty: float = -1.0
+    repeat_last_n: int = -2
+    presence_penalty: float = -3.0
+    frequency_penalty: float = -3.0
+    seed: int = -2
     use_mmproj: bool = True
     mmproj_offload: bool = True
     enable_thinking: str = "off"
     speculative_mtp: bool = False
     spec_draft_model_path: str = ""
     spec_draft_n_max: int = 3
+    spec_draft_p_min: float = 0.0
     spec_draft_gpu_layers: str = "all"
     mmproj_path: str = ""
     bench_prompt: int = 128
@@ -205,6 +214,7 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.speculative_mtp = True
         self.cfg.spec_draft_model_path = "/models/test-mtp-draft.gguf"
         self.cfg.spec_draft_n_max = 2
+        self.cfg.spec_draft_p_min = 0.8
         self.cfg.spec_draft_gpu_layers = "all"
         self.cfg.use_mmproj = False
         self.cfg.jinja = True
@@ -221,6 +231,7 @@ class TestBuildArgs(unittest.TestCase):
         self.assertEqual(
             args[args.index("--model-draft") + 1], "/models/test-mtp-draft.gguf"
         )
+        self.assertEqual(args[args.index("--spec-draft-p-min") + 1], "0.8")
         self.assertIn("--split-mode", args)
         self.assertIn("none", args)
         self.assertIn("--main-gpu", args)
@@ -241,6 +252,49 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("0.9", args)
         self.assertIn("--seed", args)
         self.assertIn("42", args)
+
+    def test_sampling_args(self):
+        self.cfg.temperature = 0.7
+        self.cfg.top_k = 20
+        self.cfg.top_p = 0.9
+        self.cfg.min_p = 0.05
+        self.cfg.typical_p = 0.95
+        self.cfg.repeat_penalty = 1.1
+        self.cfg.repeat_last_n = 128
+        self.cfg.presence_penalty = 0.2
+        self.cfg.frequency_penalty = 0.1
+        self.cfg.seed = 42
+
+        args = build_args(self.cfg, self.model)
+
+        expected = {
+            "--temp": "0.7",
+            "--top-k": "20",
+            "--top-p": "0.9",
+            "--min-p": "0.05",
+            "--typical": "0.95",
+            "--repeat-penalty": "1.1",
+            "--repeat-last-n": "128",
+            "--presence-penalty": "0.2",
+            "--frequency-penalty": "0.1",
+            "--seed": "42",
+        }
+        for flag, value in expected.items():
+            self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_sampling_auto_values_are_omitted(self):
+        args = build_args(self.cfg, self.model)
+        for flag in (
+            "--top-k",
+            "--top-p",
+            "--min-p",
+            "--typical",
+            "--repeat-last-n",
+            "--presence-penalty",
+            "--frequency-penalty",
+            "--seed",
+        ):
+            self.assertNotIn(flag, args)
 
     def test_extra_args_managed_duplicates_are_filtered(self):
         self.cfg.ctx_size = 131072
@@ -267,8 +321,9 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--top-p", args)
         self.assertIn("0.9", args)
 
-    def test_extra_args_unmanaged_mtp_values_are_preserved(self):
+    def test_managed_p_min_overrides_duplicate_extra_and_unmanaged_n_min_is_preserved(self):
         self.cfg.speculative_mtp = True
+        self.cfg.spec_draft_p_min = 0.8
         self.cfg.extra_args = "--spec-draft-n-min 1 --spec-draft-p-min 0.5"
 
         args = build_args(self.cfg, self.model)
@@ -276,7 +331,8 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--spec-draft-n-min", args)
         self.assertIn("1", args)
         self.assertIn("--spec-draft-p-min", args)
-        self.assertIn("0.5", args)
+        self.assertIn("0.8", args)
+        self.assertNotIn("0.5", args)
 
     def test_extra_args_unmanaged_jinja_still_allowed(self):
         self.cfg.jinja = False

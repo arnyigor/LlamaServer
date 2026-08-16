@@ -1,10 +1,55 @@
 """UI виджеты для LlamaServer GUI."""
 
+from PySide6.QtCore import QEvent, QObject, QPointF
+from PySide6.QtGui import QWheelEvent
+
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
+
+
+class NoWheelValueChangeFilter(QObject):
+    """Запрещает колесу менять числовые поля и списки.
+
+    Колесо перенаправляется ближайшей области прокрутки, поэтому пользователь
+    продолжает прокручивать форму, даже когда курсор находится над полем.
+    """
+
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Type.Wheel or not isinstance(
+            watched, (QAbstractSpinBox, QComboBox)
+        ):
+            return super().eventFilter(watched, event)
+
+        parent = watched.parentWidget()
+        while parent is not None and not isinstance(parent, QAbstractScrollArea):
+            parent = parent.parentWidget()
+
+        if parent is not None:
+            viewport = parent.viewport()
+            local_pos = QPointF(
+                viewport.mapFromGlobal(event.globalPosition().toPoint())
+            )
+            forwarded = QWheelEvent(
+                local_pos,
+                event.globalPosition(),
+                event.pixelDelta(),
+                event.angleDelta(),
+                event.buttons(),
+                event.modifiers(),
+                event.phase(),
+                event.inverted(),
+                event.source(),
+                event.pointingDevice(),
+            )
+            QApplication.sendEvent(viewport, forwarded)
+        return True
 
 
 class CollapsiblePanel(QWidget):

@@ -27,7 +27,10 @@ from src.utils.file_utils import (
     write_json_file_safely,
     load_or_create_json,
 )
-from src.services.hf_downloader import list_all_local_model_entries
+from src.services.hf_downloader import (
+    list_all_local_model_entries,
+    list_all_partial_downloads,
+)
 from src.services.threads import LlamaCppUpdater
 
 
@@ -56,6 +59,27 @@ class TestValidatePath(unittest.TestCase):
         base = Path("/tmp")
         with self.assertRaises(ValueError):
             validate_path("/etc/passwd", base_dir=base)
+
+
+class TestHfPartialDiscovery(unittest.TestCase):
+    def test_lists_partial_downloads_from_all_lmstudio_repositories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "author-one" / "model-a" / "model-Q4.gguf.part"
+            second = root / "author-two" / "model-b" / "nested" / "model-Q8.gguf.part"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"a" * 1024)
+            second.write_bytes(b"b" * 2048)
+
+            partials = list_all_partial_downloads(root)
+
+        self.assertEqual(len(partials), 2)
+        self.assertEqual(partials[0]["repo_id"], "author-one/model-a")
+        self.assertEqual(partials[0]["rfilename"], "model-Q4.gguf")
+        self.assertEqual(partials[0]["partial_size"], 1024)
+        self.assertEqual(partials[1]["repo_id"], "author-two/model-b")
+        self.assertEqual(partials[1]["rfilename"], "nested/model-Q8.gguf")
 
 
 class TestGGUFParser(unittest.TestCase):
@@ -108,6 +132,18 @@ class TestGGUFParser(unittest.TestCase):
             qwen_draft = qwen_dir / "Qwen3.6-27B-UD-IQ3_XXS.gguf"
             qwen_draft.write_bytes(b"fake")
 
+            self.assertEqual(detect_mtp_draft_for_model(model), "")
+
+    def test_mtp_draft_detection_ignores_other_quant_in_same_mtp_package(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "Qwen3.6-27B-MTP-GGUF"
+            root.mkdir(parents=True)
+            model = root / "Qwen3.6-27B-UD-Q3_K_XL.gguf"
+            other_quant = root / "Qwen3.6-27B-UD-IQ3_XXS.gguf"
+            model.write_bytes(b"fake")
+            other_quant.write_bytes(b"fake")
+
+            self.assertFalse(is_mtp_draft_file(other_quant))
             self.assertEqual(detect_mtp_draft_for_model(model), "")
 
     def test_list_all_local_model_entries(self):

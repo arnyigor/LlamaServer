@@ -1,11 +1,8 @@
-"""Интеграция с OpenCode и PI."""
+"""Интеграция с OpenCode, PI и Claude Code."""
 
 from typing import Any, Dict, List, Tuple
 
 from src.core.constants import DEFAULT_LOCAL_BASE_URL, LLAMACPP_PROVIDER_ID
-from src.utils.file_utils import load_or_create_json, write_json_file_safely
-
-
 def provider_container(data: Dict[str, Any], preferred_key: str) -> Dict[str, Any]:
     """Получение контейнера провайдеров из конфига."""
     if isinstance(data.get(LLAMACPP_PROVIDER_ID), dict):
@@ -50,16 +47,44 @@ def ensure_pi_llamacpp_provider(
     return provider, models
 
 
+def ensure_claude_llamacpp_environment(
+    data: Dict[str, Any], base_url: str
+) -> Dict[str, Any]:
+    """Создаёт env-конфигурацию Claude Code для Anthropic API llama-server."""
+    env = data.setdefault("env", {})
+    if not isinstance(env, dict):
+        data["env"] = {}
+        env = data["env"]
+    root_url = (base_url or DEFAULT_LOCAL_BASE_URL).rstrip("/")
+    if root_url.endswith("/v1"):
+        root_url = root_url[:-3]
+    env["ANTHROPIC_BASE_URL"] = root_url
+    env.setdefault("ANTHROPIC_AUTH_TOKEN", "llamacpp")
+    return env
+
+
 def get_model_ids(data: Dict[str, Any], target: str = "opencode") -> List[str]:
     """Универсальная функция получения списка моделей.
 
     Args:
         data: Данные конфигурации.
-        target: Тип конфига ('opencode' или 'pi').
+        target: Тип конфига ('opencode', 'pi' или 'claude').
 
     Returns:
         Отсортированный список ID моделей.
     """
+    if target == "claude":
+        env = data.get("env", {})
+        if not isinstance(env, dict):
+            return []
+        return sorted(
+            {
+                str(env[key])
+                for key in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")
+                if env.get(key)
+            }
+        )
+
     providers = data.get("provider") or data.get("providers") or data
     provider = (
         providers.get(LLAMACPP_PROVIDER_ID, {}) if isinstance(providers, dict) else {}

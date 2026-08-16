@@ -605,6 +605,46 @@ def find_partial_downloads(base_model_dir: Path, repo_id: str) -> List[Dict]:
     return result
 
 
+def list_all_partial_downloads(base_model_dir: Path) -> List[Dict]:
+    """Return every LM Studio-style ``*.gguf.part`` below the Models folder."""
+    root = Path(base_model_dir)
+    if not root.exists():
+        return []
+    try:
+        parts = sorted(root.rglob("*.gguf.part"), key=lambda p: str(p).lower())
+    except OSError:
+        return []
+
+    result = []
+    for part in parts:
+        try:
+            relative_parts = part.relative_to(root).parts
+            # LM Studio layout: Models/<author>/<repository>/<file>.gguf.part
+            if len(relative_parts) < 3:
+                continue
+            repo_id = f"{relative_parts[0]}/{relative_parts[1]}"
+            relative_file = PurePosixPath(*relative_parts[2:]).as_posix()
+            filename = (
+                relative_file[:-5]
+                if relative_file.lower().endswith(".part")
+                else relative_file
+            )
+            size = part.stat().st_size
+        except (OSError, ValueError):
+            continue
+        result.append(
+            {
+                "repo_id": repo_id,
+                "rfilename": filename,
+                "name": PurePosixPath(filename).name,
+                "partial_path": str(part),
+                "partial_size": size,
+                "partial_size_text": format_bytes(size),
+            }
+        )
+    return result
+
+
 def partial_download_info(
     base_model_dir: Path, repo_id: str, filename: str, expected_size: int = 0
 ) -> Dict:

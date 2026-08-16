@@ -40,11 +40,14 @@ class ModelScanner(QThread):
             return
 
         try:
-            all_files = [
-                f
-                for f in base.rglob("*.gguf")
-                if not is_projector_file(f) and not is_mtp_draft_file(f)
-            ]
+            all_files = []
+            for f in base.rglob("*.gguf"):
+                if self.isInterruptionRequested():
+                    self.progress.emit("вЏ№ РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ РѕС‚РјРµРЅРµРЅРѕ")
+                    self.models_found.emit(models)
+                    return
+                if not is_projector_file(f) and not is_mtp_draft_file(f):
+                    all_files.append(f)
             total = len(all_files)
 
             for i, gguf_file in enumerate(all_files, 1):
@@ -91,6 +94,9 @@ class LlamaCppUpdater(QThread):
     def run(self):
         try:
             release = self.fetch_latest_release()
+            if self.isInterruptionRequested():
+                self.completed.emit(False, "Update cancelled")
+                return
             latest_build = self.parse_build_number(release.get("tag_name", ""))
             if latest_build is None:
                 raise RuntimeError(
@@ -141,6 +147,9 @@ class LlamaCppUpdater(QThread):
                     raise RuntimeError(
                         "Downloaded archive does not contain llama-server.exe"
                     )
+                if self.isInterruptionRequested():
+                    self.completed.emit(False, "Update cancelled")
+                    return
                 self.progress.emit(f"Installing into {target_dir}")
                 self.copy_tree_contents(install_root, target_dir)
                 # Merge cudart DLLs from other extracted subdirs if any
@@ -304,6 +313,8 @@ class LlamaCppUpdater(QThread):
                 with open(destination, "wb") as out:
                     while True:
                         chunk = response.read(1024 * 1024)
+                        if self.isInterruptionRequested():
+                            raise RuntimeError("Update cancelled")
                         if not chunk:
                             break
                         out.write(chunk)
