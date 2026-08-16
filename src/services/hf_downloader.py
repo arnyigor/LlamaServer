@@ -532,16 +532,17 @@ def list_all_local_model_entries(base_model_dir: Path) -> Dict:
         try:
             if not gguf.is_file() or is_projector_file(gguf) or is_mtp_draft_file(gguf):
                 continue
-            gguf.relative_to(root_resolved)
+            gguf_resolved = gguf.resolve()
+            gguf_resolved.relative_to(root_resolved)
         except (OSError, ValueError):
             continue
 
-        if gguf.parent.resolve() == root_resolved:
-            key = gguf.resolve()
+        if gguf_resolved.parent == root_resolved:
+            key = gguf_resolved
             entry_type = "file"
             target = gguf
         else:
-            key = gguf.parent.resolve()
+            key = gguf_resolved.parent
             entry_type = "folder"
             target = gguf.parent
 
