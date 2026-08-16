@@ -158,7 +158,10 @@ class TestGGUFParser(unittest.TestCase):
             direct.write_bytes(b"d" * 7)
 
             result = list_all_local_model_entries(root)
-            relatives = {entry["relative"] for entry in result["entries"]}
+            relatives = {
+                str(entry["relative"]).replace("\\", "/")
+                for entry in result["entries"]
+            }
 
             self.assertIn("unsloth/model-a", relatives)
             self.assertIn("direct-model-Q8_0.gguf", relatives)
