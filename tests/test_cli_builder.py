@@ -224,10 +224,10 @@ class TestBuildArgs(unittest.TestCase):
         self.assertEqual(args[args.index("-ngl") + 1], "all")
         self.assertIn("--device", args)
         self.assertIn("CUDA0", args)
-        self.assertNotIn("--spec-draft-ngl", args)
+        self.assertEqual(args[args.index("--spec-draft-ngl") + 1], "all")
         self.assertNotIn("--spec-draft-type-k", args)
         self.assertNotIn("--spec-draft-type-v", args)
-        self.assertNotIn("--spec-draft-device", args)
+        self.assertEqual(args[args.index("--spec-draft-device") + 1], "CUDA0")
         self.assertEqual(
             args[args.index("--model-draft") + 1], "/models/test-mtp-draft.gguf"
         )
@@ -237,6 +237,17 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--main-gpu", args)
         self.assertIn("--jinja", args)
         self.assertIn("--no-mmproj", args)
+
+    def test_mtp_optional_draft_flags_omitted_when_empty(self):
+        self.cfg.speculative_mtp = True
+        self.cfg.spec_draft_gpu_layers = ""
+        self.cfg.spec_draft_device = ""
+
+        args = build_args(self.cfg, self.model)
+
+        self.assertIn("--spec-type", args)
+        self.assertNotIn("--spec-draft-ngl", args)
+        self.assertNotIn("--spec-draft-device", args)
 
     def test_flash_attn_and_fit_off(self):
         self.cfg.flash_attn = False

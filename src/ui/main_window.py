@@ -404,6 +404,10 @@ class MainWindowUI(QMainWindow):
         self.export_stats_btn.setToolTip(
             "Export current runtime counters to a JSON file."
         )
+        self.copy_stats_md_btn = QPushButton("Copy stats MD")
+        self.copy_stats_md_btn.setToolTip(
+            "Copy current runtime counters to the clipboard as Markdown."
+        )
         self.reset_session_btn = QPushButton("Reset session")
         self.reset_session_btn.setToolTip(
             "Zero all live runtime stats: total/task tokens, prompt/generated, "
@@ -416,6 +420,7 @@ class MainWindowUI(QMainWindow):
         for btn in [
             self.tokens_reset_btn,
             self.export_stats_btn,
+            self.copy_stats_md_btn,
             self.reset_session_btn,
             self.reset_saved_btn,
         ]:
@@ -432,6 +437,7 @@ class MainWindowUI(QMainWindow):
         stats.addWidget(self.reset_session_btn, 3, 2)
         stats.addWidget(self.current_time_label, 4, 0, 1, 2)
         stats.addWidget(self.export_stats_btn, 4, 2)
+        stats.addWidget(self.copy_stats_md_btn, 5, 2)
         stats.setColumnStretch(1, 1)
         lay.addWidget(self.runtime_stats_group)
 
@@ -503,7 +509,7 @@ class MainWindowUI(QMainWindow):
         self.ctx_size.setSpecialValueText("auto")
 
         self.preset_name_combo = QComboBox()
-        self.preset_name_combo.setEditable(True)
+        self.preset_name_combo.setEditable(False)
         self.preset_name_combo.addItem("default")
         self.preset_name_combo.setCurrentText("default")
         self.preset_name_combo.setMinimumWidth(130)
@@ -1182,6 +1188,7 @@ class MainWindowUI(QMainWindow):
             "Active/Current time, Request label. Saved history is kept.",
             self.reset_saved_btn: "Zero the accumulated Saved history (last and total).",
             self.export_stats_btn: "Export current runtime counters to JSON.",
+            self.copy_stats_md_btn: "Copy current runtime counters as Markdown.",
         }
         for widget, text in tips.items():
             if widget:

@@ -71,6 +71,34 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(parsed.settings["spec_draft_p_min"], 0.5)
         self.assertEqual(parsed.extra_args, "--spec-draft-n-min 1")
 
+    def test_parses_multiline_args_log_with_cmd_carets(self):
+        parsed = parse_llama_server_command(
+            "Args: -m G:\\Models\\model.gguf ^\n"
+            "  --host 127.0.0.1 --port 8080 ^\n"
+            "  --device CUDA0 --split-mode none --main-gpu 0 ^\n"
+            "  -ngl all -c 65536 --spec-type draft-mtp ^\n"
+            "  --spec-draft-n-max 8 --spec-draft-p-min 0.8 ^\n"
+            "  --spec-draft-ngl all --spec-draft-device CUDA0 ^\n"
+            "  --spec-draft-n-min 0\n"
+            "Env: CUDA_VISIBLE_DEVICES=0"
+        )
+
+        self.assertEqual(parsed.model_path, "G:\\Models\\model.gguf")
+        self.assertEqual(parsed.settings["host"], "127.0.0.1")
+        self.assertEqual(parsed.settings["port"], 8080)
+        self.assertEqual(parsed.settings["cuda_device"], "CUDA0")
+        self.assertEqual(parsed.settings["split_mode"], "none")
+        self.assertEqual(parsed.settings["main_gpu"], 0)
+        self.assertTrue(parsed.settings["gpu_layers_all"])
+        self.assertEqual(parsed.settings["ctx_size"], 65536)
+        self.assertTrue(parsed.settings["speculative_mtp"])
+        self.assertEqual(parsed.settings["spec_draft_n_max"], 8)
+        self.assertEqual(parsed.settings["spec_draft_p_min"], 0.8)
+        self.assertEqual(parsed.settings["spec_draft_gpu_layers"], "all")
+        self.assertEqual(parsed.settings["spec_draft_device"], "CUDA0")
+        self.assertEqual(parsed.extra_args, "--spec-draft-n-min 0")
+        self.assertNotIn("^", parsed.extra_args)
+
 
 if __name__ == "__main__":
     unittest.main()

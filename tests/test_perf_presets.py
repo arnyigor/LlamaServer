@@ -228,11 +228,15 @@ class TestPerfPresetsUI(unittest.TestCase):
         self._assert_saved_values_loaded()
 
     def test_named_presets_keep_distinct_task_values_and_saved_context(self):
+        self.ui.preset_name_combo.addItem("coding")
+        self.ui.preset_name_combo.addItem("rag")
         self.ui.preset_name_combo.setCurrentText("coding")
         self._set_saved_values()
         with patch.object(QMessageBox, "information", return_value=None):
             self.gui.save_preset()
 
+        if self.ui.preset_name_combo.findText("rag") < 0:
+            self.ui.preset_name_combo.addItem("rag")
         self.ui.preset_name_combo.setCurrentText("rag")
         self._set_saved_values()
         self.ui.ctx_size.setValue(32768)
@@ -430,8 +434,11 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.gui._sync_mtp_controls_for_model(info)
 
         self.assertEqual(self.ui.spec_draft_model_path.text(), "")
-        self.assertFalse(self.ui.speculative_mtp.isChecked())
+        self.assertTrue(self.ui.speculative_mtp.isChecked())
         self.assertFalse(self.gui._auto_mtp_supported(info))
+        self.gui.update_cli_preview(force=True)
+        self.assertNotIn("--model-draft", self.ui.cli_preview.text())
+        self.assertIn("--spec-type", self.ui.cli_preview.text())
 
         reloaded = ConfigManager(self.settings_path, self.profiles_path)
         reloaded.load()
@@ -443,6 +450,37 @@ class TestPerfPresetsUI(unittest.TestCase):
             os.path.normcase(os.path.abspath(self.model_path)),
             reloaded.settings.spec_draft_manual_paths,
         )
+
+    def test_manual_mtp_launch_is_not_disabled_for_plain_model_name(self):
+        llama_base = Path(self.tmp.name) / "llamacpp"
+        llama_build = llama_base / "llama-win-cuda-12.4-x64"
+        llama_build.mkdir(parents=True)
+        (llama_build / "llama-server.exe").write_bytes(b"exe")
+
+        self.ui.exe_path.setText(str(llama_base))
+        self.ui.auto_params.setChecked(True)
+        self.ui.models_by_path[self.model_path] = {
+            "path": self.model_path,
+            "_model_path": self.model_path,
+            "architecture": "qwen",
+            "mtp_capable": False,
+            "recommended_ctx": 8192,
+        }
+        self.ui.speculative_mtp.setChecked(True)
+        self.ui.spec_draft_model_path.clear()
+        self.ui.spec_draft_n_max.setValue(8)
+        self.ui.spec_draft_p_min.setValue(0.8)
+        self.ui.spec_draft_gpu_layers.setText("all")
+        self.ui.spec_draft_device.setText("CUDA0")
+
+        launch = self.gui._prepare_server_launch()
+
+        self.assertIsNotNone(launch)
+        _exe, args, _env = launch
+        self.assertIn("--spec-type", args)
+        self.assertEqual(args[args.index("--spec-type") + 1], "draft-mtp")
+        self.assertEqual(args[args.index("--spec-draft-ngl") + 1], "all")
+        self.assertEqual(args[args.index("--spec-draft-device") + 1], "CUDA0")
 
     def test_qwen_mtp_uses_embedded_speculation_without_neighbor_as_draft(self):
         other_quant = Path(self.tmp.name) / "Qwen3.6-27B-UD-IQ3_XXS.gguf"

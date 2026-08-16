@@ -378,8 +378,6 @@ def build_args(
             args += ["--flash-attn", "on"]
         if getattr(cfg, "speculative_mtp", False):
             # Keep MTP CLI minimal and close to llama.cpp/Unsloth examples.
-            # Extra draft KV/device/ngl flags can trigger incompatibilities with
-            # Gemma4Assistant draft GGUFs in current llama.cpp builds.
             draft_model = str(getattr(cfg, "spec_draft_model_path", "") or "").strip()
             if draft_model:
                 args += ["--model-draft", draft_model]
@@ -391,6 +389,12 @@ def build_args(
                 "--spec-draft-p-min",
                 str(min(1.0, max(0.0, float(getattr(cfg, "spec_draft_p_min", 0.8))))),
             ]
+            draft_ngl = str(getattr(cfg, "spec_draft_gpu_layers", "") or "").strip()
+            if draft_ngl:
+                args += ["--spec-draft-ngl", draft_ngl]
+            draft_device = str(getattr(cfg, "spec_draft_device", "") or "").strip()
+            if draft_device:
+                args += ["--spec-draft-device", draft_device]
 
         # mmproj logic expects model_info dict, passed separately if needed
         # handled in UI layer or passed via kwargs if necessary.

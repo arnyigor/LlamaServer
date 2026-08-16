@@ -172,6 +172,7 @@ class LlamaGUI:
         u.force_stop_btn.clicked.connect(self.force_stop_server)
         u.tokens_reset_btn.clicked.connect(self.reset_task_tokens)
         u.export_stats_btn.clicked.connect(self.export_runtime_stats)
+        u.copy_stats_md_btn.clicked.connect(self.copy_runtime_stats_markdown)
         u.reset_session_btn.clicked.connect(self.reset_session)
         u.reset_saved_btn.clicked.connect(self.reset_saved_total)
         u.test_btn.clicked.connect(self.run_benchmark)
@@ -512,6 +513,47 @@ class LlamaGUI:
             },
         }
 
+    def runtime_stats_markdown(self) -> str:
+        snapshot = self.runtime_stats_snapshot()
+        tokens = snapshot["tokens"]
+        times = snapshot["time_seconds"]
+        model = snapshot["model"]
+        server = snapshot["server"]
+        lines = [
+            "# LlamaServer Runtime Stats",
+            "",
+            f"- Exported: {snapshot['exported_at']}",
+            f"- Model: {model.get('id') or '-'}",
+            f"- Model path: {model.get('path') or '-'}",
+            f"- Server: {server.get('base_url') or '-'}",
+            f"- Running: {'yes' if server.get('running') else 'no'}",
+            "",
+            "## Tokens",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| Total | {tokens['total']} |",
+            f"| Task | {tokens['task']} |",
+            f"| Prompt | {tokens['prompt']} |",
+            f"| Generated | {tokens['generated']} |",
+            f"| Request prompt | {tokens['request_prompt']} |",
+            f"| Request generated | {tokens['request_generated']} |",
+            f"| Saved last | {tokens['saved_last']} |",
+            f"| Saved total | {tokens['saved_total']} |",
+            "",
+            "## Time",
+            "",
+            "| Metric | Seconds | Formatted |",
+            "|---|---:|---:|",
+            f"| Active total | {times['active_total']:.3f} | {format_duration(times['active_total'])} |",
+            f"| Active prompt | {times['active_prompt']:.3f} | {format_duration(times['active_prompt'])} |",
+            f"| Active generated | {times['active_generated']:.3f} | {format_duration(times['active_generated'])} |",
+            f"| Current total | {times['current_total']:.3f} | {format_duration(times['current_total'])} |",
+            f"| Current prompt | {times['current_prompt']:.3f} | {format_duration(times['current_prompt'])} |",
+            f"| Current generated | {times['current_generated']:.3f} | {format_duration(times['current_generated'])} |",
+        ]
+        return "\n".join(lines) + "\n"
+
     def _time_row_html(self, caption: str, pp_s: float, tg_s: float) -> str:
         """HTML-строка времени: `Caption: total (PP pp | TG tg)`."""
         inner = (
@@ -816,6 +858,10 @@ class LlamaGUI:
             return
 
         self.log_mgr.append(f"Runtime stats exported: {path}")
+
+    def copy_runtime_stats_markdown(self):
+        QApplication.clipboard().setText(self.runtime_stats_markdown())
+        self.log_mgr.append("Runtime stats copied to clipboard as Markdown")
 
     def browse_opencode_config(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -2237,7 +2283,6 @@ class LlamaGUI:
         self._mark_restart_needed()
 
     def _sync_mtp_controls_for_model(self, info):
-        is_mtp = self._is_mtp_model_info(info)
         manual_draft = self._mtp_manual_draft_path(info)
         detected_draft = str(info.get("mtp_draft_path") or "").strip()
         auto_draft = ""
@@ -2255,49 +2300,44 @@ class LlamaGUI:
             self.ui.spec_draft_model_btn,
             self.ui.spec_draft_device,
         ):
-            widget.setEnabled(is_mtp)
-        self.ui.speculative_mtp.setEnabled(is_mtp)
-        if is_mtp:
-            if manual_draft and os.path.isfile(manual_draft):
-                self.ui.spec_draft_model_path.setText(manual_draft)
-                self.ui.speculative_mtp.setChecked(True)
-                self.ui.spec_draft_model_path.setPlaceholderText(
-                    "Manually selected draft GGUF"
-                )
-            elif self._uses_embedded_mtp_mode(info):
-                self.ui.spec_draft_model_path.clear()
-                self.ui.spec_draft_model_path.setPlaceholderText(
-                    "Auto: embedded/package MTP mode, no --model-draft"
-                )
-            elif auto_draft:
-                self.ui.spec_draft_model_path.setText(auto_draft)
-                self.ui.speculative_mtp.setChecked(True)
-                self.ui.spec_draft_model_path.setPlaceholderText(
-                    "Auto-detected nearby MTP draft GGUF"
-                )
-            else:
-                self.ui.spec_draft_model_path.clear()
-                self.ui.speculative_mtp.setChecked(False)
-                self.ui.spec_draft_model_path.setPlaceholderText(
-                    "No compatible nearby draft detected — choose manually with ..."
-                )
+            widget.setEnabled(True)
+        self.ui.speculative_mtp.setEnabled(True)
+
+        if manual_draft and os.path.isfile(manual_draft):
+            self.ui.spec_draft_model_path.setText(manual_draft)
+            self.ui.speculative_mtp.setChecked(True)
+            self.ui.spec_draft_model_path.setPlaceholderText(
+                "Manually selected draft GGUF"
+            )
+            return
+
+        if self._uses_embedded_mtp_mode(info):
+            self.ui.spec_draft_model_path.clear()
+            self.ui.spec_draft_model_path.setPlaceholderText(
+                "Auto: embedded/package MTP mode, no --model-draft"
+            )
+            self.ui.speculative_mtp.setToolTip(
+                "Enable MTP speculative decoding. The selected GGUF looks embedded/package-capable, but manual mode is still allowed."
+            )
+            return
+
+        if auto_draft:
+            self.ui.spec_draft_model_path.setText(auto_draft)
+            self.ui.speculative_mtp.setChecked(True)
+            self.ui.spec_draft_model_path.setPlaceholderText(
+                "Auto-detected nearby MTP draft GGUF"
+            )
             self.ui.speculative_mtp.setToolTip(
                 "Enable MTP speculative decoding. A nearby draft is auto-detected; clearing the field disables auto-selection for this model."
             )
             return
 
-        if self.ui.speculative_mtp.isChecked():
-            self.ui.speculative_mtp.setChecked(False)
-            self.log_mgr.append(
-                "MTP speculative disabled: selected model does not contain MTP layers",
-                "warn",
-            )
         self.ui.spec_draft_model_path.clear()
         self.ui.spec_draft_model_path.setPlaceholderText(
-            "Auto-detected, or browse for separate MTP GGUF"
+            "Optional draft GGUF; leave empty for embedded/manual MTP parameters"
         )
         self.ui.speculative_mtp.setToolTip(
-            "Disabled: selected GGUF/package has no detected MTP draft support. Use Extra params only if you know this model supports it."
+            "Enable MTP speculative decoding manually. The model name/metadata does not need to contain MTP."
         )
 
     def _refresh_tooltips(self, info):
@@ -2501,13 +2541,6 @@ class LlamaGUI:
         if self._auto_mtp_supported(info):
             self._apply_mtp_recommended_params(info)
             return
-        if self._is_mtp_model_info(info):
-            self.ui.speculative_mtp.setChecked(False)
-            self.ui.spec_draft_model_path.clear()
-            self.log_mgr.append(
-                "MTP auto: not enabled. Separate draft GGUF files require explicit manual selection.",
-                "warn",
-            )
         if str(info.get("architecture") or "").lower().startswith("gemma4") or info.get(
             "is_qat"
         ):
@@ -2656,30 +2689,120 @@ class LlamaGUI:
         if idx >= 0:
             self.ui.model_combo.setCurrentIndex(idx)
 
+    def _cli_export_base_dirs(self) -> list[Path]:
+        bases: list[Path] = []
+        for raw in (
+            self.ui.model_dir.text().strip(),
+            self.ui.exe_path.text().strip(),
+            str(Path(self._current_model_path()).parent)
+            if self._current_model_path()
+            else "",
+            str(Path.cwd()),
+        ):
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.is_file():
+                path = path.parent
+            if path.exists() and path.is_dir():
+                bases.append(path.resolve())
+        return bases
+
+    def _relative_cli_path(self, value: str, base_dirs: list[Path]) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return text
+        path = Path(text)
+        if not path.is_absolute():
+            return text
+
+        resolved = path.resolve()
+        for base in base_dirs:
+            try:
+                rel = os.path.relpath(str(resolved), str(base))
+            except ValueError:
+                continue
+            if rel == "." or rel.startswith(".." + os.sep) or rel == "..":
+                continue
+            return rel
+
+        try:
+            return os.path.relpath(str(resolved), str(Path.cwd()))
+        except ValueError:
+            return path.name
+
+    def _portable_cli_tokens(self) -> list[str]:
+        self.config.read_from_ui(self.ui)
+        args = build_args(self.config.settings, self.ui.model_combo.currentData())
+        if not args:
+            return []
+
+        exe = self._resolve_llamacpp_executable("server") or "llama-server.exe"
+        tokens = [exe, *args]
+        base_dirs = self._cli_export_base_dirs()
+        path_flags = {
+            "-m",
+            "--model",
+            "-md",
+            "--model-draft",
+            "-mm",
+            "--mmproj",
+            "--chat-template-file",
+            "--grammar-file",
+            "--api-key-file",
+            "--lora",
+            "--lora-scaled",
+        }
+
+        portable: list[str] = []
+        expect_path_value = False
+        for index, token in enumerate(tokens):
+            if index == 0:
+                portable.append(self._relative_cli_path(token, base_dirs))
+                continue
+
+            if expect_path_value:
+                portable.append(self._relative_cli_path(token, base_dirs))
+                expect_path_value = False
+                continue
+
+            flag, separator, inline_value = str(token).partition("=")
+            if separator and flag in path_flags:
+                portable.append(
+                    f"{flag}={self._relative_cli_path(inline_value, base_dirs)}"
+                )
+                continue
+
+            portable.append(token)
+            expect_path_value = token in path_flags
+
+        return portable
+
+    def portable_cli_text(self) -> str:
+        tokens = self._portable_cli_tokens()
+        return subprocess.list2cmdline(tokens) if tokens else ""
+
     def apply_cli_preview(self):
         parsed = parse_llama_server_command(self.ui.cli_preview.text())
-        if parsed.warnings and not parsed.settings and not parsed.model_path:
+        if parsed.warnings and not parsed.settings:
             self.ui.cli_status.setText("; ".join(parsed.warnings))
             self.ui.cli_status.setStyleSheet("color: #f44336;")
             return
 
         self._applying_cli = True
         try:
-            if parsed.executable:
-                exe_path = Path(parsed.executable)
-                if exe_path.is_absolute() or "\\" in parsed.executable or "/" in parsed.executable:
-                    self.ui.exe_path.setText(parsed.executable)
-                    self._normalize_llamacpp_path_ui()
-
-            if parsed.model_path:
-                self._select_or_add_model_path(parsed.model_path)
-
             settings = dict(parsed.settings)
+            if parsed.executable:
+                settings.pop("cuda_version", None)
+            if (
+                settings.get("speculative_mtp") is True
+                and "spec_draft_model_path" not in settings
+            ):
+                settings["spec_draft_model_path"] = ""
             settings["extra_args"] = parsed.extra_args
             self.config.apply_values_to_ui(self.ui, settings)
-            self._set_mtp_manual_draft_path(
-                settings.get("spec_draft_model_path", "")
-            )
+            if "spec_draft_model_path" in settings:
+                self._set_mtp_manual_draft_path(settings["spec_draft_model_path"])
         finally:
             self._applying_cli = False
 
@@ -2695,6 +2818,13 @@ class LlamaGUI:
         else:
             status = "CLI applied"
             color = "#4CAF50"
+        ignored = []
+        if parsed.executable:
+            ignored.append("program path")
+        if parsed.model_path:
+            ignored.append("model path")
+        if ignored and not parsed.warnings:
+            status += " (ignored " + ", ".join(ignored) + ")"
         self.ui.cli_status.setText(status)
         self.ui.cli_status.setStyleSheet(f"color: {color};")
         if parsed.extra_args:
@@ -2704,16 +2834,16 @@ class LlamaGUI:
 
     def copy_cli_preview(self):
         self.update_cli_preview(force=True)
-        text = self.ui.cli_preview.text().strip()
+        text = self.portable_cli_text().strip()
         if not text:
             self.ui.cli_status.setText("CLI is empty")
             self.ui.cli_status.setStyleSheet("color: #f44336;")
             return
 
         QApplication.clipboard().setText(text)
-        self.ui.cli_status.setText("CLI copied")
+        self.ui.cli_status.setText("CLI copied with relative paths")
         self.ui.cli_status.setStyleSheet("color: #4CAF50;")
-        self.log_mgr.append("CLI copied to clipboard")
+        self.log_mgr.append("CLI copied to clipboard with relative paths")
 
     def import_cli_from_clipboard(self):
         text = QApplication.clipboard().text().strip()
@@ -3383,42 +3513,6 @@ class LlamaGUI:
         if model_path:
             info.setdefault("path", model_path)
             info.setdefault("_model_path", model_path)
-        is_mtp_model = self._is_mtp_model_info(info)
-        manual_draft = self._mtp_manual_draft_path(info)
-        configured_draft = str(
-            self.config.settings.spec_draft_model_path or ""
-        ).strip()
-        manual_draft_selected = bool(
-            manual_draft
-            and os.path.isfile(manual_draft)
-            and self._mtp_model_key(manual_draft)
-            == self._mtp_model_key(configured_draft)
-        )
-        auto_draft = self._auto_mtp_draft_path(info)
-        auto_draft_selected = bool(
-            auto_draft
-            and os.path.isfile(auto_draft)
-            and self._mtp_model_key(auto_draft)
-            == self._mtp_model_key(configured_draft)
-        )
-        if configured_draft and not (manual_draft_selected or auto_draft_selected):
-            self.config.settings.spec_draft_model_path = ""
-        if not is_mtp_model:
-            # Сохранённый MTP-чекбокс/пресет не должен ломать обычные GGUF.
-            # Пользовательские эксперименты всё ещё можно задать вручную в Extra params.
-            self.config.settings.speculative_mtp = False
-        if (
-            self.ui.auto_params.isChecked()
-            and is_mtp_model
-            and not self._auto_mtp_supported(info)
-            and not manual_draft_selected
-        ):
-            self.config.settings.speculative_mtp = False
-            self.config.settings.spec_draft_model_path = ""
-            self.log_mgr.append(
-                "MTP auto: disabled because no usable embedded or nearby draft was found, or auto-selection was manually disabled.",
-                "warn",
-            )
         if self.ui.auto_params.isChecked() and self._auto_mtp_supported(info):
             block_count = int(info.get("block_count") or 0)
             self.config.settings.gpu_auto = False

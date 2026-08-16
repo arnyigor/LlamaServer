@@ -19,8 +19,53 @@ class ParsedCliCommand:
     warnings: list[str] = field(default_factory=list)
 
 
+def _normalize_command_line_text(command: str) -> str:
+    """Normalize copied CLI text before tokenization.
+
+    Users often paste multi-line Windows commands where `^` is only a cmd.exe
+    line-continuation marker. CommandLineToArgvW treats it as a literal token,
+    so remove it before parsing.
+    """
+    lines = str(command or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    parts: list[str] = []
+    current = ""
+    saw_args_prefix = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("args:"):
+            line = line.split(":", 1)[1].strip()
+            saw_args_prefix = True
+        elif saw_args_prefix and not line.startswith(("-", "^", "`", '"', "'")):
+            break
+
+        continuation = False
+        while line in {"^", "`"}:
+            line = ""
+            continuation = True
+            break
+        if line.endswith("^") and not line.endswith("^^"):
+            line = line[:-1].rstrip()
+            continuation = True
+        elif line.endswith("`") and not line.endswith("``"):
+            line = line[:-1].rstrip()
+            continuation = True
+
+        if line:
+            current = f"{current} {line}".strip()
+        if not continuation and current:
+            parts.append(current)
+            current = ""
+
+    if current:
+        parts.append(current)
+    return " ".join(parts).strip()
+
+
 def split_command_line(command: str) -> list[str]:
-    text = str(command or "").strip()
+    text = _normalize_command_line_text(command)
     if not text:
         return []
     if os.name == "nt":
@@ -31,10 +76,14 @@ def split_command_line(command: str) -> list[str]:
         argv = shell32.CommandLineToArgvW(ctypes.c_wchar_p(text), ctypes.byref(argc))
         if argv:
             try:
-                return [argv[i] for i in range(argc.value)]
+                return [
+                    arg
+                    for arg in (argv[i] for i in range(argc.value))
+                    if str(arg).strip() not in {"^", "`"}
+                ]
             finally:
                 ctypes.windll.kernel32.LocalFree(argv)  # type: ignore[attr-defined]
-    return shlex.split(text)
+    return [arg for arg in shlex.split(text) if str(arg).strip() not in {"^", "`"}]
 
 
 def _quote_args(args: list[str]) -> str:
