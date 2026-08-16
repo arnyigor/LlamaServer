@@ -979,3 +979,24 @@ class ConfigManager:
                 pass
 
         return True
+
+    def delete_perf_preset(self, model_path: str, preset_name: str) -> bool:
+        """Delete a named performance preset for the selected model."""
+        if not model_path:
+            return False
+
+        preset_name = _normalize_perf_preset_name(preset_name)
+        if preset_name == _PERF_DEFAULT_PRESET_NAME:
+            return False
+
+        root = self.profiles.get(_PERF_PRESETS_ROOT, {})
+        if not isinstance(root, dict):
+            return False
+
+        key = self._perf_named_preset_key(model_path, preset_name)
+        if key not in root:
+            return False
+
+        root.pop(key, None)
+        self.save_profiles()
+        return True

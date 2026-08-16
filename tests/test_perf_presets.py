@@ -263,6 +263,30 @@ class TestPerfPresetsUI(unittest.TestCase):
         self.assertEqual(self.ui.threads.value(), 9)
         self.assertEqual(self.ui.cache_type_k.currentText(), "q4_1")
 
+    def test_add_and_delete_named_preset(self):
+        with patch("main.QInputDialog.getText", return_value=("coding", True)):
+            self.gui.add_preset()
+
+        self.assertEqual(self.ui.preset_name_combo.currentText(), "coding")
+        self.assertTrue(self.ui.delete_preset_btn.isEnabled())
+
+        self._set_saved_values()
+        with patch.object(QMessageBox, "information", return_value=None):
+            self.gui.save_preset()
+
+        self.assertIn("coding", self.config.list_perf_preset_names(self.model_path))
+
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.gui.delete_preset()
+
+        self.assertNotIn("coding", self.config.list_perf_preset_names(self.model_path))
+        self.assertEqual(self.ui.preset_name_combo.currentText(), "default")
+        self.assertFalse(self.ui.delete_preset_btn.isEnabled())
+
     def test_force_stop_is_available_even_without_owned_process(self):
         self.gui.update_action_buttons()
 

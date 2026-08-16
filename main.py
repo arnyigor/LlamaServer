@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QMessageBox,
+    QInputDialog,
     QSystemTrayIcon,
     QMenu,
 )
@@ -195,6 +196,9 @@ class LlamaGUI:
         u.preset_name_combo.activated.connect(
             lambda _index: self._on_preset_selected()
         )
+        u.preset_name_combo.currentIndexChanged.connect(
+            lambda _index: self._update_preset_buttons()
+        )
         for btn in getattr(u, "ctx_quick_buttons", []):
             btn.clicked.connect(
                 lambda _checked=False, b=btn: self._set_context_size_from_button(
@@ -283,6 +287,8 @@ class LlamaGUI:
         u._browse_claude_clicked = self.browse_claude_config
         u._browse_chat_template_clicked = self.browse_chat_template
         u._browse_mtp_draft_clicked = self.browse_mtp_draft_model
+        u.add_preset_btn.clicked.connect(self.add_preset)
+        u.delete_preset_btn.clicked.connect(self.delete_preset)
         u.save_preset_btn.clicked.connect(self.save_preset)
         u.autotune_btn.clicked.connect(self.open_autotune_tab)
         u.autotune.build_plan_requested.connect(self.build_autotune_plan)
@@ -1184,6 +1190,12 @@ class LlamaGUI:
             return "default"
         return combo.currentText().strip() or "default"
 
+    def _update_preset_buttons(self):
+        delete_btn = getattr(self.ui, "delete_preset_btn", None)
+        if delete_btn is None:
+            return
+        delete_btn.setEnabled(self._current_perf_preset_name() != "default")
+
     def _refresh_perf_preset_names(self, selected_name: str = ""):
         combo = getattr(self.ui, "preset_name_combo", None)
         if combo is None:
@@ -1202,6 +1214,7 @@ class LlamaGUI:
             combo.setCurrentText(selected_name)
         finally:
             combo.blockSignals(False)
+        self._update_preset_buttons()
 
     def _on_preset_selected(self):
         if getattr(self, "_loading_preset", False) or self.ui.loading_profile:
@@ -1223,6 +1236,70 @@ class LlamaGUI:
         if hasattr(self.ui, "preset_status"):
             self.ui.preset_status.setText(f"Preset: none ({preset_name})")
             self.ui.preset_status.setStyleSheet("color: #888;")
+        self._update_preset_buttons()
+
+    def add_preset(self):
+        model_path = self._current_model_path()
+        if not model_path:
+            QMessageBox.warning(self.ui, "Error", "Select a model first")
+            return
+
+        name, ok = QInputDialog.getText(
+            self.ui,
+            "Add preset",
+            "Preset name:",
+        )
+        if not ok:
+            return
+
+        preset_name = str(name or "").strip()
+        if not preset_name:
+            QMessageBox.warning(self.ui, "Error", "Preset name cannot be empty")
+            return
+        if preset_name.casefold() == "default":
+            QMessageBox.warning(self.ui, "Error", "Default preset already exists")
+            return
+
+        if self.ui.preset_name_combo.findText(preset_name) < 0:
+            self.ui.preset_name_combo.addItem(preset_name)
+        self.ui.preset_name_combo.setCurrentText(preset_name)
+        self._update_preset_buttons()
+        if hasattr(self.ui, "preset_status"):
+            self.ui.preset_status.setText(f"Preset: new {preset_name}, not saved")
+            self.ui.preset_status.setStyleSheet("color: #FF9800;")
+
+    def delete_preset(self):
+        model_path = self._current_model_path()
+        if not model_path:
+            QMessageBox.warning(self.ui, "Error", "Select a model first")
+            return
+
+        preset_name = self._current_perf_preset_name()
+        if preset_name == "default":
+            QMessageBox.warning(self.ui, "Error", "Default preset cannot be deleted")
+            return
+
+        answer = QMessageBox.question(
+            self.ui,
+            "Delete preset",
+            f"Delete preset '{preset_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        if not self.config.delete_perf_preset(model_path, preset_name):
+            QMessageBox.warning(self.ui, "Error", "Preset was not found")
+            return
+
+        self.log_mgr.append(
+            f"Preset deleted: {preset_name} | {os.path.basename(model_path)}"
+        )
+        self._refresh_perf_preset_names("default")
+        if hasattr(self.ui, "preset_status"):
+            self.ui.preset_status.setText(f"Preset: deleted {preset_name}")
+            self.ui.preset_status.setStyleSheet("color: #FF9800;")
 
     def save_preset(self):
         model_path = self._current_model_path()

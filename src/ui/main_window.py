@@ -522,6 +522,13 @@ class MainWindowUI(QMainWindow):
         self.save_preset_btn.setToolTip(
             "Save parameters (ngl, ncmoe, etc.) under selected preset name"
         )
+        self.add_preset_btn = QPushButton("Add")
+        self.add_preset_btn.setToolTip("Add a named preset for the selected model")
+        self.delete_preset_btn = QPushButton("Delete")
+        self.delete_preset_btn.setEnabled(False)
+        self.delete_preset_btn.setToolTip(
+            "Delete the selected named preset. The default preset cannot be deleted."
+        )
 
         self.preset_status = QLabel("Preset: none")
         self.preset_status.setStyleSheet("color: #888;")
@@ -611,6 +618,8 @@ class MainWindowUI(QMainWindow):
         r6.addStretch(1)
         r6.addWidget(QLabel("Preset:"))
         r6.addWidget(self.preset_name_combo)
+        r6.addWidget(self.add_preset_btn)
+        r6.addWidget(self.delete_preset_btn)
         r6.addWidget(self.save_preset_btn)
         r6.addWidget(self.preset_status)
         launch.addLayout(r6)
@@ -1103,6 +1112,8 @@ class MainWindowUI(QMainWindow):
             self.bench_prompt,
             self.bench_gen,
             self.preset_name_combo,
+            self.add_preset_btn,
+            self.delete_preset_btn,
             self.save_preset_btn,
             self.cli_manual_mode,
             self.cli_apply_btn,
