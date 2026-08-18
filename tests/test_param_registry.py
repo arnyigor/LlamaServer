@@ -7,8 +7,6 @@
 обновлять PARAM_REGISTRY и этот файл одновременно.
 """
 
-import pytest
-
 from src.core.param_registry import (
     FIELD_WIDGET_MAP,
     FILTER_BOOL_FLAGS,
