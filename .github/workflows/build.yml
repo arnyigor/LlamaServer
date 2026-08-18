@@ -52,9 +52,11 @@ jobs:
           .\.venv\Scripts\python.exe -m mypy src/core/
 
       - name: Build executable
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         run: .\.venv\Scripts\pyinstaller.exe --noconfirm --clean LlamaServerGUI.spec
 
       - name: Package executable
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } elseif ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.release_tag }}" } else { "${{ github.sha }}" }
@@ -63,6 +65,7 @@ jobs:
           "ARCHIVE=$archive" >> $env:GITHUB_ENV
 
       - name: Upload build artifact
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: LlamaServerGUI-windows
