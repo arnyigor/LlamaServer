@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,48 @@ from src.services.report_writer import (
     write_markdown_report,
     write_plan,
 )
+
+
+class _DummyBenchStdout:
+    """Line-by-line reader used by _DummyBenchProcess to feed the runner's
+    reader thread. Yields buffered lines, then '' (EOF)."""
+
+    def __init__(self, text: str):
+        self._lines = [line + "\n" for line in (text or "").splitlines()]
+
+    def readline(self) -> str:
+        if self._lines:
+            return self._lines.pop(0)
+        return ""
+
+
+class _DummyBenchProcess:
+    """Minimal subprocess.Popen stand-in for BenchmarkRunner.run().
+
+    `poll()` reports 'still running' while buffered output remains, then the
+    real returncode once the reader thread has drained it — mirroring how the
+    runner's watchdog loop waits for the process to finish.
+    """
+
+    def __init__(self, text: str, returncode: int = 0):
+        self._stdout = _DummyBenchStdout(text)
+        self.returncode = returncode
+
+    @property
+    def stdout(self):
+        return self._stdout
+
+    def poll(self):
+        return None if self._stdout._lines else self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 @dataclass
@@ -460,15 +503,6 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
         self.assertEqual(metrics.ram_used_mib, 9100)
 
     def test_runner_marks_success_and_writes_log(self):
-        class DummyProcess:
-            returncode = 0
-
-            def communicate(self, timeout=None):
-                return "| x | pp 128 | 100.0 ± 1 |\n| x | tg 256 | 20.0 ± 1 |", None
-
-            def poll(self):
-                return 0
-
         candidate = BenchmarkCandidate(
             "run_001", {"ctx_size": 8192}, "test", "baseline"
         )
@@ -476,7 +510,9 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
             tempfile.TemporaryDirectory() as tmpdir,
             patch(
                 "src.services.benchmark_runner.subprocess.Popen",
-                return_value=DummyProcess(),
+                return_value=_DummyBenchProcess(
+                    "| x | pp 128 | 100.0 ± 1 |\n| x | tg 256 | 20.0 ± 1 |"
+                ),
             ),
         ):
             runner = BenchmarkRunner("llama-bench.exe", "model.gguf", tmpdir)
@@ -488,21 +524,15 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
             self.assertTrue(Path(result.log_path).exists())
 
     def test_runner_detects_oom(self):
-        class DummyProcess:
-            returncode = 1
-
-            def communicate(self, timeout=None):
-                return "CUDA error: out of memory while allocating buffer", None
-
-            def poll(self):
-                return 0
-
         candidate = BenchmarkCandidate("run_002", {"ctx_size": 131072}, "oom", "memory")
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch(
                 "src.services.benchmark_runner.subprocess.Popen",
-                return_value=DummyProcess(),
+                return_value=_DummyBenchProcess(
+                    "CUDA error: out of memory while allocating buffer",
+                    returncode=1,
+                ),
             ),
         ):
             runner = BenchmarkRunner("llama-bench.exe", "model.gguf", tmpdir)
@@ -510,6 +540,43 @@ class TestBenchmarkRunnerParsing(unittest.TestCase):
 
             self.assertEqual(result.status, "failed_oom")
             self.assertEqual(result.error, "Out of memory")
+
+    def test_runner_watchdog_aborts_on_no_output(self):
+        class HangProcess:
+            returncode = None
+
+            @property
+            def stdout(self):
+                return _DummyBenchStdout("")  # never yields output
+
+            def poll(self):
+                return None  # process never finishes
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return None
+
+        candidate = BenchmarkCandidate("run_003", {"ctx_size": 8192}, "test", "baseline")
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "src.services.benchmark_runner.subprocess.Popen",
+                return_value=HangProcess(),
+            ),
+        ):
+            runner = BenchmarkRunner("llama-bench.exe", "model.gguf", tmpdir)
+            start = time.monotonic()
+            result = runner.run(candidate, 128, 256, 1)  # 1s launch timeout
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(result.status, "failed_timeout")
+        self.assertIn("did not load", result.error)
+        self.assertLess(elapsed, 10)  # aborted near the timeout, not hanging
 
 
 class TestAutoTuneManager(unittest.TestCase):
@@ -582,7 +649,7 @@ class TestAutoTuneManager(unittest.TestCase):
             manager = AutoTuneManager(
                 "llama-bench.exe",
                 plan,
-                per_run_timeout_sec=120,
+                launch_timeout_sec=120,
                 output_root=tmpdir,
             )
             manager.run()

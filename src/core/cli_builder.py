@@ -284,6 +284,28 @@ def build_args(
             # Latest llama.cpp uses --reasoning on/off for thinking templates;
             # --chat-template-kwargs enable_thinking is now deprecated.
             args += ["--reasoning", reasoning_mode]
+
+        # --- Reasoning controls (effort / preserve / budget) ---
+        # Эмитятся только когда reasoning активен (on/auto). При явном
+        # --reasoning off (в т.ч. когда enable_thinking=false принудительно
+        # ставит off) эти суб-параметры бессмысленны и не добавляются, чтобы
+        # не генерировать конфликтующие/лишние флаги. Сами значения остаются
+        # в настройках и вернутся в CLI при возврате reasoning в on/auto.
+        if reasoning_mode != "off":
+            effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
+            if effort:
+                args += ["--reasoning-effort", effort]
+            preserve = str(getattr(cfg, "reasoning_preserve", "off") or "off").strip().lower()
+            if preserve == "preserve":
+                args.append("--reasoning-preserve")
+            elif preserve == "no-preserve":
+                args.append("--no-reasoning-preserve")
+            budget = int(getattr(cfg, "reasoning_budget", 0) or 0)
+            if budget > 0:
+                args += ["--reasoning-budget", str(budget)]
+            budget_msg = str(getattr(cfg, "reasoning_budget_message", "") or "").strip()
+            if budget_msg:
+                args += ["--reasoning-budget-message", budget_msg]
         if cfg.ctx_checkpoints >= 0:
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
         if cfg.cache_ram >= -1:
@@ -339,20 +361,12 @@ def build_args(
         if not cfg.use_mmproj:
             args.append("--no-mmproj")
 
-        if cfg.use_mmap:
-            args.append("--mmap")
-        else:
-            args.append("--no-mmap")
         if cfg.use_mlock:
             args.append("--mlock")
         if cfg.verbose:
             args.append("--verbose")
         if cfg.log_timestamps:
             args.append("--log-timestamps")
-        if not cfg.cont_batching:
-            args.append("--no-cont-batching")
-        if not cfg.cache_prompt:
-            args.append("--no-cache-prompt")
         if cfg.context_shift:
             args.append("--context-shift")
         if cfg.no_webui:

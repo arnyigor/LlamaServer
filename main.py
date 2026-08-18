@@ -269,14 +269,11 @@ class LlamaGUI:
         u.presence_penalty.valueChanged.connect(self._on_param_changed)
         u.frequency_penalty.valueChanged.connect(self._on_param_changed)
         u.seed.valueChanged.connect(self._on_param_changed)
-        u.use_mmap.stateChanged.connect(self._on_param_changed)
         u.use_mlock.stateChanged.connect(self._on_param_changed)
         u.verbose.stateChanged.connect(self._on_param_changed)
         u.log_timestamps.stateChanged.connect(self._on_param_changed)
         u.cuda_visible_devices.textChanged.connect(self._on_param_changed)
         u.cuda_module_loading.textChanged.connect(self._on_param_changed)
-        u.cont_batching.stateChanged.connect(self._on_param_changed)
-        u.cache_prompt.stateChanged.connect(self._on_param_changed)
         u.context_shift.stateChanged.connect(self._on_param_changed)
         u.no_webui.stateChanged.connect(self._on_param_changed)
         u.use_mmproj.stateChanged.connect(self._on_param_changed)
@@ -296,7 +293,6 @@ class LlamaGUI:
         u.integration_target.currentIndexChanged.connect(self.check_integration_models)
         u.opencode_config_path.editingFinished.connect(self._on_config_path_changed)
         u.pi_config_path.editingFinished.connect(self._on_config_path_changed)
-        u.claude_config_path.editingFinished.connect(self._on_config_path_changed)
         u.exe_path.textChanged.connect(self.auto_detect_bench)
         u.exe_path.textChanged.connect(self.update_cli_preview)
         u.copy_model_btn.clicked.connect(self._copy_model_path)
@@ -309,13 +305,11 @@ class LlamaGUI:
         u._browse_model_dir_clicked = self.browse_model_dir
         u._browse_opencode_clicked = self.browse_opencode_config
         u._browse_pi_clicked = self.browse_pi_config
-        u._browse_claude_clicked = self.browse_claude_config
         u._browse_chat_template_clicked = self.browse_chat_template
         u._browse_mtp_draft_clicked = self.browse_mtp_draft_model
         u.add_preset_btn.clicked.connect(self.add_preset)
         u.delete_preset_btn.clicked.connect(self.delete_preset)
         u.save_preset_btn.clicked.connect(self.save_preset)
-        u.autotune_btn.clicked.connect(self.open_autotune_tab)
         u.autotune.build_plan_requested.connect(self.build_autotune_plan)
         u.autotune.start_requested.connect(self.start_autotune)
         u.autotune.cancel_requested.connect(self.cancel_autotune)
@@ -602,9 +596,9 @@ class LlamaGUI:
 
         detailed = self._parsed_memory_without_process_fallback() > 0
         if vram_total <= 0 and not estimate:
-            note = "Monitor will show detailed or fallback memory data after launch."
+            note = "Detailed or fallback memory data will appear in Overview after launch."
         elif detailed:
-            note = "Monitor is using detailed llama.cpp buffer breakdown."
+            note = "Overview is using detailed llama.cpp buffer breakdown."
         elif vram_total > 0:
             note = (
                 "Detailed memory breakdown unavailable for this llama.cpp build; "
@@ -938,19 +932,6 @@ class LlamaGUI:
         )
         if f:
             self.ui.pi_config_path.setText(f)
-            self.save_settings()
-            self.check_integration_models(silent=True)
-
-    def browse_claude_config(self):
-        start = self.ui.claude_config_path.text().strip()
-        f, _ = QFileDialog.getOpenFileName(
-            self.ui,
-            "Select Claude Code settings.json",
-            start,
-            "JSON (*.json);;All files (*.*)",
-        )
-        if f:
-            self.ui.claude_config_path.setText(f)
             self.save_settings()
             self.check_integration_models(silent=True)
 
@@ -2578,7 +2559,6 @@ class LlamaGUI:
         self.ui.fit_off.setChecked(True)
         self.ui.reasoning_mode.setCurrentText("off")
         self.ui.enable_thinking.setCurrentText("false")
-        self.ui.cache_prompt.setChecked(True)
         self.ui.use_mmproj.setChecked(False)
         self.ui.jinja.setChecked(True)
         self.ui.context_shift.setChecked(False)
@@ -3262,7 +3242,6 @@ class LlamaGUI:
         if not getattr(self, "_mem_viz_dirty", False):
             return
         self._mem_viz_dirty = False
-        self.ui.mem_viz.update_from_data(self._mem_data)
         self._refresh_overview()
 
     def _on_log_for_mem_viz(self, text: str, level: str):
@@ -3303,29 +3282,25 @@ class LlamaGUI:
         self._schedule_mem_viz_flush()
 
     def _reset_mem_viz(self, status: str | None = None):
-        """Сброс визуализации памяти."""
+        """Сброс данных памяти (визуализация удалена)."""
         self._mem_viz_dirty = False
         timer = getattr(self, "_mem_viz_timer", None)
         if timer is not None:
             timer.stop()
         self._mem_data = MemoryData()
         self._memory_summary_logged = False
-        self.ui.mem_viz.clear()
-        if status:
-            self.ui.mem_viz.status_label.setText(status)
         self._refresh_overview()
 
     def _finalize_mem_viz_after_stop(self, exit_code: int | None, status: str):
-        """Обновляет вкладку Memory после выгрузки модели/остановки процесса."""
+        """Финализирует данные памяти после остановки процесса."""
         if self._mem_data.fatal_error:
             # При ошибке оставляем диагностические данные, чтобы было видно,
             # какой компонент и сколько памяти пытались выделить.
             self._mem_data.process_exit_code = exit_code
-            self.ui.mem_viz.update_from_data(self._mem_data)
             self._refresh_overview()
         else:
             # Нормальная выгрузка освобождает RAM/VRAM — старые allocations
-            # больше неактуальны, поэтому полностью очищаем вкладку.
+            # больше неактуальны, поэтому полностью очищаем данные.
             self._reset_mem_viz(status)
 
     @staticmethod
@@ -3755,14 +3730,6 @@ class LlamaGUI:
             self.ui.models_by_path[model_path] = info
         return info
 
-    def open_autotune_tab(self):
-        """Opens the right-side AutoTune workspace and builds a fresh plan."""
-        if hasattr(self.ui, "tabs"):
-            index = self.ui.tabs.indexOf(self.ui.autotune)
-            if index >= 0:
-                self.ui.tabs.setCurrentIndex(index)
-        self.build_autotune_plan()
-
     def _current_autotune_plan_signature(self, options=None):
         if options is None:
             options = self.ui.autotune.options()
@@ -3921,10 +3888,10 @@ class LlamaGUI:
             model_info=self._current_model_info(),
             prompt_tokens=self.ui.bench_prompt.value(),
             generation_tokens=self.ui.bench_gen.value(),
-            per_run_timeout_sec=options["per_run_timeout_sec"],
+            launch_timeout_sec=options["launch_timeout_sec"],
         )
         self.ui.autotune.prepare_run(
-            len(plan.candidates), options["per_run_timeout_sec"]
+            len(plan.candidates), options["launch_timeout_sec"]
         )
         self.autotune.log.connect(lambda text, level: self.log_mgr.append(text, level))
         self.autotune.log.connect(
@@ -4057,13 +4024,6 @@ class LlamaGUI:
                 if bool(params.get("fit_off", self.ui.fit_off.isChecked()))
                 else "auto",
             ),
-            (
-                "Prompt cache",
-                "on" if self.ui.cache_prompt.isChecked() else "off",
-                "on"
-                if bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked()))
-                else "off",
-            ),
         ]
         lines = []
         for label, current, best in fields:
@@ -4183,9 +4143,6 @@ class LlamaGUI:
             )
             self.ui.fit_off.setChecked(
                 bool(params.get("fit_off", self.ui.fit_off.isChecked()))
-            )
-            self.ui.cache_prompt.setChecked(
-                bool(params.get("cache_prompt", self.ui.cache_prompt.isChecked()))
             )
             self.ui.cpu_moe_layers.setValue(
                 int(params.get("ncmoe", self.ui.cpu_moe_layers.value()))
@@ -4581,7 +4538,6 @@ class LlamaGUI:
             and not self.server.server_stop_requested
         )
         self.ui.test_btn.setEnabled(not busy and not upd)
-        self.ui.autotune_btn.setEnabled(not busy and not upd)
         self.ui.autotune.start_btn.setEnabled(not busy and not upd)
         self.ui.autotune.build_plan_btn.setEnabled(not busy and not upd)
         self.ui.autotune.cancel_btn.setEnabled(bool(tune))
@@ -4649,19 +4605,52 @@ class LlamaGUI:
             return
         target = self.ui.current_config_target()
         config_path = self.ui.current_config_path()
+
+        # Размер контекста: ручное значение из UI либо авто-опрос сервера.
+        max_context = self.ui.integration_max_context.value()
+        if not max_context or max_context <= 0:
+            max_context = self.query_server_context_window(
+                self.ui.current_base_url()
+            )
+
         mgr = IntegrationManager(base_url=self.ui.current_base_url())
-        result = mgr.add_model(config_path, target, model_id)
+        result = mgr.add_model(
+            config_path, target, model_id, max_context=max_context or 0
+        )
         self.ui.integration_status.setText(result.message)
         if result.success:
-            if target == "claude":
-                # Tool use through llama-server's Anthropic-compatible endpoint
-                # requires Jinja chat templates.
-                self.ui.jinja.setChecked(True)
-                self.save_settings()
             self.ui.integration_models_list.clear()
             self.ui.integration_models_list.addItems(result.model_ids)
         else:
             QMessageBox.warning(self.ui, "Integration Error", result.message)
+
+    def query_server_context_window(self, base_url: str) -> int:
+        """Живой опрос сервера llama.cpp: GET /slots -> max(n_ctx).
+
+        /slots — нативный endpoint у корня (не под /v1), поэтому /v1
+        отрезается. Возвращает 0 при недоступности сервера.
+        """
+        import json
+        import urllib.request
+        import urllib.error
+
+        root = (base_url or "").rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        url = f"{root}/slots"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("Accept", "application/json")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list) and data:
+                return max(
+                    (int(s.get("n_ctx", 0)) for s in data if isinstance(s, dict)),
+                    default=0,
+                )
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError):
+            pass
+        return 0
 
     def remove_model_from_integration(self):
         selected = self.ui.integration_models_list.currentItem()

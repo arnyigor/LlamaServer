@@ -182,7 +182,6 @@ class MainWindowUI(QMainWindow):
             self.presence_penalty,
             self.frequency_penalty,
             self.seed,
-            self.use_mmap,
             self.use_mlock,
             self.verbose,
             self.log_timestamps,
@@ -202,13 +201,15 @@ class MainWindowUI(QMainWindow):
             self.cache_ram,
             self.host,
             self.port,
-            self.cont_batching,
-            self.cache_prompt,
             self.context_shift,
             self.no_webui,
             self.jinja,
             self.reasoning_mode,
             self.enable_thinking,
+            self.reasoning_effort,
+            self.reasoning_preserve,
+            self.reasoning_budget,
+            self.reasoning_budget_message,
             self.extra_args,
             self.cuda_visible_devices,
             self.cuda_module_loading,
@@ -880,13 +881,44 @@ class MainWindowUI(QMainWindow):
         self.enable_thinking = QComboBox()
         self.enable_thinking.addItems(["off", "false", "true"])
         self.enable_thinking.setCurrentText("off")
+        self.reasoning_effort = QComboBox()
+        self.reasoning_effort.addItems(["", "low", "medium", "xhigh"])
+        self.reasoning_effort.setCurrentText("")
+        self.reasoning_preserve = QComboBox()
+        self.reasoning_preserve.addItems(["off", "preserve", "no-preserve"])
+        self.reasoning_preserve.setCurrentText("off")
+        self.reasoning_budget = QSpinBox()
+        self.reasoning_budget.setRange(0, 32767)
+        self.reasoning_budget.setValue(0)
+        self.reasoning_budget_message = QLineEdit(placeholderText="optional")
         r7 = QHBoxLayout()
         r7.addWidget(QLabel(self.tr("Reasoning (--reasoning):")))
         r7.addWidget(self.reasoning_mode)
         r7.addSpacing(10)
         r7.addWidget(QLabel(self.tr("Thinking:")))
         r7.addWidget(self.enable_thinking)
+        r7.addSpacing(10)
+        r7.addWidget(QLabel(self.tr("Effort (--reasoning-effort):")))
+        r7.addWidget(self.reasoning_effort)
+        r7.addSpacing(10)
+        r7.addWidget(QLabel(self.tr("Preserve (--reasoning-preserve):")))
+        r7.addWidget(self.reasoning_preserve)
         sampling.addLayout(r7)
+
+        # Budget и Budget msg — вертикально ("друг под другом"): текстовое
+        # поле рядом со спинбоксом неудобно, а сообщение удобнее на всю ширину.
+        r7b = QVBoxLayout()
+        r7b.setSpacing(4)
+        row_budget = QHBoxLayout()
+        row_budget.addWidget(QLabel(self.tr("Budget (--reasoning-budget):")))
+        row_budget.addWidget(self.reasoning_budget)
+        row_budget.addStretch(1)
+        r7b.addLayout(row_budget)
+        row_budget_msg = QHBoxLayout()
+        row_budget_msg.addWidget(QLabel(self.tr("Budget msg (--reasoning-budget-message):")))
+        row_budget_msg.addWidget(self.reasoning_budget_message, 1)
+        r7b.addLayout(row_budget_msg)
+        sampling.addLayout(r7b)
 
         self.host = QLineEdit(placeholderText="127.0.0.1")
         self.host.setText("127.0.0.1")
@@ -1088,13 +1120,10 @@ class MainWindowUI(QMainWindow):
             widget.setToolTip(help_text)
         sampling.addLayout(sampling_grid)
 
-        self.use_mmap = QCheckBox(self.tr("mmap"))
-        self.use_mmap.setChecked(True)
         self.use_mlock = QCheckBox(self.tr("mlock"))
         self.verbose = QCheckBox(self.tr("verbose"))
         self.log_timestamps = QCheckBox(self.tr("log timestamps"))
         memory_flags = QHBoxLayout()
-        memory_flags.addWidget(self.use_mmap)
         memory_flags.addWidget(self.use_mlock)
         memory_flags.addStretch(1)
         lperf.addLayout(memory_flags)
@@ -1116,17 +1145,11 @@ class MainWindowUI(QMainWindow):
         s_cuda.addStretch(1)
         lperf.addLayout(s_cuda)
 
-        self.cont_batching = QCheckBox(self.tr("cont batching"))
-        self.cont_batching.setChecked(True)
-        self.cache_prompt = QCheckBox(self.tr("cache prompt"))
-        self.cache_prompt.setChecked(True)
         self.context_shift = QCheckBox(self.tr("context shift"))
         self.no_webui = QCheckBox(self.tr("no webui"))
         self.jinja = QCheckBox(self.tr("jinja"))
         s3 = QHBoxLayout()
         for w in [
-            self.cont_batching,
-            self.cache_prompt,
             self.context_shift,
             self.no_webui,
             self.jinja,
@@ -1165,7 +1188,7 @@ class MainWindowUI(QMainWindow):
     def _build_integration_section(self):
         # === 5. Интеграция ===
         self.int_panel = CollapsiblePanel(
-            self.tr("Integration (OpenCode / PI / Claude Code)"),
+            self.tr("Integration (OpenCode / PI)"),
             settings_key="panel_integration",
         )
 
@@ -1193,25 +1216,28 @@ class MainWindowUI(QMainWindow):
         pi_layout.addWidget(pi_btn)
         self.int_panel.add_widget(self.pi_row)
 
-        self.claude_row = QWidget()
-        claude_layout = QHBoxLayout(self.claude_row)
-        claude_layout.setContentsMargins(0, 0, 0, 0)
-        claude_layout.addWidget(QLabel(self.tr("Claude settings JSON:")))
-        self.claude_config_path = QLineEdit(
-            placeholderText="Path to ~/.claude/settings.json"
+        # Максимальный контекст: авто (0) или ручное значение (токены).
+        # При 0 значение подтягивается с сервера (GET /slots -> n_ctx) в main.py.
+        ctx_layout = QHBoxLayout()
+        ctx_layout.addWidget(QLabel(self.tr("Max context (tokens, 0=auto):")))
+        self.integration_max_context = QSpinBox()
+        self.integration_max_context.setRange(0, 2_000_000)
+        self.integration_max_context.setValue(0)
+        self.integration_max_context.setSingleStep(1024)
+        self.integration_max_context.setToolTip(
+            self.tr(
+                "Размер окна контекста сервера. 0 — авто (считывается с "
+                "запущенного сервера). Агент будет корректно сжимать контекст."
+            )
         )
-        claude_btn = QPushButton(self.tr("..."))
-        claude_btn.clicked.connect(self._browse_claude_clicked)
-        claude_layout.addWidget(self.claude_config_path)
-        claude_layout.addWidget(claude_btn)
-        self.int_panel.add_widget(self.claude_row)
+        ctx_layout.addWidget(self.integration_max_context)
+        self.int_panel.add_layout(ctx_layout)
 
         tgt_layout = QHBoxLayout()
         tgt_layout.addWidget(QLabel(self.tr("Target:")))
         self.integration_target = QComboBox()
         self.integration_target.addItem("OpenCode", "opencode")
         self.integration_target.addItem("PI", "pi")
-        self.integration_target.addItem("Claude Code", "claude")
         tgt_layout.addWidget(self.integration_target)
         self.integration_check_btn = QPushButton(self.tr("Check"))
         tgt_layout.addWidget(self.integration_check_btn)
@@ -1248,7 +1274,6 @@ class MainWindowUI(QMainWindow):
         target = self.integration_target.currentData() or "opencode"
         self.opencode_row.setVisible(target == "opencode")
         self.pi_row.setVisible(target == "pi")
-        self.claude_row.setVisible(target == "claude")
 
     def _build_benchmark_section(self):
         # === 6. Бенчмарк ===
@@ -1277,15 +1302,7 @@ class MainWindowUI(QMainWindow):
         self.test_btn.setStyleSheet(
             "background-color: #2196F3; color: white; font-weight: bold; padding: 6px;"
         )
-        self.autotune_btn = QPushButton(self.tr("AutoTune..."))
-        self.autotune_btn.setToolTip(
-            "Open AutoTune, build candidates from current model/context, then run automatic benchmark"
-        )
-        self.autotune_btn.setStyleSheet(
-            "background-color: #673AB7; color: white; font-weight: bold; padding: 6px;"
-        )
         bench_buttons.addWidget(self.test_btn)
-        bench_buttons.addWidget(self.autotune_btn)
         self.bench_panel.add_layout(bench_buttons)
 
     def _build_cli_section(self, lay):
@@ -1439,15 +1456,6 @@ class MainWindowUI(QMainWindow):
         overview.addStretch(1)
         self.tabs.addTab(overview_tab, "Overview")
 
-        # Monitor: visible memory visualization with its own graceful empty/fallback state.
-        monitor_tab = QWidget()
-        monitor_layout = QVBoxLayout(monitor_tab)
-        monitor_layout.setContentsMargins(0, 0, 0, 0)
-        self.mem_viz = MemoryVisualizationWidget()
-        self.mem_viz.setVisible(True)
-        monitor_layout.addWidget(self.mem_viz)
-        self.tabs.addTab(monitor_tab, "Monitor")
-
         # Вкладка логов
         log_tab = QWidget()
         self.log_tab = log_tab
@@ -1473,7 +1481,7 @@ class MainWindowUI(QMainWindow):
         self.tabs.addTab(log_tab, "Logs")
 
         self.autotune = AutoTuneWidget()
-        self.tabs.addTab(self.autotune, "AutoTune")
+        self.bench_panel.add_widget(self.autotune)
 
         lay.addWidget(self.tabs)
         return panel
@@ -1515,7 +1523,6 @@ class MainWindowUI(QMainWindow):
             self.model_combo: "Selected GGUF model",
             self.auto_params: "Automatically sets parameters",
             self.start_btn: "Starts llama-server",
-            self.autotune_btn: "Opens AutoTune and builds a plan from current settings",
             self.speculative_mtp: "Enable MTP speculative decoding when the selected model/package supports it",
             self.spec_draft_model_path: "Separate MTP/draft GGUF path, auto-detected when possible",
             self.reload_btn: "Restarts llama-server with current parameters",
@@ -1586,9 +1593,6 @@ class MainWindowUI(QMainWindow):
     def _browse_pi_clicked(self):
         pass
 
-    def _browse_claude_clicked(self):
-        pass
-
     def _browse_chat_template_clicked(self):
         pass
 
@@ -1599,8 +1603,6 @@ class MainWindowUI(QMainWindow):
         target = self.current_config_target()
         if target == "pi":
             return self.pi_config_path.text().strip()
-        if target == "claude":
-            return self.claude_config_path.text().strip()
         return self.opencode_config_path.text().strip()
 
     def current_base_url(self):

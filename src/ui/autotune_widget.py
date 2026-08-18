@@ -107,7 +107,7 @@ class AutoTuneWidget(QWidget):
         self._gen_tg: Dict[str, float] = {}  # candidate_id -> gen_tok_s для ΔTG
         self._done_runs = 0
         self._total_runs = 0
-        self._per_run_timeout_sec = 0
+        self._launch_timeout_sec = 0
         self._run_started_at = 0.0
         self._current_run_started_at = 0.0
         self._current_run_id = ""
@@ -129,10 +129,11 @@ class AutoTuneWidget(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Smart", "Quick", "Normal", "Deep"])
         self.mode_combo.setToolTip(
-            "Smart: auto-selects a compact plan from model/hardware constraints.\n"
-            "Quick: small staged plan for fast checks.\n"
-            "Normal: more KV/batch/ubatch/thread candidates.\n"
-            "Deep: wider search, slower but more thorough."
+            "Управляет числом и широтой кандидатов в плане прогона:\n"
+            "Smart — компактный план по железу/модели (рекомендуется);\n"
+            "Quick — быстрая проверка нескольких ключевых точек;\n"
+            "Normal — больше вариантов KV/batch/ubatch/threads;\n"
+            "Deep — самый широкий поиск, дольше всего."
         )
         row1.addWidget(self.mode_combo)
 
@@ -142,57 +143,47 @@ class AutoTuneWidget(QWidget):
             ["Auto", "Balanced", "Max Speed", "Low VRAM", "Quality KV", "MoE Optimized"]
         )
         self.target_combo.setToolTip(
-            "Auto: picks Balanced/Low VRAM/Max Speed from current model and GPU estimate.\n"
-            "Balanced: speed + stability + memory margin.\n"
-            "Max Speed: prioritizes tok/s.\n"
-            "Low VRAM: favors memory-saving settings.\n"
-            "Quality KV: favors higher-quality KV cache.\n"
-            "MoE Optimized: explores CPU MoE offload more aggressively."
+            "Цель оптимизации:\n"
+            "Auto — выбирается из модели/GPU (Balanced/Low VRAM/Max Speed);\n"
+            "Balanced — скорость + стабильность + запас памяти;\n"
+            "Max Speed — приоритет tok/s;\n"
+            "Low VRAM — экономия видеопамяти;\n"
+            "Quality KV — качественный KV-кэш (f16/q8);\n"
+            "MoE Optimized — агрессивнее CPU-offload экспертов."
         )
         row1.addWidget(self.target_combo)
-
-        row1.addWidget(QLabel("Engine:"))
-        self.engine_combo = QComboBox()
-        self.engine_combo.addItems(["llama-bench", "hybrid", "llama-server"])
-        self.engine_combo.setToolTip(
-            "llama-bench: current implemented engine, fastest micro-benchmark.\n"
-            "hybrid/server: planned modes; currently blocked with explanation."
-        )
-        row1.addWidget(self.engine_combo)
+        self.target_help_btn = QPushButton("?")
+        self.target_help_btn.setFixedWidth(24)
+        self.target_help_btn.setToolTip("Показать описание целей")
+        self.target_help_btn.clicked.connect(self._show_target_help)
+        row1.addWidget(self.target_help_btn)
         settings.addLayout(row1)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Time budget (min):"))
         self.time_budget = QSpinBox()
-        self.time_budget.setRange(1, 240)
-        self.time_budget.setValue(10)
+        self.time_budget.setRange(1, 10)
+        self.time_budget.setValue(5)
+        self.time_budget.setToolTip("Общий лимит времени всех прогонов (макс. 10 мин).")
         row2.addWidget(self.time_budget)
 
         row2.addWidget(QLabel("Max runs:"))
         self.max_runs = QSpinBox()
-        self.max_runs.setRange(1, 500)
-        self.max_runs.setValue(10)
+        self.max_runs.setRange(1, 50)
+        self.max_runs.setValue(5)
         row2.addWidget(self.max_runs)
 
-        row2.addWidget(QLabel("Repeat top:"))
-        self.repeat_top = QSpinBox()
-        self.repeat_top.setRange(1, 5)
-        self.repeat_top.setValue(1)
-        row2.addWidget(self.repeat_top)
-
-        row2.addWidget(QLabel("Per-run timeout (sec):"))
-        self.per_run_timeout = QSpinBox()
-        self.per_run_timeout.setRange(120, 7200)
-        self.per_run_timeout.setValue(300)
-        row2.addWidget(self.per_run_timeout)
+        row2.addWidget(QLabel("Launch timeout (sec):"))
+        self.launch_timeout = QSpinBox()
+        self.launch_timeout.setRange(10, 300)
+        self.launch_timeout.setValue(60)
+        self.launch_timeout.setToolTip(
+            "Если модель не загрузилась за это время — кандидат пропускается."
+        )
+        row2.addWidget(self.launch_timeout)
         settings.addLayout(row2)
 
         row2b = QHBoxLayout()
-        self.auto_limits = QCheckBox("Auto limits")
-        self.auto_limits.setChecked(True)
-        self.auto_limits.setToolTip(
-            "Let Smart AutoTune choose time budget and run count from mode/model constraints."
-        )
         self.early_stop_peak = QCheckBox("Early stop after peak drop")
         self.early_stop_peak.setChecked(True)
         self.early_stop_peak.setToolTip(
@@ -205,7 +196,6 @@ class AutoTuneWidget(QWidget):
         self.verify_server_after_apply.setToolTip(
             "After Apply Best, start/restart llama-server with the same saved parameters and send one short test request."
         )
-        row2b.addWidget(self.auto_limits)
         row2b.addWidget(self.early_stop_peak)
         row2b.addWidget(self.verify_server_after_apply)
         row2b.addStretch(1)
@@ -214,31 +204,19 @@ class AutoTuneWidget(QWidget):
         row3 = QHBoxLayout()
         self.build_plan_btn = QPushButton("Build Plan")
         self.start_btn = QPushButton("Run AutoTune")
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.setEnabled(False)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.apply_best_btn = QPushButton("Apply Best")
         self.apply_best_btn.setEnabled(False)
-        self.apply_selected_btn = QPushButton("Apply Selected")
-        self.apply_selected_btn.setEnabled(False)
         self.save_best_btn = QPushButton("Save Best Preset")
         self.save_best_btn.setEnabled(False)
-        self.export_report_btn = QPushButton("Export Report")
-        self.export_report_btn.setEnabled(False)
-        self.open_results_btn = QPushButton("Open Results Folder")
-        self.open_results_btn.setEnabled(False)
 
         for btn in [
             self.build_plan_btn,
             self.start_btn,
-            self.pause_btn,
             self.cancel_btn,
             self.apply_best_btn,
-            self.apply_selected_btn,
             self.save_best_btn,
-            self.export_report_btn,
-            self.open_results_btn,
         ]:
             row3.addWidget(btn)
         settings.addLayout(row3)
@@ -319,23 +297,17 @@ class AutoTuneWidget(QWidget):
         self.start_btn.clicked.connect(self.start_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.apply_best_btn.clicked.connect(self.apply_best_requested.emit)
-        self.apply_selected_btn.clicked.connect(self._emit_apply_selected)
         self.save_best_btn.clicked.connect(self.save_best_requested.emit)
-        self.export_report_btn.clicked.connect(self.export_report_requested.emit)
-        self.open_results_btn.clicked.connect(self.open_results_requested.emit)
-        self.table.itemSelectionChanged.connect(self._update_selection_actions)
 
     def options(self) -> Dict[str, object]:
         return {
             "mode": self.mode_combo.currentText().lower(),
             "target": self.target_combo.currentText().lower().replace(" ", "_"),
-            "engine": self.engine_combo.currentText(),
-            "time_budget_sec": None
-            if self.auto_limits.isChecked()
-            else self.time_budget.value() * 60,
-            "max_runs": None if self.auto_limits.isChecked() else self.max_runs.value(),
-            "repeat_top": self.repeat_top.value(),
-            "per_run_timeout_sec": self.per_run_timeout.value(),
+            "engine": "llama-bench",
+            "time_budget_sec": self.time_budget.value() * 60,
+            "max_runs": self.max_runs.value(),
+            "repeat_top": 1,
+            "launch_timeout_sec": self.launch_timeout.value(),
             "early_stop_on_peak": self.early_stop_peak.isChecked(),
             "verify_server_after_apply": self.verify_server_after_apply.isChecked(),
         }
@@ -363,9 +335,6 @@ class AutoTuneWidget(QWidget):
         self.apply_best_btn.setEnabled(
             False if running else self.apply_best_btn.isEnabled()
         )
-        self.apply_selected_btn.setEnabled(
-            False if running else self.apply_selected_btn.isEnabled()
-        )
         self.save_best_btn.setEnabled(
             False if running else self.save_best_btn.isEnabled()
         )
@@ -390,10 +359,7 @@ class AutoTuneWidget(QWidget):
         self.current_run_label.setText("Idle")
         self.plan_summary.setText("Smart summary will appear after Build Plan.")
         self.apply_best_btn.setEnabled(False)
-        self.apply_selected_btn.setEnabled(False)
         self.save_best_btn.setEnabled(False)
-        self.export_report_btn.setEnabled(False)
-        self.open_results_btn.setEnabled(False)
 
     def set_plan(self, plan: AutoTunePlan) -> None:
         self.clear_results()
@@ -513,16 +479,18 @@ class AutoTuneWidget(QWidget):
             return ""
         return self._cell_text(selected[0].row(), 0)
 
-    def _emit_apply_selected(self) -> None:
-        self.apply_selected_requested.emit(self.selected_candidate_id())
+    def _show_target_help(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
 
-    def _update_selection_actions(self) -> None:
-        cid = self.selected_candidate_id()
-        enabled = False
-        if cid:
-            row = self._row_by_id.get(cid)
-            enabled = row is not None and self._cell_text(row, 1) == "success"
-        self.apply_selected_btn.setEnabled(enabled and self.start_btn.isEnabled())
+        text = (
+            "Auto — цель подбирается из модели/GPU (Balanced / Low VRAM / Max Speed).\n"
+            "Balanced — скорость + стабильность + запас памяти.\n"
+            "Max Speed — приоритет tok/s.\n"
+            "Low VRAM — экономия видеопамяти.\n"
+            "Quality KV — качественный KV-кэш (f16/q8).\n"
+            "MoE Optimized — агрессивнее CPU-offload экспертов MoE."
+        )
+        QMessageBox.information(self, "AutoTune Target", text)
 
     def _coerce_param_value(self, key: str, value: str, old_value: object) -> object:
         text = str(value).strip()
@@ -664,7 +632,6 @@ class AutoTuneWidget(QWidget):
             + (f", error={result.error}" if result.error else "")
         )
         self._apply_row_color(row, result.status)
-        self._update_selection_actions()
 
     def _refresh_deltas(self) -> None:
         """Пересчитывает %Best (колонка 3) и ΔTG (колонка 4) для всех строк."""
@@ -708,18 +675,14 @@ class AutoTuneWidget(QWidget):
             f"Finished. Results folder: {output_dir}" if output_dir else "Finished"
         )
         self._update_time_labels(finished=True)
-        self.export_report_btn.setEnabled(bool(output_dir))
-        self.open_results_btn.setEnabled(bool(output_dir))
         if not best:
             self.best_text.setPlainText(
                 f"No successful result. Results folder: {output_dir}"
             )
             self.apply_best_btn.setEnabled(False)
-            self.apply_selected_btn.setEnabled(False)
             self.save_best_btn.setEnabled(False)
             return
         self.apply_best_btn.setEnabled(True)
-        self._update_selection_actions()
         self.save_best_btn.setEnabled(True)
 
         # Вычисляем сравнение с baseline (первый успешный кандидат)
@@ -768,16 +731,16 @@ class AutoTuneWidget(QWidget):
         lines.append(f"\nResults folder: {output_dir}")
         self.best_text.setPlainText("\n".join(lines))
 
-    def prepare_run(self, total: int, per_run_timeout_sec: int) -> None:
+    def prepare_run(self, total: int, launch_timeout_sec: int) -> None:
         self._done_runs = 0
         self._total_runs = max(int(total), 1)
-        self._per_run_timeout_sec = max(int(per_run_timeout_sec), 0)
+        self._launch_timeout_sec = max(int(launch_timeout_sec), 0)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, self._total_runs)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(f"0/{self._total_runs} runs")
         self.progress_summary.setText(
-            f"Prepared: 0/{self._total_runs} runs. Per-run timeout: {self._format_duration(self._per_run_timeout_sec)}."
+            f"Prepared: 0/{self._total_runs} runs. Launch timeout: {self._format_duration(self._launch_timeout_sec)}."
         )
 
     def append_activity(self, text: str) -> None:
@@ -807,9 +770,9 @@ class AutoTuneWidget(QWidget):
             avg = total_elapsed / self._done_runs
             eta = avg * remaining
             eta_text = self._format_duration(eta)
-        elif self._per_run_timeout_sec and remaining:
+        elif self._launch_timeout_sec and remaining:
             eta_text = (
-                f"up to {self._format_duration(self._per_run_timeout_sec * remaining)}"
+                f"up to {self._format_duration(self._launch_timeout_sec * remaining)}"
             )
         else:
             eta_text = "estimating"

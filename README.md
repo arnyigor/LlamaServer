@@ -19,7 +19,7 @@ The app focuses on practical day-to-day operation: select a model, choose the CU
 - AutoTune-assisted benchmark workflow
 - Hugging Face GGUF download manager
 - Local model manager with safe deletion
-- OpenCode, PI, and Claude Code integration helpers
+- OpenCode and PI integration helpers (auto context-window injection)
 - Diagnostics for failed launches and crashes
 
 ## Why It Exists
@@ -151,8 +151,12 @@ Downloaded models are compatible with common local model folder structures.
 Llama Server Studio can help add the selected local server model to external tool configs:
 
 - OpenCode;
-- PI;
-- Claude Code.
+- PI.
+
+When adding a model, the app writes the server's context window into the agent
+config as `limit.context` (auto-detected from a running server via `/slots`, or
+manually in the "Max context" field). This lets the agent compact context
+correctly instead of abruptly cutting generation.
 
 The app keeps integration editing separate from server launch settings, so you can tune local inference first and then publish the selected endpoint to your tools.
 

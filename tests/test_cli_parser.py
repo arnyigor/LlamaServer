@@ -100,5 +100,32 @@ class TestCliParser(unittest.TestCase):
         self.assertNotIn("^", parsed.extra_args)
 
 
+    def test_parses_reasoning_controls(self):
+        parsed = parse_llama_server_command(
+            "llama-server -m model.gguf --reasoning-effort xhigh "
+            "--reasoning-preserve --reasoning-budget 256 "
+            '--reasoning-budget-message "budget hit"'
+        )
+
+        self.assertEqual(parsed.settings["reasoning_effort"], "xhigh")
+        self.assertEqual(parsed.settings["reasoning_preserve"], "preserve")
+        self.assertEqual(parsed.settings["reasoning_budget"], 256)
+        self.assertEqual(parsed.settings["reasoning_budget_message"], "budget hit")
+        self.assertEqual(parsed.extra_args, "")
+
+    def test_parses_reasoning_no_preserve(self):
+        parsed = parse_llama_server_command(
+            "llama-server -m model.gguf --no-reasoning-preserve"
+        )
+        self.assertEqual(parsed.settings["reasoning_preserve"], "no-preserve")
+
+    def test_parses_reasoning_effort_only(self):
+        parsed = parse_llama_server_command(
+            "llama-server -m model.gguf --reasoning-effort medium"
+        )
+        self.assertEqual(parsed.settings["reasoning_effort"], "medium")
+        self.assertEqual(parsed.settings.get("reasoning_preserve", "off"), "off")
+
+
 if __name__ == "__main__":
     unittest.main()

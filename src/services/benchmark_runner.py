@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -133,8 +134,11 @@ class BenchmarkRunner:
             started_at=started.isoformat(timespec="seconds"),
         )
 
-        text = ""
+        text_parts: list[str] = []
         start_mono = time.monotonic()
+        seen_output = False
+        output_lock = threading.Lock()
+
         try:
             self._process = subprocess.Popen(
                 command,
@@ -146,18 +150,45 @@ class BenchmarkRunner:
                 cwd=os.path.dirname(self.bench_exe) or None,
                 **no_console_kwargs(),
             )
-            try:
-                text, _ = self._process.communicate(timeout=max(5, int(timeout_sec)))
-            except subprocess.TimeoutExpired:
-                self.cancel()
-                try:
-                    text, _ = self._process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    text, _ = self._process.communicate(timeout=5)
-                result.status = "failed_timeout"
-                result.error = f"Timeout after {timeout_sec}s"
 
+            def _reader() -> None:
+                nonlocal seen_output
+                assert self._process is not None
+                assert self._process.stdout is not None
+                for line in iter(self._process.stdout.readline, ""):
+                    if not line:
+                        break
+                    with output_lock:
+                        text_parts.append(line)
+                    seen_output = True
+                    if log_callback:
+                        log_callback(line.rstrip("\n"))
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            # Launch watchdog: llama-bench is verbose while loading the model
+            # but silent during the actual benchmark inference. We only abort if
+            # the process produces NO output at all within `timeout_sec` of
+            # launch — i.e. the model never started loading (bad GPU params,
+            # busy device, hard hang). Once any output appears the model is
+            # alive, so we let it run to completion instead of killing a slow
+            # but valid benchmark.
+            while self._process.poll() is None:
+                if not seen_output and (time.monotonic() - start_mono) > timeout_sec:
+                    self.cancel()
+                    try:
+                        self._process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        self._process.wait(timeout=5)
+                    result.status = "failed_timeout"
+                    result.error = f"model did not load within {timeout_sec}s (no output)"
+                    break
+                time.sleep(0.1)
+
+            reader_thread.join(timeout=3)
+            text = "".join(text_parts)
             result.exit_code = self._process.returncode
         except OSError as exc:
             result.status = "failed_crash"

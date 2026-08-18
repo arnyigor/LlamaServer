@@ -172,6 +172,70 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("on", args)
         self.assertNotIn("--chat-template-kwargs", args)
 
+    def test_reasoning_controls_emitted_conditionally(self):
+        # По умолчанию reasoning-контролы не добавляют флагов.
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--reasoning-effort", args)
+        self.assertNotIn("--reasoning-preserve", args)
+        self.assertNotIn("--no-reasoning-preserve", args)
+        self.assertNotIn("--reasoning-budget", args)
+        self.assertNotIn("--reasoning-budget-message", args)
+
+        # Заданные значения эмитятся, только когда reasoning активен
+        # (on/auto). Фикстура по умолчанию reasoning_mode="off".
+        self.cfg.reasoning_mode = "auto"
+        self.cfg.reasoning_effort = "low"
+        self.cfg.reasoning_preserve = "preserve"
+        self.cfg.reasoning_budget = 512
+        self.cfg.reasoning_budget_message = "keep thinking"
+        args = build_args(self.cfg, self.model)
+        self.assertEqual(args[args.index("--reasoning-effort") + 1], "low")
+        self.assertIn("--reasoning-preserve", args)
+        self.assertNotIn("--no-reasoning-preserve", args)
+        self.assertEqual(args[args.index("--reasoning-budget") + 1], "512")
+        self.assertEqual(
+            args[args.index("--reasoning-budget-message") + 1], "keep thinking"
+        )
+
+        # Вариант no-preserve.
+        self.cfg.reasoning_preserve = "no-preserve"
+        args = build_args(self.cfg, self.model)
+        self.assertIn("--no-reasoning-preserve", args)
+        self.assertNotIn("--reasoning-preserve", args)
+
+        # Пустые значения/0 подавляют флаги.
+        self.cfg.reasoning_effort = ""
+        self.cfg.reasoning_budget = 0
+        self.cfg.reasoning_budget_message = ""
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--reasoning-effort", args)
+        self.assertNotIn("--reasoning-budget", args)
+        self.assertNotIn("--reasoning-budget-message", args)
+
+    def test_reasoning_controls_suppressed_when_reasoning_off(self):
+        # При явном --reasoning off суб-параметры не эмитятся, даже если заданы.
+        self.cfg.reasoning_mode = "off"
+        self.cfg.reasoning_effort = "xhigh"
+        self.cfg.reasoning_preserve = "preserve"
+        self.cfg.reasoning_budget = 256
+        self.cfg.reasoning_budget_message = "budget hit"
+        args = build_args(self.cfg, self.model)
+        self.assertIn("--reasoning", args)
+        self.assertIn("off", args)
+        self.assertNotIn("--reasoning-effort", args)
+        self.assertNotIn("--reasoning-preserve", args)
+        self.assertNotIn("--no-reasoning-preserve", args)
+        self.assertNotIn("--reasoning-budget", args)
+        self.assertNotIn("--reasoning-budget-message", args)
+
+        # То же самое при enable_thinking=false (принудительно off).
+        self.cfg.reasoning_mode = "auto"
+        self.cfg.enable_thinking = "false"
+        args = build_args(self.cfg, self.model)
+        self.assertNotIn("--reasoning-effort", args)
+        self.assertNotIn("--reasoning-budget", args)
+        self.assertNotIn("--reasoning-budget-message", args)
+
     def test_enable_thinking_modes(self):
         self.cfg.enable_thinking = "off"
         args = build_args(self.cfg, self.model)

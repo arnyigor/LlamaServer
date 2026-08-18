@@ -44,9 +44,6 @@ class AppSettings:
     model_dir: str = ""
     opencode_config: str = ""
     pi_config: str = ""
-    claude_config: str = field(
-        default_factory=lambda: str(Path.home() / ".claude" / "settings.json")
-    )
     integration_target: str = "opencode"
     bench_prompt: int = 128
     bench_gen: int = 256
@@ -84,6 +81,10 @@ class AppSettings:
     flash_attn: bool = True
     fit_off: bool = True
     reasoning_mode: str = "off"
+    reasoning_effort: str = ""
+    reasoning_preserve: str = "off"
+    reasoning_budget: int = 0
+    reasoning_budget_message: str = ""
     use_mmap: bool = True
     use_mlock: bool = False
     verbose: bool = False

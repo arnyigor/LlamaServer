@@ -171,6 +171,14 @@ def _sp_spec_type(result, settings, extra, value):
         extra.extend(["--spec-type", str(value)])
 
 
+def _sp_reasoning_preserve(result, settings, extra, value):
+    settings["reasoning_preserve"] = "preserve"
+
+
+def _sp_no_reasoning_preserve(result, settings, extra, value):
+    settings["reasoning_preserve"] = "no-preserve"
+
+
 _SPECIAL_HANDLERS: dict[str, Callable[[Any, dict[str, Any], list[str], "str | None"], None]] = {
     "-m": _sp_model_path,
     "--model": _sp_model_path,
@@ -183,7 +191,14 @@ _SPECIAL_HANDLERS: dict[str, Callable[[Any, dict[str, Any], list[str], "str | No
     "--model-draft": _sp_model_draft,
     "--chat-template-file": _sp_chat_template,
     "--spec-type": _sp_spec_type,
+    "--reasoning-preserve": _sp_reasoning_preserve,
+    "--no-reasoning-preserve": _sp_no_reasoning_preserve,
 }
+
+# Bool-специальные флаги: не потребляют значение (в отличие от остальных
+# special-флагов, которые все value-consuming). Они попадают в VALUE_FLAGS
+# как cli_kind="special", но парсер не должен требовать для них значение.
+_SPECIAL_NO_VALUE_FLAGS = {"--reasoning-preserve", "--no-reasoning-preserve"}
 
 
 def _looks_like_executable(token: str) -> bool:
@@ -228,7 +243,7 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
         value = inline_value
         consumed_value = False
 
-        if flag in _VALUE_FLAGS:
+        if flag in _VALUE_FLAGS and flag not in _SPECIAL_NO_VALUE_FLAGS:
             if value is None and i + 1 < len(tokens) and _is_value_token(tokens[i + 1]):
                 value = tokens[i + 1]
                 consumed_value = True

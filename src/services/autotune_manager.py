@@ -46,7 +46,7 @@ class AutoTuneManager(QThread):
         model_info: Dict[str, Any] | None = None,
         prompt_tokens: int = 128,
         generation_tokens: int = 256,
-        per_run_timeout_sec: int = 300,
+        launch_timeout_sec: int = 60,
         output_root: str = "benchmarks",
         parent=None,
     ):
@@ -56,9 +56,9 @@ class AutoTuneManager(QThread):
         self.model_info = model_info or {}
         self.prompt_tokens = int(prompt_tokens)
         self.generation_tokens = int(generation_tokens)
-        # Large GGUFs can spend tens of seconds just loading before TG starts.
-        # A too-low timeout produces false failures, so keep a safe floor.
-        self.per_run_timeout_sec = max(120, int(per_run_timeout_sec))
+        # Watchdog: if a candidate produces no output for `launch_timeout_sec`
+        # (e.g. model fails to load), skip it instead of hanging the whole run.
+        self.launch_timeout_sec = max(10, int(launch_timeout_sec))
         self.results: List[BenchmarkResult] = []
         self.best_result: Optional[BenchmarkResult] = None
         self.output_dir = self._make_output_dir(output_root)
@@ -254,7 +254,7 @@ class AutoTuneManager(QThread):
             candidate,
             prompt_tokens=self.prompt_tokens,
             generation_tokens=self.generation_tokens,
-            timeout_sec=self.per_run_timeout_sec,
+            timeout_sec=self.launch_timeout_sec,
             log_callback=lambda msg: self._emit_log(msg, "bench"),
         )
         score_result(result, candidate.params, self.plan.target)

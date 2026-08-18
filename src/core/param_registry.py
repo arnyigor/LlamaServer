@@ -46,7 +46,6 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
     ParamSpec("model_dir", "model_dir"),
     ParamSpec("opencode_config", "opencode_config_path"),
     ParamSpec("pi_config", "pi_config_path"),
-    ParamSpec("claude_config", "claude_config_path"),
     ParamSpec("bench_prompt", "bench_prompt"),
     ParamSpec("bench_gen", "bench_gen"),
     ParamSpec("auto_params", "auto_params"),
@@ -90,7 +89,26 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
     ),
     ParamSpec("fit_off", "fit_off", ("--fit",), "special", bool),
     ParamSpec("reasoning_mode", "reasoning_mode", ("-rea", "--reasoning"), "value", str),
-    ParamSpec("use_mmap", "use_mmap", ("--mmap",), "bool", bool, cli_neg_flags=("--no-mmap",)),
+    ParamSpec("reasoning_effort", "reasoning_effort", ("--reasoning-effort",), "value", str),
+    ParamSpec(
+        "reasoning_preserve",
+        "reasoning_preserve",
+        ("--reasoning-preserve", "--no-reasoning-preserve"),
+        "special",
+        str,
+    ),
+    ParamSpec("reasoning_budget", "reasoning_budget", ("--reasoning-budget",), "value", int),
+    ParamSpec(
+        "reasoning_budget_message",
+        "reasoning_budget_message",
+        ("--reasoning-budget-message",),
+        "value",
+        str,
+    ),
+    # UI-галочка и серверная эмиссия убраны; поле оставлено для обратной
+    # совместимости/автотьюна. Флаг не managed -> не вырезается из extra params
+    # (пользователь может добавить --load-mode mmap вручную).
+    ParamSpec("use_mmap", None, (), "bool", bool, managed=False),
     ParamSpec("use_mlock", "use_mlock", ("--mlock",), "bool", bool),
     ParamSpec("verbose", "verbose", ("--verbose",), "bool", bool),
     ParamSpec("log_timestamps", "log_timestamps", ("--log-timestamps",), "bool", bool),
@@ -109,8 +127,12 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
     ParamSpec("spec_draft_gpu_layers", "spec_draft_gpu_layers", ("--spec-draft-ngl", "-ngld"), "value", str),
     ParamSpec("ctx_checkpoints", "ctx_checkpoints", ("--ctx-checkpoints",), "value", int),
     ParamSpec("cache_ram", "cache_ram", ("--cache-ram",), "value", int),
-    ParamSpec("cont_batching", "cont_batching", ("--no-cont-batching",), "false", bool),
-    ParamSpec("cache_prompt", "cache_prompt", ("--no-cache-prompt",), "false", bool),
+    # UI-галочка и серверная эмиссия --no-cont-batching убраны; поле оставлено.
+    # Флаг не managed -> не вырезается из extra params.
+    ParamSpec("cont_batching", None, (), "bool", bool, managed=False),
+    # UI-галочка и серверная эмиссия убраны; поле оставлено. Флаг не managed ->
+    # пользователь может добавить --cache-prompt вручную через extra params.
+    ParamSpec("cache_prompt", None, (), "bool", bool, managed=False),
     ParamSpec("context_shift", "context_shift", ("--context-shift",), "bool", bool),
     ParamSpec("no_webui", "no_webui", ("--no-webui",), "bool", bool),
     ParamSpec("jinja", "jinja", ("--jinja",), "bool", bool),

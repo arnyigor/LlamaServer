@@ -1,4 +1,4 @@
-"""Интеграция с OpenCode, PI и Claude Code."""
+"""Интеграция с OpenCode и PI (llama.cpp локальный сервер)."""
 
 from typing import Any, Dict, List, Tuple
 
@@ -15,9 +15,17 @@ def provider_container(data: Dict[str, Any], preferred_key: str) -> Dict[str, An
 
 
 def ensure_opencode_llamacpp_provider(
-    data: Dict[str, Any], base_url: str
+    data: Dict[str, Any], base_url: str, max_context: int = 0
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Обеспечение наличия OpenCode провайдера."""
+    """Обеспечение наличия OpenCode провайдера.
+
+    Args:
+        data: Конфиг (изменяется на месте).
+        base_url: URL сервера llama.cpp.
+        max_context: Размер окна контекста (токены). Если > 0, проставляется
+            models[model_id]["limit"]["context"], чтобы агент корректно
+            сжимал контекст.
+    """
     providers = provider_container(data, "provider")
     provider = providers.setdefault(LLAMACPP_PROVIDER_ID, {})
     provider.setdefault("name", "llama.cpp (local)")
@@ -28,13 +36,25 @@ def ensure_opencode_llamacpp_provider(
     if not isinstance(models, dict):
         provider["models"] = {}
         models = provider["models"]
+    if max_context and max_context > 0:
+        for model in models.values():
+            if isinstance(model, dict):
+                model.setdefault("limit", {})["context"] = max_context
     return provider, models
 
 
 def ensure_pi_llamacpp_provider(
-    data: Dict[str, Any], base_url: str
+    data: Dict[str, Any], base_url: str, max_context: int = 0
 ) -> Tuple[Dict[str, Any], List[Any]]:
-    """Обеспечение наличия PI провайдера."""
+    """Обеспечение наличия PI провайдера.
+
+    Args:
+        data: Конфиг (изменяется на месте).
+        base_url: URL сервера llama.cpp.
+        max_context: Размер окна контекста (токены). Если > 0, проставляется
+            limit.context у каждой модели, чтобы агент корректно сжимал
+            контекст.
+    """
     providers = provider_container(data, "providers")
     provider = providers.setdefault(LLAMACPP_PROVIDER_ID, {})
     provider.setdefault("api", "openai-completions")
@@ -44,23 +64,11 @@ def ensure_pi_llamacpp_provider(
     if not isinstance(models, list):
         provider["models"] = []
         models = provider["models"]
+    if max_context and max_context > 0:
+        for model in models:
+            if isinstance(model, dict):
+                model.setdefault("limit", {})["context"] = max_context
     return provider, models
-
-
-def ensure_claude_llamacpp_environment(
-    data: Dict[str, Any], base_url: str
-) -> Dict[str, Any]:
-    """Создаёт env-конфигурацию Claude Code для Anthropic API llama-server."""
-    env = data.setdefault("env", {})
-    if not isinstance(env, dict):
-        data["env"] = {}
-        env = data["env"]
-    root_url = (base_url or DEFAULT_LOCAL_BASE_URL).rstrip("/")
-    if root_url.endswith("/v1"):
-        root_url = root_url[:-3]
-    env["ANTHROPIC_BASE_URL"] = root_url
-    env.setdefault("ANTHROPIC_AUTH_TOKEN", "llamacpp")
-    return env
 
 
 def get_model_ids(data: Dict[str, Any], target: str = "opencode") -> List[str]:
@@ -68,23 +76,11 @@ def get_model_ids(data: Dict[str, Any], target: str = "opencode") -> List[str]:
 
     Args:
         data: Данные конфигурации.
-        target: Тип конфига ('opencode', 'pi' или 'claude').
+        target: Тип конфига ('opencode' или 'pi').
 
     Returns:
         Отсортированный список ID моделей.
     """
-    if target == "claude":
-        env = data.get("env", {})
-        if not isinstance(env, dict):
-            return []
-        return sorted(
-            {
-                str(env[key])
-                for key in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")
-                if env.get(key)
-            }
-        )
-
     providers = data.get("provider") or data.get("providers") or data
     provider = (
         providers.get(LLAMACPP_PROVIDER_ID, {}) if isinstance(providers, dict) else {}

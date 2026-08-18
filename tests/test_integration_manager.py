@@ -74,41 +74,35 @@ class TestIntegrationManager(unittest.TestCase):
             r = self.mgr.add_model(str(cfg), "unknown_target", "model")
             self.assertFalse(r.success)
 
-    def test_add_check_and_remove_claude_code(self):
+    def test_opencode_limit_context_written(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = self._make_config(Path(d), {"env": {"KEEP_ME": "yes"}})
-            r = self.mgr.add_model(str(cfg), "claude", "local-model")
+            cfg = self._make_config(Path(d), {})
+            r = self.mgr.add_model(
+                str(cfg), "opencode", "my-model", max_context=32768
+            )
             self.assertTrue(r.success)
-            self.assertEqual(r.model_ids, ["local-model"])
-
+            self.assertIn("context: 32768", r.message)
             data = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8080")
-            self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], "llamacpp")
-            self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "local-model")
-            self.assertEqual(data["env"]["ANTHROPIC_SMALL_FAST_MODEL"], "local-model")
-            self.assertEqual(data["env"]["KEEP_ME"], "yes")
+            model = data["provider"]["llamacpp"]["models"]["my-model"]
+            self.assertEqual(model["limit"]["context"], 32768)
 
-            checked = self.mgr.check_models(str(cfg), "claude")
-            self.assertTrue(checked.success)
-            self.assertEqual(checked.model_ids, ["local-model"])
-
-            removed = self.mgr.remove_model(str(cfg), "claude", "local-model")
-            self.assertTrue(removed.success)
-            self.assertEqual(removed.model_ids, [])
-            data = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["KEEP_ME"], "yes")
-            self.assertNotIn("ANTHROPIC_BASE_URL", data["env"])
-            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", data["env"])
-
-    def test_claude_code_settings_file_can_be_created(self):
+    def test_pi_limit_context_written(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = Path(d) / ".claude" / "settings.json"
-            result = self.mgr.add_model(str(cfg), "claude", "local-model")
-
-            self.assertTrue(result.success)
-            self.assertTrue(cfg.exists())
+            cfg = self._make_config(Path(d), {})
+            r = self.mgr.add_model(str(cfg), "pi", "pi-model", max_context=8192)
+            self.assertTrue(r.success)
+            self.assertIn("context: 8192", r.message)
             data = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "local-model")
+            model = data["providers"]["llamacpp"]["models"][0]
+            self.assertEqual(model["limit"]["context"], 8192)
+
+    def test_no_limit_context_when_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._make_config(Path(d), {})
+            self.mgr.add_model(str(cfg), "opencode", "my-model", max_context=0)
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            model = data["provider"]["llamacpp"]["models"]["my-model"]
+            self.assertNotIn("limit", model)
 
 
 # tests/test_log_manager.py
