@@ -67,10 +67,9 @@ The launch panel covers the settings that usually matter for local server operat
 - KV cache type;
 - parallel slots;
 - Flash Attention;
-- mmap / mlock;
+- mlock;
 - Jinja and custom chat templates;
-- cache prompt and continuous batching;
-- extra uncommon `llama-server` flags.
+- extra uncommon `llama-server` flags (for example `--mmap`, `--cache-prompt`, `--cont-batching`).
 
 Every launch produces a clear `llama-server` command preview.
 
