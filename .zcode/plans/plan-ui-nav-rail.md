@@ -1,7 +1,7 @@
 # План: Редизайн UI — навигационный рейл + логи снизу
 
 > **Ветка:** `ui/navigation-rail-layout`
-> **Статус:** 🟡 в разработке (Этап 1 — каркас готов, структурная верификация пройдена)
+> **Статус:** 🟡 в разработке (Этап 1 + 1.5 — каркас и UX-доработки готовы, верификация пройдена)
 > **Дата начала:** 2026-08-25
 > **Цель:** Перенять паттерн UI из `pytraveler/LlamaServerLauncherAvalonia`
 > (иконочный nav-рейл слева, настройки в центре, логи в нижнем доке),
@@ -87,7 +87,7 @@ UI-паттерну. Их добавлять не будем.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ HEADER: [☰] Profile[▼ Save▾] · [Update llama.cpp] · Lang[en▾]          │  Этап 1
+│ HEADER: [Llama Server Studio] · Lang[en▾]                              │  Этап 1.5
 ├──────┬───────────────────────────────────────────────────────────────┤
 │ NAV  │  QStackedWidget — страница выбранного раздела (вся ширина)      │
 │ рейл │                                                                 │
@@ -130,7 +130,7 @@ UI-паттерну. Их добавлять не будем.
 | `src/ui/panels/integration_page.py` | **НОВЫЙ**. | 4 |
 | `src/ui/panels/benchmark_page.py` | **НОВЫЙ** (prompt/gen + Test + AutoTune). | 4 |
 | `src/ui/panels/autotune_page.py` | **НОВЫЙ** — обёртка над `AutoTuneWidget`. | 1/4 |
-| `src/ui/header_bar.py` | **НОВЫЙ** — шапка (профиль + Save flyout + язык). | 1 |
+| `src/ui/header_bar.py` | **НОВЫЙ** — шапка (только язык + брендинг). | 1/1.5 |
 | `src/ui/log_dock.py` | **НОВЫЙ** — нижний док логов. | 2 |
 | `src/ui/control_strip.py` | **НОВЫЙ** — полоса управления. | 3 |
 | `src/ui/nav_rail.py` | **НОВЫЙ** — icon list-widget. | 1 |
@@ -172,7 +172,41 @@ UI-паттерну. Их добавлять не будем.
       (75 атрибутов, 9 страниц, переключение, advanced toggle, state round-trip).
       Также исправлены: двойной вызов `_build_launch_controls_section`,
       `self.language_combo` реэкспорт из `paths_panel` (→ header), 4 строки
-      `self.ui.tabs.setCurrentWidget` в `main.py`, импорты/иконки под PySide6 6.11.
+      `self.ui.tabs.setCurrentWidget` в `main.py`,        импорты/иконки под PySide6 6.11.
+
+### ✅ Этап 1.5 — UX-доработки по фидбеку (поверх Этапа 1)
+- [x] **Шапка очищена**: убран «Profile» (комбо + Save flyout + сигналы
+      `profile_selected`/`save_requested`/`set_profiles`). Оставлена только
+      `language_combo` + брендинг-лейбл «Llama Server Studio». `header_bar.py`
+      переписан; `main.py` больше не дёргает `header.set_profiles`/коннекты
+      профиля (удалены 4 строки + 2 метода `_on_header_save`/`_on_header_profile`).
+- [x] **CollapsiblePanel статичные**: добавлен параметр `collapsible=False`
+      (заголовок-лейбл, контент всегда виден). Сделаны статичными 6 панелей:
+      adv_panel («Память (KV-кэш)»), sampling_panel, server_panel, models_panel,
+      int_panel, bench_panel. Чёрные спойлеры убраны (страницы теперь отдельные).
+- [x] **NAV_PAGES переименованы на русские** по смыслу: Главная / Пути / Запуск /
+      Сэмплинг / Сервер / Модели / Интеграция / Тесты / Автотюн.
+- [x] **Preset** (per-model performance preset — единственный механизм
+      сохранения) перенесён из performance-секции в постоянную панель запуска
+      (`_build_launch_controls_section`, Row1 рядом со Start/Stop/Advanced) +
+      добавлен `launch_readout` (QLabel «Model: -», selectable) во Row2.
+      Устранено двойное создание `preset_name_combo` (было и в launch-, и в
+      performance-секции).
+- [x] **MTP-блок** (kv_unified / speculative_mtp / spec_draft_*) перенесён из
+      adv_panel («Память») на страницу **Сэмплинг** (sampling_panel).
+- [x] **Extra params** (`extra_args`) перенесён из server_panel на страницу
+      **Сэмплинг** (sampling_panel).
+- [x] **CLI Preview** (`cli_group`: preview + Copy CLI + Import CLI + Apply CLI)
+      был осиротел (создан, но не добавлен ни в одну страницу) → возвращён на
+      страницу **Запуск** (`_performance_page`). Import CLI сохраняет merge-логику
+      (не заменяет параметры — НЕ сломано).
+- [x] **Basic/Advanced** теперь прячет только панель «Память (KV-кэш)»
+      (`_advanced_panels` возвращает `[adv_panel]`); Sampling/Server и остальные
+      страницы остаются видимыми. Тултип `advanced_mode_chk` обновлён.
+- [x] **Верификация 1.5**: `py_compile` чистый; `verify_phase1.py` (offscreen) →
+      PASSED (75 атрибутов, 9 страниц, переключение, advanced toggle, state
+      round-trip); PyInstaller-сборка `dist_next/LlamaServerGUI.exe` →
+      `verify_build.py` STARTUP_OK (12s, без краша).
 
 ### ⬜ Этап 2 — Лог-док снизу
 - [ ] `src/ui/log_dock.py`: `LogDock(QWidget)` — `QTextEdit` (self.logs, то же
@@ -240,6 +274,7 @@ UI-паттерну. Их добавлять не будем.
 |---|---|---|---|---|
 | 2026-08-25 | 0 | Создана ветка `ui/navigation-rail-layout`; записан план | `git branch`, чтение файла | ✅ |
 | 2026-08-25 | 1 | Каркас: `HeaderBar` + `NavRail` + `QStackedWidget` (9 страниц, Dashboard как пункт рейла), логи inline снизу, язык в шапку; `verify_phase1.py` | `python verify_phase1.py` (offscreen) → PASSED; `py_compile` чистый | ✅ |
+| 2026-08-25 | 1.5 | UX-доработки: шапка без Profile; CollapsiblePanel статичные; NAV_PAGES рус; Preset+readout в панели запуска; MTP+extra_args на Сэмплинг; CLI Preview на Запуск; Basic/Advanced прячет только Память | `verify_phase1.py` PASSED; `py_compile` чистый; `verify_build.py` STARTUP_OK | ✅ |
 | | 2 | _ | _ | ⬜ |
 | | 3 | _ | _ | ⬜ |
 | | 4 | _ | _ | ⬜ |

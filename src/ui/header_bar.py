@@ -1,28 +1,24 @@
-"""Шапка приложения (Этап 1): профиль + Save flyout + язык.
+"""Шапка приложения: только выбор языка.
 
-Компактная горизонтальная панель вверху окна. Не знает про LlamaGUI:
-действия наружу — через сигналы (profile_selected, save_requested,
-language_changed). MainWindowUI реэкспортирует language_combo, чтобы
-config/main.py продолжали работать как раньше.
+Компактная горизонтальная панель вверху окна. Механизм сохранения настроек
+теперь — единственный «Preset» (per-model performance preset), вынесенный в
+панель запуска рядом со Start/Stop. Шапка оставлена минимальной: язык
+интерфейса. Сигнал language_changed наружу; MainWindowUI реэкспортирует
+language_combo для совместимости с main.py.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QSettings, Signal
-from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
-    QPushButton,
-    QMenu,
     QWidget,
 )
 
 
 class HeaderBar(QWidget):
-    profile_selected = Signal(str)
-    save_requested = Signal(str)
     language_changed = Signal(str)
 
     def __init__(self, parent=None):
@@ -31,43 +27,13 @@ class HeaderBar(QWidget):
         lay.setContentsMargins(8, 4, 8, 4)
         lay.setSpacing(8)
 
-        # === Профиль ===
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(150)
-        self.profile_combo.setToolTip("Select configuration profile")
-        self.profile_combo.currentTextChanged.connect(
-            lambda name: self.profile_selected.emit(name)
-        )
-        lay.addWidget(QLabel(self.tr("Profile:")))
-        lay.addWidget(self.profile_combo)
-
-        # === Save flyout ===
-        self.save_btn = QPushButton(self.tr("Save"))
-        self.save_menu = QMenu(self)
-        for action in (
-            "Save",
-            "Save As",
-            "Rename",
-            "Clone",
-            "Export",
-            "Import",
-            "Delete",
-        ):
-            act = QAction(action, self)
-            act.triggered.connect(
-                lambda _checked=False, a=action: self.save_requested.emit(a)
-            )
-            self.save_menu.addAction(act)
-        self.save_btn.setMenu(self.save_menu)
-        self.save_btn.setToolTip(
-            "Save profile, or open the menu for Save As / Rename / Clone / "
-            "Export / Import / Delete"
-        )
-        lay.addWidget(self.save_btn)
-
+        # Лёгкий заголовок слева (брендинг, не интерактивен).
+        title = QLabel(self.tr("Llama Server Studio"))
+        title.setStyleSheet("font-weight: bold; color: #bbb;")
+        lay.addWidget(title)
         lay.addStretch(1)
 
-        # === Язык (переехал из PathsPanel) ===
+        # === Язык ===
         self.language_combo = QComboBox()
         self.language_combo.addItem("English", "en")
         self.language_combo.addItem("Русский", "ru")
@@ -88,14 +54,3 @@ class HeaderBar(QWidget):
         lang = str(self.language_combo.itemData(index) or "en")
         QSettings("LlamaServerGUI", "UIState").setValue("language", lang)
         self.language_changed.emit(lang)
-
-    def set_profiles(self, names, current: str = ""):
-        """Заполняет комбо профиля (блокируя сигналы во избежание ложного выбора)."""
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.clear()
-        self.profile_combo.addItems(names or ["Default"])
-        if current:
-            idx = self.profile_combo.findText(current)
-            if idx >= 0:
-                self.profile_combo.setCurrentText(current)
-        self.profile_combo.blockSignals(False)

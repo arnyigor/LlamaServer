@@ -66,15 +66,15 @@ class MainWindowUI(QMainWindow):
     # Порядок страниц навигации (label, key). NavRail и QStackedWidget в
     # _build_pages собираются в этом же порядке — единый источник истины.
     NAV_PAGES = [
-        ("Dashboard", "dashboard"),
-        ("Paths", "paths"),
-        ("Performance", "performance"),
-        ("Sampling", "sampling"),
-        ("Server", "server"),
-        ("Library", "library"),
-        ("Integration", "integration"),
-        ("Benchmark", "benchmark"),
-        ("AutoTune", "autotune"),
+        ("Главная", "dashboard"),
+        ("Пути", "paths"),
+        ("Запуск", "performance"),
+        ("Сэмплинг", "sampling"),
+        ("Сервер", "server"),
+        ("Модели", "library"),
+        ("Интеграция", "integration"),
+        ("Тесты", "benchmark"),
+        ("Автотюн", "autotune"),
     ]
 
     def __init__(self):
@@ -348,8 +348,15 @@ class MainWindowUI(QMainWindow):
         self._runtime_lockable.extend(getattr(self, "ctx_quick_buttons", []))
 
     def _build_launch_controls_section(self):
-        # === 0. Кнопки управления (всегда видны в верхней панели) ===
-        btn_row = QHBoxLayout()
+        # === Постоянная панель управления (всегда видна) ===
+        container = QWidget()
+        vlay = QVBoxLayout(container)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(6)
+
+        # Row 1: запуск + basic/advanced + preset
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
         self.start_btn = QPushButton(self.tr("Start Server"))
         self.start_btn.setStyleSheet(
             "background-color: "
@@ -389,18 +396,59 @@ class MainWindowUI(QMainWindow):
             self.ui_settings.value("advancedMode", True, type=bool)
         )
         self.advanced_mode_chk.setToolTip(
-            "Show advanced panels: Paths, Performance/MTP, Sampling, "
-            "Server/Diagnostics. Basic mode keeps model selection, launch "
-            "controls and Runtime stats."
+            "Show the advanced Memory (KV-cache) panel on the Launch page. "
+            "Basic mode keeps model selection, launch controls, Runtime stats "
+            "and all other pages."
         )
         self.advanced_mode_chk.toggled.connect(self._apply_advanced_mode)
-        btn_row.addWidget(self.start_btn)
-        btn_row.addWidget(self.reload_btn)
-        btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.force_stop_btn)
-        btn_row.addWidget(self.advanced_mode_chk)
-        self.launch_controls_widget = QWidget()
-        self.launch_controls_widget.setLayout(btn_row)
+        row1.addWidget(self.start_btn)
+        row1.addWidget(self.reload_btn)
+        row1.addWidget(self.stop_btn)
+        row1.addWidget(self.force_stop_btn)
+        row1.addWidget(self.advanced_mode_chk)
+        row1.addStretch(1)
+
+        # Preset (per-model performance preset) — единственный механизм
+        # сохранения настроек; перенесён сюда рядом с запуском.
+        self.preset_name_combo = QComboBox()
+        self.preset_name_combo.setEditable(False)
+        self.preset_name_combo.addItem("default")
+        self.preset_name_combo.setCurrentText("default")
+        self.preset_name_combo.setMinimumWidth(130)
+        self.preset_name_combo.setMaximumWidth(220)
+        self.preset_name_combo.setToolTip(
+            "Preset name for current model; use task names like coding or rag"
+        )
+        self.save_preset_btn = QPushButton(self.tr("Save Preset"))
+        self.save_preset_btn.setToolTip(
+            "Save parameters (ngl, ncmoe, etc.) under selected preset name"
+        )
+        self.add_preset_btn = QPushButton(self.tr("Add"))
+        self.add_preset_btn.setToolTip("Add a named preset for the selected model")
+        self.delete_preset_btn = QPushButton(self.tr("Delete"))
+        self.delete_preset_btn.setEnabled(False)
+        self.delete_preset_btn.setToolTip(
+            "Delete the selected named preset. The default preset cannot be deleted."
+        )
+        self.preset_status = QLabel(self.tr("Preset: none"))
+        self.preset_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
+        row1.addWidget(QLabel(self.tr("Preset:")))
+        row1.addWidget(self.preset_name_combo)
+        row1.addWidget(self.add_preset_btn)
+        row1.addWidget(self.delete_preset_btn)
+        row1.addWidget(self.save_preset_btn)
+        vlay.addLayout(row1)
+
+        # Row 2: компактный readout выбранной модели + ключевых параметров
+        # (виден на любой странице навигации).
+        self.launch_readout = QLabel(self.tr("Model: -"))
+        self.launch_readout.setStyleSheet("color: #888; padding: 2px 0;")
+        self.launch_readout.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        vlay.addWidget(self.launch_readout)
+
+        self.launch_controls_widget = container
 
     def _apply_advanced_mode(self, advanced: bool):
         """Basic mode: спрятать продвинутые панели, оставить Model + Launch."""
@@ -409,15 +457,10 @@ class MainWindowUI(QMainWindow):
         self.ui_settings.setValue("advancedMode", bool(advanced))
 
     def _advanced_panels(self):
+        # Basic mode hides only the Memory (KV-cache) panel on the Launch page.
+        # Sampling/Server and all other nav pages stay fully visible.
         return [
-            panel
-            for panel in (
-                getattr(self, "paths_panel", None),
-                getattr(self, "adv_panel", None),
-                getattr(self, "sampling_panel", None),
-                getattr(self, "server_panel", None),
-            )
-            if panel is not None
+            panel for panel in (getattr(self, "adv_panel", None),) if panel is not None
         ]
 
     def _build_paths_section(self):
@@ -502,6 +545,7 @@ class MainWindowUI(QMainWindow):
         self.models_panel = CollapsiblePanel(
             self.tr("Local model manager and download"),
             settings_key="panel_models",
+            collapsible=False,
         )
         local = self.models_panel.content_layout
 
@@ -747,8 +791,9 @@ class MainWindowUI(QMainWindow):
         launch.setSpacing(8)
 
         self.adv_panel = CollapsiblePanel(
-            self.tr("Advanced: Performance, Memory and MTP"),
+            self.tr("Память (KV-кэш)"),
             settings_key="panel_adv",
+            collapsible=False,
         )
         lperf = self.adv_panel.content_layout
         lperf.setContentsMargins(8, 6, 8, 6)
@@ -756,6 +801,7 @@ class MainWindowUI(QMainWindow):
         self.sampling_panel = CollapsiblePanel(
             self.tr("Generation: Sampling and Penalties"),
             settings_key="panel_sampling",
+            collapsible=False,
         )
         sampling = self.sampling_panel.content_layout
         sampling.setContentsMargins(8, 6, 8, 6)
@@ -763,6 +809,7 @@ class MainWindowUI(QMainWindow):
         self.server_panel = CollapsiblePanel(
             self.tr("Server, Templates and Diagnostics"),
             settings_key="panel_server",
+            collapsible=False,
         )
         server_opts = self.server_panel.content_layout
         server_opts.setContentsMargins(8, 6, 8, 6)
@@ -851,31 +898,6 @@ class MainWindowUI(QMainWindow):
         self.ctx_size.setSingleStep(512)
         self.ctx_size.setValue(AUTO_SENTINEL)
         self.ctx_size.setSpecialValueText("auto")
-
-        self.preset_name_combo = QComboBox()
-        self.preset_name_combo.setEditable(False)
-        self.preset_name_combo.addItem("default")
-        self.preset_name_combo.setCurrentText("default")
-        self.preset_name_combo.setMinimumWidth(130)
-        self.preset_name_combo.setMaximumWidth(220)
-        self.preset_name_combo.setToolTip(
-            "Preset name for current model; use task names like coding or rag"
-        )
-
-        self.save_preset_btn = QPushButton(self.tr("Save Preset"))
-        self.save_preset_btn.setToolTip(
-            "Save parameters (ngl, ncmoe, etc.) under selected preset name"
-        )
-        self.add_preset_btn = QPushButton(self.tr("Add"))
-        self.add_preset_btn.setToolTip("Add a named preset for the selected model")
-        self.delete_preset_btn = QPushButton(self.tr("Delete"))
-        self.delete_preset_btn.setEnabled(False)
-        self.delete_preset_btn.setToolTip(
-            "Delete the selected named preset. The default preset cannot be deleted."
-        )
-
-        self.preset_status = QLabel(self.tr("Preset: none"))
-        self.preset_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
 
         r2a = QHBoxLayout()
         r2a.addWidget(QLabel(self.tr("Context Size (-c):")))
@@ -975,12 +997,6 @@ class MainWindowUI(QMainWindow):
         r6.addWidget(self.flash_attn)
         r6.addWidget(self.fit_off)
         r6.addStretch(1)
-        r6.addWidget(QLabel(self.tr("Preset:")))
-        r6.addWidget(self.preset_name_combo)
-        r6.addWidget(self.add_preset_btn)
-        r6.addWidget(self.delete_preset_btn)
-        r6.addWidget(self.save_preset_btn)
-        r6.addWidget(self.preset_status)
         launch.addLayout(r6)
 
         self.reasoning_mode = QComboBox()
@@ -1077,7 +1093,7 @@ class MainWindowUI(QMainWindow):
         r8b.addWidget(self.spec_draft_n_max)
         r8b.addWidget(self.spec_draft_p_min)
         r8b.addWidget(self.spec_draft_gpu_layers)
-        lperf.addLayout(r8b)
+        sampling.addLayout(r8b)
 
         r8b2 = QHBoxLayout()
         r8b2.addWidget(QLabel(self.tr("MTP draft GGUF:")))
@@ -1094,7 +1110,7 @@ class MainWindowUI(QMainWindow):
         )
         r8b2.addWidget(self.spec_draft_model_path, 1)
         r8b2.addWidget(self.spec_draft_model_btn)
-        lperf.addLayout(r8b2)
+        sampling.addLayout(r8b2)
 
         self.cuda_device = QLineEdit(placeholderText="CUDA0")
         self.cuda_device.setMaximumWidth(80)
@@ -1115,7 +1131,7 @@ class MainWindowUI(QMainWindow):
         r8c.addWidget(self.split_mode)
         r8c.addWidget(QLabel(self.tr("Main GPU:")))
         r8c.addWidget(self.main_gpu)
-        lperf.addLayout(r8c)
+        sampling.addLayout(r8c)
 
         self.ctx_checkpoints = QSpinBox()
         self.ctx_checkpoints.setRange(AUTO_SENTINEL, 128)
@@ -1286,20 +1302,21 @@ class MainWindowUI(QMainWindow):
         s_tpl.addWidget(self.chat_template_btn)
         server_opts.addLayout(s_tpl)
 
-        server_opts.addWidget(
+        sampling.addWidget(
             QLabel(self.tr("Extra params (only uncommon llama-server flags):"))
         )
         self.extra_args = QLineEdit()
         self.extra_args.setPlaceholderText(
             "--dry-multiplier 0.8 --xtc-probability 0.1 ..."
         )
-        server_opts.addWidget(self.extra_args)
+        sampling.addWidget(self.extra_args)
 
     def _build_integration_section(self):
         # === 5. Интеграция ===
         self.int_panel = CollapsiblePanel(
             self.tr("Integration (OpenCode / PI)"),
             settings_key="panel_integration",
+            collapsible=False,
         )
 
         # Каждый путь завёрнут в контейнер, чтобы показывать только тот,
@@ -1390,6 +1407,7 @@ class MainWindowUI(QMainWindow):
         self.bench_panel = CollapsiblePanel(
             self.tr("Benchmark"),
             settings_key="panel_benchmark",
+            collapsible=False,
         )
         bp_layout = QHBoxLayout()
         bp_layout.addWidget(QLabel(self.tr("Prompt (-p):")))
@@ -1501,6 +1519,7 @@ class MainWindowUI(QMainWindow):
         page, lay = self._scroll_page()
         lay.addWidget(self.g_launch)
         lay.addWidget(self.adv_panel)
+        lay.addWidget(self.cli_group)
         lay.addStretch()
         return page
 

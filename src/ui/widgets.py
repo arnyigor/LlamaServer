@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QLabel,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -53,9 +54,15 @@ class NoWheelValueChangeFilter(QObject):
 
 
 class CollapsiblePanel(QWidget):
-    """Виджет-спойлер с возможностью сворачивания."""
+    """Виджет-контейнер с заголовком.
 
-    def __init__(self, title, parent=None, settings_key=None):
+    При ``collapsible=True`` (по умолчанию) ведёт себя как спойлер со
+    сворачиванием. При ``collapsible=False`` заголовок статичен, контент всегда
+    виден — используется, когда секция уже вынесена на отдельную страницу
+    навигации и сворачивание избыточно.
+    """
+
+    def __init__(self, title, parent=None, settings_key=None, collapsible=True):
         super().__init__(parent)
         self.base_title = title
         self._settings_key = settings_key or f"panel_{title}"
@@ -63,29 +70,41 @@ class CollapsiblePanel(QWidget):
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(2)
 
-        self.toggle_btn = QPushButton(f"▶ {title}")
-        self.toggle_btn.setCheckable(True)
-        self.toggle_btn.setStyleSheet(
-            "text-align: left; font-weight: bold; border: 1px solid #444; "
-            "padding: 5px; background: #2a2a2a; color: #ccc; border-radius: 4px;"
-        )
-        self.toggle_btn.clicked.connect(self.toggle_visibility)
-        self.main_layout.addWidget(self.toggle_btn)
+        if collapsible:
+            self.toggle_btn = QPushButton(f"▶ {title}")
+            self.toggle_btn.setCheckable(True)
+            self.toggle_btn.setStyleSheet(
+                "text-align: left; font-weight: bold; border: 1px solid #444; "
+                "padding: 5px; background: #2a2a2a; color: #ccc; border-radius: 4px;"
+            )
+            self.toggle_btn.clicked.connect(self.toggle_visibility)
+            self.main_layout.addWidget(self.toggle_btn)
 
-        self.content_widget = QWidget()
-        self.content_widget.setVisible(False)
-        self.content_layout = QVBoxLayout(self.content_widget)
-        self.content_layout.setContentsMargins(8, 6, 8, 6)
-        self.content_layout.setSpacing(6)
-        self.main_layout.addWidget(self.content_widget)
+            self.content_widget = QWidget()
+            self.content_widget.setVisible(False)
+            self.content_layout = QVBoxLayout(self.content_widget)
+            self.content_layout.setContentsMargins(8, 6, 8, 6)
+            self.content_layout.setSpacing(6)
+            self.main_layout.addWidget(self.content_widget)
 
-        # Restore saved open/closed state
-        settings = QSettings("LlamaServerGUI", "UIState")
-        is_open = settings.value(self._settings_key, False, type=bool)
-        self.toggle_btn.setChecked(is_open)
-        self.content_widget.setVisible(is_open)
-        if is_open:
-            self.toggle_btn.setText(f"▼ {title}")
+            # Restore saved open/closed state
+            settings = QSettings("LlamaServerGUI", "UIState")
+            is_open = settings.value(self._settings_key, False, type=bool)
+            self.toggle_btn.setChecked(is_open)
+            self.content_widget.setVisible(is_open)
+            if is_open:
+                self.toggle_btn.setText(f"▼ {title}")
+        else:
+            # Статичный контейнер: заголовок-метка + всегда видимый контент.
+            title_lbl = QLabel(title)
+            title_lbl.setStyleSheet("font-weight: bold; color: #ccc; padding: 2px 0;")
+            self.main_layout.addWidget(title_lbl)
+            self.content_widget = QWidget()
+            self.content_widget.setVisible(True)
+            self.content_layout = QVBoxLayout(self.content_widget)
+            self.content_layout.setContentsMargins(8, 6, 8, 6)
+            self.content_layout.setSpacing(6)
+            self.main_layout.addWidget(self.content_widget)
 
     def toggle_visibility(self):
         is_open = self.toggle_btn.isChecked()
