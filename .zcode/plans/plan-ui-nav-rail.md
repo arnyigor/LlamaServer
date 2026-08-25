@@ -1,7 +1,7 @@
 # План: Редизайн UI — навигационный рейл + логи снизу
 
 > **Ветка:** `ui/navigation-rail-layout`
-> **Статус:** 🟡 в разработке (Этап 1 + 1.5 + 1.6 + 1.7 + 2 — каркас, UX-доработки, реорганизация раскладки, очистка UI и лог-док готовы, верификация пройдена)
+> **Статус:** 🟡 в разработке (Этап 1 + 1.5 + 1.6 + 1.7 + 2 + 3 — каркас, UX-доработки, реорганизация раскладки, очистка UI, лог-док и полоса управления готовы, верификация пройдена)
 > **Дата начала:** 2026-08-25
 > **Цель:** Перенять паттерн UI из `pytraveler/LlamaServerLauncherAvalonia`
 > (иконочный nav-рейл слева, настройки в центре, логи в нижнем доке),
@@ -285,12 +285,26 @@ UI-паттерну. Их добавлять не будем.
        round-trip OK); PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
        `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
-### ⬜ Этап 3 — Полоса управления сервером
-- [ ] `src/ui/control_strip.py`: `ControlStrip(QWidget)` — переиспользовать
-      `self.start_btn/stop_btn/reload_btn/force_stop_btn`, гейджи
-      (CPU/RAM/VRAM — если есть данные) и свёртку `self.cli_preview`.
-- [ ] Разместить между `QStackedWidget` и `LogDock`.
-- [ ] **Верификация Этапа 3**.
+### ✅ Этап 3 — Полоса управления сервером
+- [x] `src/ui/control_strip.py`: `ControlStrip(QWidget)` — переиспользует
+       `self.start_btn/stop_btn/reload_btn/force_stop_btn` (те же стили/тултипы,
+       что были в верхнем launch-controls). Кнопки вынесены из верхней строки
+       launch-controls в нижнюю полосу.
+- [x] Полоса размещена между контентом и лог-доком внутри вертикального
+       `main_vsplit` (3 виджета: content_splitter / control_strip / log_dock;
+       stretch-факторы 1/0/0, setSizes [660,44,180]).
+- [x] Гейджи CPU/RAM/VRAM НЕ добавлены: в приложении нет системного
+       источника метрик (только опрос llama-server `/slots`), живые гейджи
+       потребовали бы добавления провайдера метрик (psutil) — вне объёма фазы.
+       Полоса ограничена серверными кнопками (как в эталоне — Start/Stop снизу).
+- [x] Атрибуты `start_btn/stop_btn/reload_btn/force_stop_btn` реэкспортированы
+       с `control_strip` на `self.ui` — `main.py` работает без изменений
+       (force_stop по-прежнему скрыт по умолчанию, раскрывается через
+       `_reveal_force_stop`).
+- [x] **Верификация Этапа 3**: `py_compile` чистый; `verify_phase1.py` (offscreen)
+       → PASSED (76 атрибутов, в т.ч. `control_strip`; save/load round-trip OK);
+       PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
+       `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
 ### ⬜ Этап 4 — Вынос секций в независимые классы (интегрируемость)
 - [ ] Создать `src/ui/panels/*.py` (см. раздел 5). Каждый класс:
@@ -347,7 +361,8 @@ UI-паттерну. Их добавлять не будем.
 | 2026-08-25 | 2 | Лог-док вынесен в `src/ui/log_dock.py`; контент+док в вертикальном `QSplitter` (ресайз); кнопка maximize (скрывает контент, состояние в QSettings) | `py_compile` чистый; `verify_phase1.py` PASSED (75, +main_vsplit/log_dock); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
 | 2026-08-25 | 2.1 | Убран лишний заголовок «Performance and Memory:» в панели Память (KV-кэш) на Sampling (дублировал заголовок панели); версия `APP_VERSION` (v1.5.5, `src/core/constants.py`) показана в шапке рядом с брендингом | `py_compile` чистый; `verify_phase1.py` PASSED (75); `verify_build.py` STARTUP_OK | ✅ |
 | 2026-08-25 | commit | Фазы 1.6 + 1.7 + 2 + 2.1 зафиксированы коммитом `e9edea4` (8 файлов, +311/−146). Ветка `ui/navigation-rail-layout` НЕ запушена. | — | ✅ |
-| | 3 | _ | _ | ⬜ |
+| 2026-08-25 | 3 | Полоса управления `ControlStrip` (Start/Restart/Stop/Force Stop) вынесена из верхнего launch-controls в нижнюю полосу между контентом и лог-доком; гейджи CPU/RAM/VRAM не добавлены (нет системного источника метрик) | `py_compile` чистый; `verify_phase1.py` PASSED (76, +control_strip); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
+| | 4 | _ | _ | ⬜ |
 | | 4 | _ | _ | ⬜ |
 | | 5 | _ | _ | ⬜ |
 

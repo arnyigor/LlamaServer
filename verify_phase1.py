@@ -21,6 +21,7 @@ REQUIRED = [
     "content_splitter",
     "main_vsplit",
     "log_dock",
+    "control_strip",
     # overview / dashboard
     "overview_status",
     "overview_model",

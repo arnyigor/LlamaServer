@@ -40,13 +40,10 @@ from PySide6.QtGui import QAction, QFont, QIcon
 
 from src.core.constants import (
     AUTO_SENTINEL,
-    STATUS_COLOR_ERROR,
     STATUS_COLOR_MUTED,
     STATUS_COLOR_MUTED_DARK,
     STATUS_COLOR_PENDING,
     STATUS_COLOR_READY,
-    STATUS_COLOR_RUNNING,
-    STATUS_COLOR_WARNING,
     SAMPLING_AUTO_FLOAT,
     SAMPLING_AUTO_INT,
     SAMPLING_LAST_N_AUTO,
@@ -60,6 +57,7 @@ from src.ui.mem_viz_widget import MemoryVisualizationWidget
 from src.ui.autotune_widget import AutoTuneWidget
 from src.ui.header_bar import HeaderBar
 from src.ui.log_dock import LogDock
+from src.ui.control_strip import ControlStrip
 from src.ui.nav_rail import NavRail
 
 
@@ -162,15 +160,25 @@ class MainWindowUI(QMainWindow):
         self.open_diagnostics_btn = self.log_dock.open_diagnostics_btn
         self.log_dock.toggle_maximize.connect(self._toggle_log_maximize)
 
-        # Вертикальный сплиттер: контент (nav|pages) + лог-док (ресайз + maximize)
+        # === Полоса управления сервером (Phase 3: ControlStrip) ===
+        self.control_strip = ControlStrip()
+        # Реэкспорт кнопок для совместимости с main.py
+        self.start_btn = self.control_strip.start_btn
+        self.reload_btn = self.control_strip.reload_btn
+        self.stop_btn = self.control_strip.stop_btn
+        self.force_stop_btn = self.control_strip.force_stop_btn
+
+        # Вертикальный сплиттер: контент + полоса управления + лог-док
         main_vsplit = QSplitter(Qt.Orientation.Vertical)
         main_vsplit.addWidget(self.content_splitter)
+        main_vsplit.addWidget(self.control_strip)
         main_vsplit.addWidget(self.log_dock)
         main_vsplit.setStretchFactor(0, 1)
         main_vsplit.setStretchFactor(1, 0)
-        main_vsplit.setSizes([700, 180])
+        main_vsplit.setStretchFactor(2, 0)
+        main_vsplit.setSizes([660, 44, 180])
         self.main_vsplit = main_vsplit
-        self._main_vsplit_docked = [700, 180]
+        self._main_vsplit_docked = [660, 44, 180]
         self._log_maximized = False
         root.addWidget(self.main_vsplit, 1)
 
@@ -375,40 +383,10 @@ class MainWindowUI(QMainWindow):
         # Row 1: запуск + basic/advanced + preset
         row1 = QHBoxLayout()
         row1.setSpacing(6)
-        self.start_btn = QPushButton(self.tr("Start Server"))
-        self.start_btn.setStyleSheet(
-            "background-color: "
-            + STATUS_COLOR_RUNNING
-            + "; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.reload_btn = QPushButton(self.tr("Restart"), enabled=False)
-        self.reload_btn.setVisible(False)
-        self.reload_btn.setToolTip(
-            "Restart the running server and apply the current model parameters"
-        )
-        self.reload_btn.setStyleSheet(
-            "background-color: "
-            + STATUS_COLOR_WARNING
-            + "; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.stop_btn = QPushButton(self.tr("Stop"), enabled=False)
-        self.stop_btn.setStyleSheet(
-            "background-color: "
-            + STATUS_COLOR_ERROR
-            + "; color: white; font-weight: bold; padding: 8px;"
-        )
-        self.force_stop_btn = QPushButton(self.tr("Force Stop"), enabled=True)
-        self.force_stop_btn.setToolTip(
-            "Immediately kills llama-server process tree if normal stop is stuck"
-        )
-        self.force_stop_btn.setStyleSheet(
-            "background-color: #8B0000; color: white; font-weight: bold; padding: 8px;"
-        )
-        # Скрыта по умолчанию; появляется автоматически через ~5 сек после
-        # нажатия Stop, если сервер не остановился (см. _reveal_force_stop).
-        self.force_stop_btn.setVisible(False)
 
         # Basic/Advanced (Этап 3.2): скрывает продвинутые панели разом.
+        # Серверные кнопки (Start/Restart/Stop/Force Stop) перенесены в
+        # ControlStrip — нижняя полоса управления (Этап 3).
         self.advanced_mode_chk = QCheckBox(self.tr("Advanced settings"))
         self.advanced_mode_chk.setChecked(
             self.ui_settings.value("advancedMode", True, type=bool)
@@ -419,10 +397,6 @@ class MainWindowUI(QMainWindow):
             "and all other pages."
         )
         self.advanced_mode_chk.toggled.connect(self._apply_advanced_mode)
-        row1.addWidget(self.start_btn)
-        row1.addWidget(self.reload_btn)
-        row1.addWidget(self.stop_btn)
-        row1.addWidget(self.force_stop_btn)
         row1.addWidget(self.advanced_mode_chk)
         row1.addStretch(1)
 
