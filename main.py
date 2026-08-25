@@ -618,57 +618,25 @@ class LlamaGUI:
             self.ui.preflight_status.setText(
                 "Select a model to estimate launch readiness"
             )
-            self.ui.preflight_vram_label.setText("Estimated VRAM: -")
-            self.ui.preflight_vram_bar.setValue(0)
-            self.ui.preflight_vram_bar.setFormat("-")
-            self.ui.preflight_warning.setText("")
-            return
-        if estimate:
-            self.ui.preflight_vram_label.setText(
-                "Estimated VRAM: "
-                f"{estimate.total_gib:.2f} GiB "
-                f"(weights {estimate.model_vram_gib:.2f}, KV {estimate.kv_cache_gib:.2f})"
-            )
-            cap_mib = vram_cap or 0
-            if cap_mib:
-                pct = min(100, int((estimate.total_gib * 1024 / cap_mib) * 100))
-                self.ui.preflight_vram_bar.setValue(pct)
-                self.ui.preflight_vram_bar.setFormat(f"{pct}%")
-                margin_gib = cap_mib / 1024 - estimate.total_gib
-                if pct >= 95:
-                    self.ui.preflight_status.setText("⚠ Ready, but VRAM margin is low")
-                    self.ui.preflight_status.setStyleSheet(
-                        "font-weight: bold; color: " + STATUS_COLOR_PENDING + ";"
-                    )
-                    self.ui.preflight_warning.setText(
-                        f"Estimated margin: {margin_gib:.2f} GiB. Consider lower context or KV Q4."
-                    )
-                else:
-                    self.ui.preflight_status.setText("✓ Ready to launch")
-                    self.ui.preflight_status.setStyleSheet(
-                        "font-weight: bold; color: " + STATUS_COLOR_READY + ";"
-                    )
-                    self.ui.preflight_warning.setText(
-                        f"Estimated margin: {margin_gib:.2f} GiB"
-                    )
-            else:
-                self.ui.preflight_vram_bar.setValue(0)
-                self.ui.preflight_vram_bar.setFormat("capacity unknown")
-                self.ui.preflight_status.setText("Ready to launch")
-                self.ui.preflight_status.setStyleSheet(
-                    "font-weight: bold; color: " + STATUS_COLOR_READY + ";"
-                )
-                self.ui.preflight_warning.setText(
-                    "GPU capacity not available until llama.cpp reports it."
-                )
-        else:
-            self.ui.preflight_status.setText("Ready to launch")
             self.ui.preflight_status.setStyleSheet(
                 "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
             )
-            self.ui.preflight_vram_label.setText("Estimated VRAM: unavailable")
-            self.ui.preflight_vram_bar.setValue(0)
-            self.ui.preflight_vram_bar.setFormat("-")
+            self.ui.preflight_warning.setText("")
+            return
+        # VRAM capacity bar removed: llama.cpp reports VRAM only after the
+        # model loads, so the pre-launch estimate was unreliable
+        # ("GPU capacity not available"). Preflight shows launch readiness
+        # without it.
+        self.ui.preflight_status.setText("Ready to launch")
+        self.ui.preflight_status.setStyleSheet(
+            "font-weight: bold; color: " + STATUS_COLOR_READY + ";"
+        )
+        if estimate:
+            self.ui.preflight_warning.setText(
+                f"Estimated VRAM: {estimate.total_gib:.2f} GiB "
+                f"(weights {estimate.model_vram_gib:.2f}, KV {estimate.kv_cache_gib:.2f})"
+            )
+        else:
             self.ui.preflight_warning.setText("Model metadata is incomplete.")
 
     def _on_log_speed_updated(self, text: str):

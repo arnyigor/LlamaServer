@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.core.constants import APP_VERSION
+
 
 class HeaderBar(QWidget):
     language_changed = Signal(str)
@@ -31,6 +33,10 @@ class HeaderBar(QWidget):
         title = QLabel(self.tr("Llama Server Studio"))
         title.setStyleSheet("font-weight: bold; color: #bbb;")
         lay.addWidget(title)
+        # Версия приложения — видна сразу, без раскрытия настроек.
+        ver = QLabel(APP_VERSION)
+        ver.setStyleSheet("color: #777; font-size: 11px; padding-left: 6px;")
+        lay.addWidget(ver)
         lay.addStretch(1)
 
         # === Язык ===

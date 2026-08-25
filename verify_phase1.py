@@ -19,6 +19,8 @@ REQUIRED = [
     "nav_rail",
     "pages",
     "content_splitter",
+    "main_vsplit",
+    "log_dock",
     # overview / dashboard
     "overview_status",
     "overview_model",
@@ -47,8 +49,6 @@ REQUIRED = [
     "preflight_gpu",
     "preflight_mtp",
     "preflight_endpoint",
-    "preflight_vram_label",
-    "preflight_vram_bar",
     "preflight_warning",
     # logs
     "logs",

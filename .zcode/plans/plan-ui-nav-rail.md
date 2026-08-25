@@ -1,7 +1,7 @@
 # План: Редизайн UI — навигационный рейл + логи снизу
 
 > **Ветка:** `ui/navigation-rail-layout`
-> **Статус:** 🟡 в разработке (Этап 1 + 1.5 — каркас и UX-доработки готовы, верификация пройдена)
+> **Статус:** 🟡 в разработке (Этап 1 + 1.5 + 1.6 + 1.7 + 2 — каркас, UX-доработки, реорганизация раскладки, очистка UI и лог-док готовы, верификация пройдена)
 > **Дата начала:** 2026-08-25
 > **Цель:** Перенять паттерн UI из `pytraveler/LlamaServerLauncherAvalonia`
 > (иконочный nav-рейл слева, настройки в центре, логи в нижнем доке),
@@ -92,10 +92,10 @@ UI-паттерну. Их добавлять не будем.
 │ NAV  │  QStackedWidget — страница выбранного раздела (вся ширина)      │
 │ рейл │                                                                 │
 │(икон-│  Pages:                                                         │
-│ ки + │   • Dashboard  (Overview: статус + 6 карточек + preflight)      │
+│ ки + │   • Dashboard  (stats: overview cards + live speed/tokens + preflight)      │
 │ лейб │   • Paths      (llama.cpp / models / CUDA / update)            │
-│ лы)  │   • Performance(M launch settings + adv perf/MTP + preflight)   │
-│      │   • Sampling   (sampling grid + reasoning)                     │
+│ лы)  │   • Launch     (model select + context + vision/mmproj + CUDA + CLI Preview)   │
+│      │   • Сэмплинг   (GPU offload + KV cache + attention + batch/threads + MTP + reasoning + sampling grid + Память KV-кэш)                     │
 │ Dash │   • Server     (server opts + diagnostics + templates + extra)│
 │ Path │   • Library    (local models + HF download)                    │
 │ Perf │   • Integration(OpenCode/PI)                                   │
@@ -206,17 +206,84 @@ UI-паттерну. Их добавлять не будем.
 - [x] **Верификация 1.5**: `py_compile` чистый; `verify_phase1.py` (offscreen) →
       PASSED (75 атрибутов, 9 страниц, переключение, advanced toggle, state
       round-trip); PyInstaller-сборка `dist_next/LlamaServerGUI.exe` →
+       `verify_build.py` STARTUP_OK (12s, без краша).
+
+### ✅ Этап 1.6 — Реорганизация раскладки: Запуск / Сэмплинг / Пути
+- [x] **Запуск** (`g_launch`) оставлен минимальным: только выбор размера
+      контекста (`ctx_size` + быстрые кнопки + CPU MoE `-ncmoe`), vision-модель
+      (`use_mmproj` / `mmproj_offload`, перенесены из секции Модель) и CUDA
+      (`launch_cuda_version_combo` в `r_cuda`).
+- [x] **Vision (mmproj)** перенесён из `_build_model_section` (где был в группе
+      Модель на Dashboard) в `_build_performance_section` → `g_launch`.
+      Атрибуты `use_mmproj`/`mmproj_offload` сохранены (main.py работает).
+- [x] **GPU offload (-ngl)** (`r1`), **KV K/V** (`r3`), **Flash Attention / Fit**
+      (`r6`) перенесены с Запуска на страницу **Сэмплинг**, каждый завёрнут в
+      свой `QGroupBox`-блок («GPU offload (-ngl)» / «KV cache type» /
+      «Attention / Fit») внутри `sampling_panel.content_layout`.
+- [x] **Панель «Память (KV-кэш)»** (`adv_panel`) перенесена целиком со страницы
+      Запуск на страницу **Сэмплинг** как sibling-блок (`_sampling_page`).
+      `_advanced_panels()` и `advanced_mode_chk` остаются рабочими (тоггл
+      скрывает/показывает блок Памяти теперь на Сэмплинге).
+- [x] **Пути** (`PathsPanel`): убран спойлер — `CollapsiblePanel(collapsible=False)`
+      (всегда раскрыта). Версия CUDA для обновления (`cuda_version_combo`,
+      источник истины) теперь показана в строке обновления рядом с кнопкой
+      «Update llama.cpp».
+- [x] **cuda_version_combo** — один экземпляр нельзя поместить в две раскладки,
+      поэтому на Запуске показано зеркало `launch_cuda_version_combo` с
+      двусторонней синхронизацией (`currentIndexChanged` ↔). Источник
+      (`cuda_version_combo`) остаётся там, где `main.py` его читает/блокирует
+      (`update_llamacpp`, `setEnabled`) — на вкладке Пути.
+- [x] **Верификация 1.6**: `py_compile` чистый; `verify_phase1.py` (offscreen) →
+      PASSED (75 атрибутов, 9 страниц, переключение, advanced toggle, state
+      round-trip); PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
+       `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
+
+### ✅ Этап 1.7 — Модель на Запуск, английский UI, Dashboard=stats, удалён «GPU capacity»
+- [x] **Выбор и данные модели** (`model_group`: Scan / Found GGUF / Auto setup /
+      Model info / Copy path) перенесены с Dashboard на страницу **Запуск**
+      (`_performance_page`, первым блоком). Теперь на Запуске сразу видно,
+      какая модель выбрана и что запускаем.
+- [x] **NAV_PAGES возвращены на английский** (Dashboard / Paths / Launch /
+      Sampling / Server / Models / Integration / Benchmark / AutoTune) — проще
+      читать для технических программ. (Остальные UI-лейблы и так были
+      английскими; русскими были только NAV_PAGES с Этапа 1.5.)
+- [x] **Dashboard = stats (onboarding)**: после переноса модели страница
+      содержит только статистику — `overview_content_widget` (6 карточек:
+      Generation / Memory / Request / Context / Active / Endpoint),
+      `runtime_stats_group` (Speed / Tokens / Request / Saved / Active / Current
+      time + кнопки экспорта) и `launch_summary_group` (preflight). Порядок:
+      карточки → live stats → preflight.
+- [x] **Удалён «GPU capacity»** — это была VRAM-оценка в preflight
+      (`preflight_vram_bar` + сообщение «GPU capacity not available until
+      llama.cpp reports it.»). Она работает только ПОСЛЕ загрузки модели
+      (llama.cpp сообщает VRAM только тогда), поэтому до запуска всегда
+      показывала «not available» — т.е. «не работает». Удалены виджеты
+      `preflight_vram_label`/`preflight_vram_bar` (main_window.py), вся логика
+      VRAM-бара и ветка «GPU capacity not available» (main.py), и упоминания из
+      `verify_phase1.py` (REQUIRED уменьшен 75→73). Preflight теперь показывает
+      model/context/KV/GPU offload/MTP/endpoint + статус готовности.
+- [x] **Верификация 1.7**: `py_compile` чистый; `grep preflight_vram` → NONE;
+      `verify_phase1.py` (offscreen) → PASSED (73 атрибута, 9 страниц,
+      переключение, advanced toggle, state round-trip); PyInstaller-сборка
+      `dist_next/LlamaServerGUI_Next.exe` и `dist/LlamaServerGUI_Next.exe` →
       `verify_build.py` STARTUP_OK (12s, без краша).
 
-### ⬜ Этап 2 — Лог-док снизу
-- [ ] `src/ui/log_dock.py`: `LogDock(QWidget)` — `QTextEdit` (self.logs, то же
-      имя), заголовок с auto-scroll/clear/copy/save + кнопка maximize.
-- [ ] Встроить в `QSplitter` (Vertical) между контентом и низом окна.
-- [ ] Кнопка maximize: разворачивает док на всю высоту (скрывает контент) и
-      обратно; состояние в `QSettings`.
-- [ ] `LogManager(self.ui.logs)` из `main.py` работает без изменений (имя атрибута
-      сохранено).
-- [ ] **Верификация Этапа 2**.
+### ✅ Этап 2 — Лог-док снизу
+- [x] `src/ui/log_dock.py`: `LogDock(QWidget)` — `QTextEdit` (self.logs, то же
+       имя), заголовок с auto-scroll/clear/copy-last-error/open-diagnostics +
+       кнопка maximize (toggle_maximize Signal, set_maximized(on) меняет лейбл).
+- [x] Контент (nav|pages `content_splitter`) и `log_dock` обёрнуты в вертикальный
+       `QSplitter` (`main_vsplit`) — лог-док ресайзится мышью.
+- [x] Кнопка maximize: скрывает контент (`content_splitter.setVisible(False)`) →
+       лог-док на всю высоту, и обратно (`setSizes` из сохранённых док-размеров);
+       состояние в `QSettings` (`mainVSplitterSizes` + `logDockMaximized`).
+- [x] `LogManager(self.ui.logs)` из `main.py` работает без изменений — атрибуты
+       `logs`/`autoscroll_logs`/`copy_last_error_btn`/`open_diagnostics_btn`
+       реэкспортированы с `log_dock` на `self.ui`.
+- [x] **Верификация Этапа 2**: `py_compile` чистый; `verify_phase1.py` (offscreen)
+       → PASSED (75 атрибутов, в т.ч. `main_vsplit`/`log_dock`; save/load
+       round-trip OK); PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
+       `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
 ### ⬜ Этап 3 — Полоса управления сервером
 - [ ] `src/ui/control_strip.py`: `ControlStrip(QWidget)` — переиспользовать
@@ -275,7 +342,9 @@ UI-паттерну. Их добавлять не будем.
 | 2026-08-25 | 0 | Создана ветка `ui/navigation-rail-layout`; записан план | `git branch`, чтение файла | ✅ |
 | 2026-08-25 | 1 | Каркас: `HeaderBar` + `NavRail` + `QStackedWidget` (9 страниц, Dashboard как пункт рейла), логи inline снизу, язык в шапку; `verify_phase1.py` | `python verify_phase1.py` (offscreen) → PASSED; `py_compile` чистый | ✅ |
 | 2026-08-25 | 1.5 | UX-доработки: шапка без Profile; CollapsiblePanel статичные; NAV_PAGES рус; Preset+readout в панели запуска; MTP+extra_args на Сэмплинг; CLI Preview на Запуск; Basic/Advanced прячет только Память | `verify_phase1.py` PASSED; `py_compile` чистый; `verify_build.py` STARTUP_OK | ✅ |
-| | 2 | _ | _ | ⬜ |
+| 2026-08-25 | 1.6 | Реорганизация раскладки: Запуск = context+vision+CUDA; GPU offload/KV K-V/Flash-Fit/Память → Сэмплинг (QGroupBox-блоки); Пути без спойлера + версия CUDA для обновления; cuda_version_combo-зеркало на Запуске | `verify_phase1.py` PASSED; `py_compile` чистый; `verify_build.py` STARTUP_OK (обе копии Next.exe) | ✅ |
+| 2026-08-25 | 1.7 | Модель (выбор+данные) → Запуск; NAV_PAGES на английский; Dashboard=stats; удалён «GPU capacity» (VRAM-оценка preflight, не работала до запуска) | `py_compile` чистый; `grep preflight_vram`→NONE; `verify_phase1.py` PASSED (73); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
+| 2026-08-25 | 2 | Лог-док вынесен в `src/ui/log_dock.py`; контент+док в вертикальном `QSplitter` (ресайз); кнопка maximize (скрывает контент, состояние в QSettings) | `py_compile` чистый; `verify_phase1.py` PASSED (75, +main_vsplit/log_dock); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
 | | 3 | _ | _ | ⬜ |
 | | 4 | _ | _ | ⬜ |
 | | 5 | _ | _ | ⬜ |

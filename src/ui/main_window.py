@@ -59,6 +59,7 @@ from src.ui.panels.paths_panel import PathsPanel
 from src.ui.mem_viz_widget import MemoryVisualizationWidget
 from src.ui.autotune_widget import AutoTuneWidget
 from src.ui.header_bar import HeaderBar
+from src.ui.log_dock import LogDock
 from src.ui.nav_rail import NavRail
 
 
@@ -66,15 +67,15 @@ class MainWindowUI(QMainWindow):
     # Порядок страниц навигации (label, key). NavRail и QStackedWidget в
     # _build_pages собираются в этом же порядке — единый источник истины.
     NAV_PAGES = [
-        ("Главная", "dashboard"),
-        ("Пути", "paths"),
-        ("Запуск", "performance"),
-        ("Сэмплинг", "sampling"),
-        ("Сервер", "server"),
-        ("Модели", "library"),
-        ("Интеграция", "integration"),
-        ("Тесты", "benchmark"),
-        ("Автотюн", "autotune"),
+        ("Dashboard", "dashboard"),
+        ("Paths", "paths"),
+        ("Launch", "performance"),
+        ("Sampling", "sampling"),
+        ("Server", "server"),
+        ("Models", "library"),
+        ("Integration", "integration"),
+        ("Benchmark", "benchmark"),
+        ("AutoTune", "autotune"),
     ]
 
     def __init__(self):
@@ -151,10 +152,27 @@ class MainWindowUI(QMainWindow):
         content.setStretchFactor(1, 1)
         content.setSizes([190, 1000])
         self.content_splitter = content
-        root.addWidget(content, 1)
 
-        # === Нижний док логов (Этап 2 вынесет в log_dock.py) ===
-        root.addWidget(self._build_log_area())
+        # === Нижний док логов (Phase 2: вынесен в LogDock) ===
+        self.log_dock = LogDock()
+        # Реэкспорт атрибутов для совместимости с main.py
+        self.logs = self.log_dock.logs
+        self.autoscroll_logs = self.log_dock.autoscroll_logs
+        self.copy_last_error_btn = self.log_dock.copy_last_error_btn
+        self.open_diagnostics_btn = self.log_dock.open_diagnostics_btn
+        self.log_dock.toggle_maximize.connect(self._toggle_log_maximize)
+
+        # Вертикальный сплиттер: контент (nav|pages) + лог-док (ресайз + maximize)
+        main_vsplit = QSplitter(Qt.Orientation.Vertical)
+        main_vsplit.addWidget(self.content_splitter)
+        main_vsplit.addWidget(self.log_dock)
+        main_vsplit.setStretchFactor(0, 1)
+        main_vsplit.setStretchFactor(1, 0)
+        main_vsplit.setSizes([700, 180])
+        self.main_vsplit = main_vsplit
+        self._main_vsplit_docked = [700, 180]
+        self._log_maximized = False
+        root.addWidget(self.main_vsplit, 1)
 
         # Стартовая страница
         self.nav_rail.setCurrentRow(0)
@@ -473,6 +491,7 @@ class MainWindowUI(QMainWindow):
         self.bench_path = self.paths_panel.bench_path
         self.model_dir = self.paths_panel.model_dir
         self.cuda_version_combo = self.paths_panel.cuda_version_combo
+        self.launch_cuda_version_combo = self.paths_panel.launch_cuda_version_combo
         self.update_llama_btn = self.paths_panel.update_llama_btn
         self.update_status = self.paths_panel.update_status
         self.update_progress = self.paths_panel.update_progress
@@ -510,15 +529,6 @@ class MainWindowUI(QMainWindow):
         self.auto_params = QCheckBox(self.tr("Auto setup ctx/GPU/cache by GGUF"))
         self.auto_params.setChecked(True)
         lm.addWidget(self.auto_params)
-
-        mmproj_row = QHBoxLayout()
-        self.use_mmproj = QCheckBox(self.tr("Use mmproj"))
-        self.use_mmproj.setChecked(True)
-        self.mmproj_offload = QCheckBox(self.tr("mmproj offload"))
-        self.mmproj_offload.setChecked(True)
-        mmproj_row.addWidget(self.use_mmproj)
-        mmproj_row.addWidget(self.mmproj_offload)
-        lm.addLayout(mmproj_row)
 
         self.model_info = QLabel(self.tr("Select model"))
         self.model_info.setTextInteractionFlags(
@@ -814,7 +824,9 @@ class MainWindowUI(QMainWindow):
         server_opts = self.server_panel.content_layout
         server_opts.setContentsMargins(8, 6, 8, 6)
         server_opts.setSpacing(8)
-        # Launch settings stays directly under Model; advanced controls remain collapsed below.
+        # Launch settings (g_launch) keeps only context, vision and CUDA.
+        # GPU offload, KV cache type, attention and the Memory (KV-cache)
+        # panel are moved to the Sampling page as separate blocks.
 
         self.launch_summary_group = QGroupBox(self.tr("Launch preflight"))
         launch_summary = QVBoxLayout(self.launch_summary_group)
@@ -833,9 +845,6 @@ class MainWindowUI(QMainWindow):
         self.preflight_gpu = QLabel(self.tr("GPU offload: -"))
         self.preflight_mtp = QLabel(self.tr("MTP: -"))
         self.preflight_endpoint = QLabel(self.tr("Endpoint: -"))
-        self.preflight_vram_label = QLabel(self.tr("Estimated VRAM: -"))
-        self.preflight_vram_bar = QProgressBar(minimum=0, maximum=100)
-        self.preflight_vram_bar.setTextVisible(True)
         self.preflight_warning = QLabel(self.tr(""))
         self.preflight_warning.setWordWrap(True)
         self.preflight_warning.setStyleSheet("color: " + STATUS_COLOR_PENDING + ";")
@@ -846,11 +855,9 @@ class MainWindowUI(QMainWindow):
             self.preflight_gpu,
             self.preflight_mtp,
             self.preflight_endpoint,
-            self.preflight_vram_label,
         ]:
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             launch_summary.addWidget(label)
-        launch_summary.addWidget(self.preflight_vram_bar)
         launch_summary.addWidget(self.preflight_warning)
 
         self.gpu_layers = QSpinBox()
@@ -882,7 +889,7 @@ class MainWindowUI(QMainWindow):
         )
         r_cuda = QHBoxLayout()
         r_cuda.addWidget(QLabel(self.tr("CUDA build:")))
-        r_cuda.addWidget(self.cuda_version_combo)
+        r_cuda.addWidget(self.launch_cuda_version_combo)
         r_cuda.addWidget(self.cuda_status_label, 1)
         launch.addLayout(r_cuda)
 
@@ -941,7 +948,21 @@ class MainWindowUI(QMainWindow):
                 r2b.addSpacing(10)
         r2b.addStretch(1)
         launch.addLayout(r2b)
-        launch.addLayout(r1)
+
+        # Vision (mmproj) — перенесено из секции модели на страницу Запуск.
+        mmproj_row = QHBoxLayout()
+        self.use_mmproj = QCheckBox(self.tr("Use mmproj"))
+        self.use_mmproj.setChecked(True)
+        self.mmproj_offload = QCheckBox(self.tr("mmproj offload"))
+        self.mmproj_offload.setChecked(True)
+        mmproj_row.addWidget(self.use_mmproj)
+        mmproj_row.addWidget(self.mmproj_offload)
+        launch.addLayout(mmproj_row)
+
+        # GPU offload (-ngl) — блок на странице Сэмплинг.
+        gpu_offload_box = QGroupBox(self.tr("GPU offload (-ngl)"))
+        gpu_offload_box.setLayout(r1)
+        sampling.addWidget(gpu_offload_box)
 
         self.batch_size = QSpinBox()
         self.batch_size.setRange(AUTO_SENTINEL, 32768)
@@ -961,15 +982,21 @@ class MainWindowUI(QMainWindow):
             self.cache_type_v.addItem(ct)
 
         r3 = QHBoxLayout()
-        r3.addWidget(QLabel(self.tr("Batch / UBatch:")))
-        r3.addWidget(self.batch_size)
-        r3.addWidget(self.ubatch_size)
-        r3.addSpacing(12)
         r3.addWidget(QLabel(self.tr("KV K / V:")))
         r3.addWidget(self.cache_type_k)
         r3.addWidget(self.cache_type_v)
         r3.addStretch(1)
-        launch.addLayout(r3)
+        kv_cache_box = QGroupBox(self.tr("KV cache type"))
+        kv_cache_box.setLayout(r3)
+        sampling.addWidget(kv_cache_box)
+
+        # Batch / UBatch — генеративные параметры, на страницу Сэмплинг.
+        r_batch = QHBoxLayout()
+        r_batch.addWidget(QLabel(self.tr("Batch / UBatch (-b / -ub):")))
+        r_batch.addWidget(self.batch_size)
+        r_batch.addWidget(self.ubatch_size)
+        r_batch.addStretch(1)
+        sampling.addLayout(r_batch)
 
         self.threads = QSpinBox()
         self.threads.setRange(1, 64)
@@ -982,12 +1009,7 @@ class MainWindowUI(QMainWindow):
         r4.addWidget(QLabel(self.tr("Threads gen / batch (-t / -tb):")))
         r4.addWidget(self.threads)
         r4.addWidget(self.threads_batch)
-        perf_header = QLabel(self.tr("Performance and Memory:"))
-        perf_header.setStyleSheet(
-            "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
-        )
-        lperf.addWidget(perf_header)
-        lperf.addLayout(r4)
+        sampling.addLayout(r4)
 
         self.flash_attn = QCheckBox(self.tr("Flash Attention (-fa)"))
         self.flash_attn.setChecked(True)
@@ -997,7 +1019,9 @@ class MainWindowUI(QMainWindow):
         r6.addWidget(self.flash_attn)
         r6.addWidget(self.fit_off)
         r6.addStretch(1)
-        launch.addLayout(r6)
+        attention_box = QGroupBox(self.tr("Attention / Fit"))
+        attention_box.setLayout(r6)
+        sampling.addWidget(attention_box)
 
         self.reasoning_mode = QComboBox()
         self.reasoning_mode.addItems(["off", "auto", "on"])
@@ -1502,9 +1526,8 @@ class MainWindowUI(QMainWindow):
 
     def _dashboard_page(self):
         page, lay = self._scroll_page()
-        lay.addWidget(self.model_group)
-        lay.addWidget(self.runtime_stats_group)
         lay.addWidget(self.overview_content_widget)
+        lay.addWidget(self.runtime_stats_group)
         lay.addWidget(self.launch_summary_group)
         lay.addStretch()
         return page
@@ -1517,8 +1540,8 @@ class MainWindowUI(QMainWindow):
 
     def _performance_page(self):
         page, lay = self._scroll_page()
+        lay.addWidget(self.model_group)
         lay.addWidget(self.g_launch)
-        lay.addWidget(self.adv_panel)
         lay.addWidget(self.cli_group)
         lay.addStretch()
         return page
@@ -1526,6 +1549,7 @@ class MainWindowUI(QMainWindow):
     def _sampling_page(self):
         page, lay = self._scroll_page()
         lay.addWidget(self.sampling_panel)
+        lay.addWidget(self.adv_panel)
         lay.addStretch()
         return page
 
@@ -1646,30 +1670,23 @@ class MainWindowUI(QMainWindow):
         overview.addStretch(1)
         return widget
 
-    def _build_log_area(self):
-        """Нижний док логов (временная inline-версия; Этап 2 → log_dock.py)."""
-        widget = QWidget()
-        log_layout = QVBoxLayout(widget)
-        log_layout.setContentsMargins(4, 4, 4, 4)
-        log_layout.setSpacing(4)
-        hdr = QHBoxLayout()
-        hdr.addWidget(QLabel(self.tr("Logs:")))
-        self.autoscroll_logs = QCheckBox(self.tr("Auto-scroll"), checked=True)
-        hdr.addWidget(self.autoscroll_logs)
-        hdr.addStretch(1)
-        self.copy_last_error_btn = QPushButton(self.tr("Copy last error"))
-        self.copy_last_error_btn.setEnabled(False)
-        self.open_diagnostics_btn = QPushButton(self.tr("Open diagnostics"))
-        hdr.addWidget(self.copy_last_error_btn)
-        hdr.addWidget(self.open_diagnostics_btn)
-        log_layout.addLayout(hdr)
-        self.logs = QTextEdit(readOnly=True, font=QFont("Consolas", 9))
-        self.logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
-        log_layout.addWidget(self.logs, 1)
-        clr = QPushButton(self.tr("Clear"))
-        clr.clicked.connect(self.logs.clear)
-        log_layout.addWidget(clr)
-        return widget
+    def _apply_log_maximize(self, on: bool) -> None:
+        """Hide (on=True) or show (on=False) the content area so the log dock
+        takes full height. Docked sizes are remembered for restore. State is
+        persisted via ``save_ui_state``."""
+        if on == self._log_maximized:
+            return
+        if on:
+            self._main_vsplit_docked = self.main_vsplit.sizes()
+            self.content_splitter.setVisible(False)
+        else:
+            self.content_splitter.setVisible(True)
+            self.main_vsplit.setSizes(self._main_vsplit_docked)
+        self._log_maximized = on
+        self.log_dock.set_maximized(on)
+
+    def _toggle_log_maximize(self) -> None:
+        self._apply_log_maximize(not self._log_maximized)
 
     def _build_status_bar(self):
         """Компактная полоса статуса поверх вкладок — видна всегда."""
@@ -1745,6 +1762,14 @@ class MainWindowUI(QMainWindow):
         splitter_state = self.ui_settings.value("contentSplitterState")
         if splitter_state and hasattr(self, "content_splitter"):
             self.content_splitter.restoreState(splitter_state)
+        vstate = self.ui_settings.value("mainVSplitterSizes")
+        if vstate and hasattr(self, "main_vsplit"):
+            try:
+                self.main_vsplit.setSizes([int(x) for x in vstate])
+            except (TypeError, ValueError):
+                pass
+        if self.ui_settings.value("logDockMaximized", False, type=bool):
+            self._apply_log_maximize(True)
         nav_index = self.ui_settings.value("navIndex")
         if nav_index is not None and hasattr(self, "nav_rail"):
             try:
@@ -1758,6 +1783,17 @@ class MainWindowUI(QMainWindow):
         if hasattr(self, "content_splitter"):
             self.ui_settings.setValue(
                 "contentSplitterState", self.content_splitter.saveState()
+            )
+        if hasattr(self, "main_vsplit"):
+            sizes = (
+                self._main_vsplit_docked
+                if getattr(self, "_log_maximized", False)
+                else self.main_vsplit.sizes()
+            )
+            self.ui_settings.setValue("mainVSplitterSizes", sizes)
+        if hasattr(self, "log_dock"):
+            self.ui_settings.setValue(
+                "logDockMaximized", bool(getattr(self, "_log_maximized", False))
             )
         if hasattr(self, "nav_rail"):
             self.ui_settings.setValue("navIndex", self.nav_rail.currentRow())

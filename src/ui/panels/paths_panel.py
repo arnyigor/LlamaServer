@@ -28,7 +28,8 @@ class PathsPanel(CollapsiblePanel):
     browse_models_requested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("Advanced: Paths and llama.cpp", parent=parent)
+        # Спойлер убран (collapsible=False): панель всегда раскрыта.
+        super().__init__("Paths and llama.cpp", parent=parent, collapsible=False)
         box = QGroupBox("Paths")
         lay = QVBoxLayout(box)
         lay.setContentsMargins(12, 18, 12, 12)
@@ -59,6 +60,7 @@ class PathsPanel(CollapsiblePanel):
             lay.addLayout(row)
 
         upd_row = QHBoxLayout()
+        # Источник истины — версия CUDA для обновления llama.cpp (рядом с Update).
         self.cuda_version_combo = QComboBox()
         self.cuda_version_combo.addItem("CUDA 12", "12")
         self.cuda_version_combo.addItem("CUDA 13", "13")
@@ -68,8 +70,23 @@ class PathsPanel(CollapsiblePanel):
             "CUDA 13 also downloads additional cudart DLLs.\n"
             "Minor version (12.4 / 13.3) is auto-detected from release."
         )
+        # Зеркало для вкладки «Запуск» (двусторонняя синхронизация выбора).
+        self.launch_cuda_version_combo = QComboBox()
+        self.launch_cuda_version_combo.addItem("CUDA 12", "12")
+        self.launch_cuda_version_combo.addItem("CUDA 13", "13")
+        self.launch_cuda_version_combo.setMaximumWidth(110)
+        self.launch_cuda_version_combo.setToolTip(
+            "CUDA major version for llama.cpp builds (mirrors the Paths tab selection)."
+        )
+        self.cuda_version_combo.currentIndexChanged.connect(
+            lambda i: self.launch_cuda_version_combo.setCurrentIndex(i)
+        )
+        self.launch_cuda_version_combo.currentIndexChanged.connect(
+            lambda i: self.cuda_version_combo.setCurrentIndex(i)
+        )
         self.update_llama_btn = QPushButton("Update llama.cpp")
         self.update_status = QLabel("idle", wordWrap=True)
+        upd_row.addWidget(self.cuda_version_combo)
         upd_row.addWidget(self.update_llama_btn)
         upd_row.addWidget(self.update_status, 1)
         lay.addLayout(upd_row)
