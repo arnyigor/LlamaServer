@@ -8,7 +8,7 @@ LlamaGUI, действия наружу — через сигналы; MainWindo
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -76,31 +76,5 @@ class PathsPanel(CollapsiblePanel):
 
         self.update_progress = QProgressBar(visible=False, minimum=0, maximum=100)
         lay.addWidget(self.update_progress)
-        lay.addLayout(self._build_language_row())
 
         self.add_widget(box)
-
-    def _build_language_row(self) -> QHBoxLayout:
-        """Язык интерфейса (Этап 4): применяется после перезапуска приложения."""
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Language:"))
-        self.language_combo = QComboBox()
-        self.language_combo.addItem("English", "en")
-        self.language_combo.addItem("Русский", "ru")
-        ui_settings = QSettings("LlamaServerGUI", "UIState")
-        saved_lang = str(ui_settings.value("language", "en") or "en").strip().lower()
-        self.language_combo.setCurrentIndex(
-            max(self.language_combo.findData(saved_lang), 0)
-        )
-        self.language_combo.setToolTip(
-            "Interface language. Applied after the application restarts "
-            "(or launch with --lang=ru / --lang=en)."
-        )
-        self.language_combo.currentIndexChanged.connect(
-            lambda index: ui_settings.setValue(
-                "language", str(self.language_combo.itemData(index) or "en")
-            )
-        )
-        row.addWidget(self.language_combo)
-        row.addStretch(1)
-        return row

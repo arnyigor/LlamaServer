@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QGridLayout,
     QAbstractItemView,
     QHeaderView,
@@ -57,9 +58,25 @@ from src.ui.widgets import CollapsiblePanel, NoWheelValueChangeFilter
 from src.ui.panels.paths_panel import PathsPanel
 from src.ui.mem_viz_widget import MemoryVisualizationWidget
 from src.ui.autotune_widget import AutoTuneWidget
+from src.ui.header_bar import HeaderBar
+from src.ui.nav_rail import NavRail
 
 
 class MainWindowUI(QMainWindow):
+    # Порядок страниц навигации (label, key). NavRail и QStackedWidget в
+    # _build_pages собираются в этом же порядке — единый источник истины.
+    NAV_PAGES = [
+        ("Dashboard", "dashboard"),
+        ("Paths", "paths"),
+        ("Performance", "performance"),
+        ("Sampling", "sampling"),
+        ("Server", "server"),
+        ("Library", "library"),
+        ("Integration", "integration"),
+        ("Benchmark", "benchmark"),
+        ("AutoTune", "autotune"),
+    ]
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Llama Server Studio")
@@ -74,6 +91,7 @@ class MainWindowUI(QMainWindow):
         self.ui_settings = QSettings("LlamaServerGUI", "UIState")
 
         self._setup_ui()
+        self._hide_extra_widgets()
         self._no_wheel_value_filter = NoWheelValueChangeFilter(self)
         QApplication.instance().installEventFilter(self._no_wheel_value_filter)
         self._setup_tooltips()
@@ -102,57 +120,161 @@ class MainWindowUI(QMainWindow):
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
-        left = self._build_left_panel()
-        right = self._build_right_panel()
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([820, 730])
-        self.main_splitter = splitter
-        main_layout.addWidget(splitter)
+        # === Шапка: профиль + Save flyout + язык ===
+        self.header = HeaderBar()
+        # Реэкспорт для совместимости (config/main.py могут ссылаться на language_combo)
+        self.language_combo = self.header.language_combo
+        root.addWidget(self.header)
 
-    def _build_left_panel(self):
-        panel = QWidget()
-        panel.setMinimumWidth(720)
-        outer_lay = QVBoxLayout(panel)
-        outer_lay.setContentsMargins(10, 10, 10, 10)
-        outer_lay.setSpacing(10)
+        # === Постоянная тонкая полоса статуса (всегда видна) ===
+        self.status_bar_widget = self._build_status_bar()
+        root.addWidget(self.status_bar_widget)
 
-        # === Фиксированная зона: кнопки запуска + runtime stats ===
-        self._build_launch_controls_section(outer_lay)
-        self._build_hf_models_section(
-            outer_lay
-        )  # creates runtime_stats_group, adds to outer_lay
+        # === Контент: nav-рейл + страницы ===
+        # _build_all_widgets() внутри вызывает _build_launch_controls_section()
+        # (первый вызов) и создаёт self.launch_controls_widget — вызываем ДО
+        # добавления панели запуска в root, чтобы не дублировать кнопки.
+        self._build_all_widgets()
+        root.addWidget(self.launch_controls_widget)
+        self.pages = self._build_pages()
 
-        # === Scrollable zone: все остальные секции ===
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        inner = QWidget()
-        inner_lay = QVBoxLayout(inner)
-        inner_lay.setContentsMargins(0, 0, 0, 0)
-        inner_lay.setSpacing(10)
+        content = QSplitter(Qt.Orientation.Horizontal)
+        self.nav_rail = NavRail(self.NAV_PAGES)
+        self.nav_rail.page_selected.connect(self._on_nav_selected)
+        content.addWidget(self.nav_rail)
+        content.addWidget(self.pages)
+        content.setStretchFactor(0, 0)
+        content.setStretchFactor(1, 1)
+        content.setSizes([190, 1000])
+        self.content_splitter = content
+        root.addWidget(content, 1)
 
+        # === Нижний док логов (Этап 2 вынесет в log_dock.py) ===
+        root.addWidget(self._build_log_area())
+
+        # Стартовая страница
+        self.nav_rail.setCurrentRow(0)
+
+    def _direct_layout_of(self, widget):
+        """Возвращает layout, который напрямую содержит виджет (с учётом вложенности).
+
+        ``widget.parentWidget().layout()`` отдаёт верхнеуровневый layout панели,
+        тогда как сам виджет лежит во вложенном под-layout'е (напр. r8c внутри
+        content_layout). Простой ``indexOf`` по верхнеуровневому layout не найдёт
+        вложенный виджет, поэтому ищем layout, содержащий виджет, обходом по
+        вложенности.
+        """
+        parent = widget.parentWidget()
+        if parent is None:
+            return None
+        top = parent.layout()
+        if top is None:
+            return None
+        stack = [top]
+        while stack:
+            lay = stack.pop()
+            if lay.indexOf(widget) >= 0:
+                return lay
+            for i in range(lay.count()):
+                sub = lay.itemAt(i).layout()
+                if sub is not None:
+                    stack.append(sub)
+        return None
+
+    def _label_before_widget(self, widget, layout):
+        """QLabel-подпись непосредственно перед виджетом в layout (пропуская spacer'ы).
+
+        Для самоподписанных чекбоксов (текст внутри самого виджета) возвращает
+        None — отдельной подписи нет.
+        """
+        idx = layout.indexOf(widget)
+        if idx <= 0:
+            return None
+        for i in range(idx - 1, -1, -1):
+            item = layout.itemAt(i)
+            if item is None:
+                continue
+            if item.spacerItem() is not None:
+                continue
+            w = item.widget()
+            if w is None:
+                continue
+            if isinstance(w, QLabel):
+                return w
+            return None  # другой виджет перед нашим — подписи нет
+        return None
+
+    def _hide_extra_widgets(self) -> None:
+        """EXTRA-параметры (managed=False) больше не управляются UI при сборке команды.
+
+        Их виджеты создаём (для совместимости с FIELD_WIDGET_MAP и синхронизацией
+        settings↔виджеты в config.py), но не показываем — они живут только в
+        текстовом поле extra_args. Вынимаем их и сопутствующие подписи (QLabel),
+        стоящие перед ними в том же layout, чтобы не оставлять «осиротевших»
+        подписей рядом с пустым местом.
+        """
+        extra_attrs = [
+            "ctx_checkpoints",
+            "cache_ram",
+            "split_mode",
+            "main_gpu",
+            "cuda_device",
+            "use_mlock",
+            "verbose",
+            "log_timestamps",
+            "context_shift",
+            "no_webui",
+            "use_chat_template",
+            "chat_template_file",
+            "chat_template_btn",
+            "cuda_visible_devices",
+            "cuda_module_loading",
+            "kv_unified",
+            "cont_batching",
+            "cache_prompt",
+            "use_mmap",
+        ]
+        for attr in extra_attrs:
+            widget = getattr(self, attr, None)
+            if widget is None or not hasattr(widget, "hide"):
+                continue
+            layout = self._direct_layout_of(widget)
+            if layout is not None:
+                label = self._label_before_widget(widget, layout)
+                if label is not None:
+                    layout.removeWidget(label)
+                    label.hide()
+                layout.removeWidget(widget)
+            widget.hide()
+
+    def _build_all_widgets(self):
+        """Создаёт все виджеты (self.*) без привязки к старым контейнерам.
+
+        Сборка в страницы навигации выполняется в ``_build_pages``. Порядок
+        важен: performance создаёт панели, которые sampling наполняет контентом.
+        """
+        self._build_launch_controls_section()
+        self._build_hf_models_section()
         self._build_paths_section()
-        self._build_model_section(inner_lay)
-        self._build_performance_section(inner_lay)
+        self._build_model_section()
+        self._build_performance_section()
         self._build_sampling_section()
         self._build_integration_section()
         self._build_benchmark_section()
-        self._build_cli_section(inner_lay)
-        self._assemble_left_sections(inner_lay)
-        inner_lay.addStretch()
-        scroll.setWidget(inner)
-        outer_lay.addWidget(scroll, 1)
+        self._build_cli_section()
+        self.overview_content_widget = self._build_overview_content()
+
+        self.autotune = AutoTuneWidget()
 
         self._apply_advanced_mode(self.advanced_mode_chk.isChecked())
+        self._collect_runtime_lockable()
 
-        # Collect all widgets that must be locked while server/bench/autotune runs
+    def _collect_runtime_lockable(self):
+        """Виджеты, блокируемые во время работы сервера/bench/autotune."""
         self._runtime_lockable = [
             self.model_combo,
             self.auto_params,
@@ -225,17 +347,8 @@ class MainWindowUI(QMainWindow):
         ]
         self._runtime_lockable.extend(getattr(self, "ctx_quick_buttons", []))
 
-        scroll = QScrollArea(
-            widgetResizable=True,
-            horizontalScrollBarPolicy=Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
-        )
-        scroll.setWidget(panel)
-        scroll.setMinimumWidth(720)
-        scroll.setMaximumWidth(940)
-        return scroll
-
-    def _build_launch_controls_section(self, lay):
-        # === 0. Кнопки управления (вверху, чтобы не скролить) ===
+    def _build_launch_controls_section(self):
+        # === 0. Кнопки управления (всегда видны в верхней панели) ===
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton(self.tr("Start Server"))
         self.start_btn.setStyleSheet(
@@ -286,7 +399,8 @@ class MainWindowUI(QMainWindow):
         btn_row.addWidget(self.stop_btn)
         btn_row.addWidget(self.force_stop_btn)
         btn_row.addWidget(self.advanced_mode_chk)
-        lay.addLayout(btn_row)
+        self.launch_controls_widget = QWidget()
+        self.launch_controls_widget.setLayout(btn_row)
 
     def _apply_advanced_mode(self, advanced: bool):
         """Basic mode: спрятать продвинутые панели, оставить Model + Launch."""
@@ -319,13 +433,8 @@ class MainWindowUI(QMainWindow):
         self.update_llama_btn = self.paths_panel.update_llama_btn
         self.update_status = self.paths_panel.update_status
         self.update_progress = self.paths_panel.update_progress
-        self.language_combo = self.paths_panel.language_combo
 
-    def _save_language(self, index: int):
-        lang = str(self.language_combo.itemData(index) or "en")
-        self.ui_settings.setValue("language", lang)
-
-    def _build_model_section(self, lay):
+    def _build_model_section(self):
         # === 2. Модель ===
         g_model = QGroupBox(self.tr("Model"))
         lm = QVBoxLayout(g_model)
@@ -386,9 +495,9 @@ class MainWindowUI(QMainWindow):
         mrow.addWidget(self.model_id_label, 1)
         lm.addWidget(self.model_info)
         lm.addLayout(mrow)
-        lay.addWidget(g_model)
+        self.model_group = g_model
 
-    def _build_hf_models_section(self, lay):
+    def _build_hf_models_section(self):
         # === 2a. Локальные модели + загрузка с Hugging Face ===
         self.models_panel = CollapsiblePanel(
             self.tr("Local model manager and download"),
@@ -629,9 +738,8 @@ class MainWindowUI(QMainWindow):
         stats.addWidget(self.export_stats_btn, 4, 2)
         stats.addWidget(self.copy_stats_md_btn, 5, 2)
         stats.setColumnStretch(1, 1)
-        lay.addWidget(self.runtime_stats_group)
 
-    def _build_performance_section(self, lay):
+    def _build_performance_section(self):
         # === 3. Производительность ===
         self.g_launch = QGroupBox(self.tr("Launch settings"))
         launch = QVBoxLayout(self.g_launch)
@@ -915,7 +1023,9 @@ class MainWindowUI(QMainWindow):
         row_budget.addStretch(1)
         r7b.addLayout(row_budget)
         row_budget_msg = QHBoxLayout()
-        row_budget_msg.addWidget(QLabel(self.tr("Budget msg (--reasoning-budget-message):")))
+        row_budget_msg.addWidget(
+            QLabel(self.tr("Budget msg (--reasoning-budget-message):"))
+        )
         row_budget_msg.addWidget(self.reasoning_budget_message, 1)
         r7b.addLayout(row_budget_msg)
         sampling.addLayout(r7b)
@@ -1305,7 +1415,7 @@ class MainWindowUI(QMainWindow):
         bench_buttons.addWidget(self.test_btn)
         self.bench_panel.add_layout(bench_buttons)
 
-    def _build_cli_section(self, lay):
+    def _build_cli_section(self):
         # === 7. Preview CLI ===
         self.cli_group = QGroupBox(self.tr("CLI Preview"))
         g_cli = self.cli_group
@@ -1346,37 +1456,98 @@ class MainWindowUI(QMainWindow):
         cli_layout.addLayout(cli_controls)
         cli_layout.addWidget(self.cli_preview)
 
-    def _assemble_left_sections(self, lay):
-        # === 8. Итоговый порядок блоков ===
-        # g_launch (Launch settings) и launch_summary_group (Launch preflight)
-        # создаются в _build_performance_section, но не добавляются там в layout —
-        # собираем их здесь единым местом, чтобы не было «висячих» панелей.
-        lay.addWidget(self.paths_panel)
-        lay.addWidget(self.g_launch)
+    def _scroll_page(self):
+        """Возвращает (QScrollArea, content_layout) для прокручиваемой страницы."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+        scroll.setWidget(inner)
+        return scroll, lay
+
+    def _build_pages(self):
+        """QStackedWidget со страницами в порядке NAV_PAGES."""
+        stack = QStackedWidget()
+        stack.addWidget(self._dashboard_page())
+        stack.addWidget(self._paths_page())
+        stack.addWidget(self._performance_page())
+        stack.addWidget(self._sampling_page())
+        stack.addWidget(self._server_page())
+        stack.addWidget(self._library_page())
+        stack.addWidget(self._integration_page())
+        stack.addWidget(self._benchmark_page())
+        stack.addWidget(self._autotune_page())
+        return stack
+
+    def _dashboard_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.model_group)
+        lay.addWidget(self.runtime_stats_group)
+        lay.addWidget(self.overview_content_widget)
         lay.addWidget(self.launch_summary_group)
-        lay.addWidget(self.adv_panel)
-        lay.addWidget(self.sampling_panel)
-        lay.addWidget(self.server_panel)
-        lay.addWidget(self.models_panel)
-        lay.addWidget(self.int_panel)
-        lay.addWidget(self.bench_panel)
-        lay.addWidget(self.cli_group)
         lay.addStretch()
+        return page
 
-    def _build_right_panel(self):
-        panel = QWidget()
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(4, 4, 4, 4)
+    def _paths_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.paths_panel)
+        lay.addStretch()
+        return page
 
-        self.status_bar_widget = self._build_status_bar()
-        lay.addWidget(self.status_bar_widget)
+    def _performance_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.g_launch)
+        lay.addWidget(self.adv_panel)
+        lay.addStretch()
+        return page
 
-        self.tabs = QTabWidget()
+    def _sampling_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.sampling_panel)
+        lay.addStretch()
+        return page
 
-        # Overview: compact operational dashboard for the running server.
-        overview_tab = QWidget()
-        self.overview_tab = overview_tab
-        overview = QVBoxLayout(overview_tab)
+    def _server_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.server_panel)
+        lay.addStretch()
+        return page
+
+    def _library_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.models_panel)
+        lay.addStretch()
+        return page
+
+    def _integration_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.int_panel)
+        lay.addStretch()
+        return page
+
+    def _benchmark_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.bench_panel)
+        lay.addStretch()
+        return page
+
+    def _autotune_page(self):
+        page, lay = self._scroll_page()
+        lay.addWidget(self.autotune)
+        lay.addStretch()
+        return page
+
+    def _on_nav_selected(self, index: int):
+        self.pages.setCurrentIndex(index)
+        self.ui_settings.setValue("navIndex", index)
+
+    def _build_overview_content(self):
+        """Карточки оперативного обзора (бывшая вкладка Overview)."""
+        widget = QWidget()
+        overview = QVBoxLayout(widget)
         overview.setContentsMargins(8, 8, 8, 8)
         overview.setSpacing(10)
 
@@ -1454,13 +1625,14 @@ class MainWindowUI(QMainWindow):
         self.overview_memory_note.setStyleSheet("color: #777;")
         overview.addWidget(self.overview_memory_note)
         overview.addStretch(1)
-        self.tabs.addTab(overview_tab, "Overview")
+        return widget
 
-        # Вкладка логов
-        log_tab = QWidget()
-        self.log_tab = log_tab
-        log_layout = QVBoxLayout(log_tab)
-        log_layout.setContentsMargins(0, 0, 0, 0)
+    def _build_log_area(self):
+        """Нижний док логов (временная inline-версия; Этап 2 → log_dock.py)."""
+        widget = QWidget()
+        log_layout = QVBoxLayout(widget)
+        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_layout.setSpacing(4)
         hdr = QHBoxLayout()
         hdr.addWidget(QLabel(self.tr("Logs:")))
         self.autoscroll_logs = QCheckBox(self.tr("Auto-scroll"), checked=True)
@@ -1474,17 +1646,11 @@ class MainWindowUI(QMainWindow):
         log_layout.addLayout(hdr)
         self.logs = QTextEdit(readOnly=True, font=QFont("Consolas", 9))
         self.logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
-        log_layout.addWidget(self.logs)
+        log_layout.addWidget(self.logs, 1)
         clr = QPushButton(self.tr("Clear"))
         clr.clicked.connect(self.logs.clear)
         log_layout.addWidget(clr)
-        self.tabs.addTab(log_tab, "Logs")
-
-        self.autotune = AutoTuneWidget()
-        self.bench_panel.add_widget(self.autotune)
-
-        lay.addWidget(self.tabs)
-        return panel
+        return widget
 
     def _build_status_bar(self):
         """Компактная полоса статуса поверх вкладок — видна всегда."""
@@ -1557,25 +1723,25 @@ class MainWindowUI(QMainWindow):
         state = self.ui_settings.value("windowState")
         if state:
             self.restoreState(state)
-        splitter_state = self.ui_settings.value("mainSplitterState")
-        if splitter_state and hasattr(self, "main_splitter"):
-            self.main_splitter.restoreState(splitter_state)
-        active_tab = self.ui_settings.value("rightTabIndex")
-        if active_tab is not None and hasattr(self, "tabs"):
+        splitter_state = self.ui_settings.value("contentSplitterState")
+        if splitter_state and hasattr(self, "content_splitter"):
+            self.content_splitter.restoreState(splitter_state)
+        nav_index = self.ui_settings.value("navIndex")
+        if nav_index is not None and hasattr(self, "nav_rail"):
             try:
-                self.tabs.setCurrentIndex(int(active_tab))
+                self.nav_rail.setCurrentRow(int(nav_index))
             except (TypeError, ValueError):
                 pass
 
     def save_ui_state(self):
         self.ui_settings.setValue("geometry", self.saveGeometry())
         self.ui_settings.setValue("windowState", self.saveState())
-        if hasattr(self, "main_splitter"):
+        if hasattr(self, "content_splitter"):
             self.ui_settings.setValue(
-                "mainSplitterState", self.main_splitter.saveState()
+                "contentSplitterState", self.content_splitter.saveState()
             )
-        if hasattr(self, "tabs"):
-            self.ui_settings.setValue("rightTabIndex", self.tabs.currentIndex())
+        if hasattr(self, "nav_rail"):
+            self.ui_settings.setValue("navIndex", self.nav_rail.currentRow())
 
     # === Placeholders ===
     def _browse_exe_clicked(self):

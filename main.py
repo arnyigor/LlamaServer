@@ -160,6 +160,9 @@ class LlamaGUI:
         self._connect_stats_signals()
 
         self.config.load()
+        self.ui.header.set_profiles(
+            list(self.config.profiles.keys()) if self.config.profiles else ["Default"]
+        )
         self.config.apply_to_ui(self.ui)
         self._normalize_llamacpp_path_ui()
         self.auto_detect_bench()
@@ -194,6 +197,8 @@ class LlamaGUI:
 
     def _connect_signals(self):
         u = self.ui
+        u.header.save_requested.connect(self._on_header_save)
+        u.header.profile_selected.connect(self._on_header_profile)
         u.start_btn.clicked.connect(self.start_server)
         u.reload_btn.clicked.connect(self.restart_server)
         u.stop_btn.clicked.connect(self.stop_work)
@@ -1079,6 +1084,24 @@ class LlamaGUI:
         self.config.read_from_ui(self.ui)
         self.config.settings.model_cache = self.ui.models
         self.config.save()
+
+    def _on_header_save(self, action: str):
+        # Этап 1: только явное Save функционально; остальные действия профиля
+        # (Save As / Rename / Clone / Export / Import / Delete) — заглушки,
+        # полная работа с профилями добавляется отдельным этапом.
+        if action == "Save":
+            self.save_settings()
+            self.log_mgr.append("Settings saved to current profile")
+        else:
+            self.log_mgr.append(f"Profile action '{action}' is not implemented yet")
+
+    def _on_header_profile(self, name: str):
+        # Загрузка профиля через ConfigManager.load_profile отложена; пока
+        # фиксируем выбор. Сигнал приходит и при программном заполнении
+        # (заблокировано в set_profiles), так что здесь только ручной выбор.
+        if not name or name == "Default":
+            return
+        self.log_mgr.append(f"Profile selected: {name}")
 
     def _selected_cuda_version(self) -> str:
         return str(self.ui.cuda_version_combo.currentData() or "12")
@@ -3370,7 +3393,6 @@ class LlamaGUI:
         self.last_diagnostic_summary = summary
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(summary, "error")
-        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
         return result
 
     def _record_preflight_diagnostic(self, cause: str, action: str):
@@ -3384,7 +3406,6 @@ class LlamaGUI:
         self.last_diagnostic_summary = summary
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(summary, "error")
-        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
 
     def copy_last_error(self):
         if not self.last_diagnostic_summary:
@@ -3426,7 +3447,6 @@ class LlamaGUI:
         )
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(self.last_diagnostic_summary, "error")
-        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
 
     def handle_unhandled_exception(self, exc_type, exc_value, exc_traceback):
         exception_text = "".join(
@@ -3446,7 +3466,6 @@ class LlamaGUI:
         self.ui.copy_last_error_btn.setEnabled(True)
         self.log_mgr.append(self.last_diagnostic_summary, "error")
         self.log_mgr.append(exception_text, "error")
-        self.ui.tabs.setCurrentWidget(self.ui.log_tab)
 
     def handle_qt_message(self, message_type, context, message):
         location = ""

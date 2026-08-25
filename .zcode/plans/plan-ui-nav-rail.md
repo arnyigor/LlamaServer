@@ -1,0 +1,250 @@
+# План: Редизайн UI — навигационный рейл + логи снизу
+
+> **Ветка:** `ui/navigation-rail-layout`
+> **Статус:** 🟡 в разработке (Этап 1 — каркас готов, структурная верификация пройдена)
+> **Дата начала:** 2026-08-25
+> **Цель:** Перенять паттерн UI из `pytraveler/LlamaServerLauncherAvalonia`
+> (иконочный nav-рейл слева, настройки в центре, логи в нижнем доке),
+> сохранив все существующие виджеты и связи `main.py` без поломок.
+
+---
+
+## 0. Цель и решения (утверждены пользователем)
+
+1. **Dashboard (Overview) = пункт nav-рейла**, а не отдельная правая панель.
+   → центр (страницы настроек) занимает всю ширину.
+2. **Реализация поэтапная**, каждый этап проверяется (сборка/запуск).
+3. **Автотюнинг** — отдельный независимый блок (уже выделен в
+   `AutoTuneWidget`), дорабатывается отдельно; в nav-рейле это просто
+   страница-обёртка, интегрируемая «быстро и локально».
+4. **Принцип независимых блоков** (на будущее): каждая секция настроек —
+   отдельный класс-виджет (как уже сделано с `PathsPanel` и
+   `AutoTuneWidget`), чтобы прикручивать/заменять блоки локально, не трогая
+   `main.py` и ядро.
+5. **Верификация:** можно собирать `.exe` под *другим именем* рядом — конфиги
+   подтянутся, т.к. `QSettings("LlamaServerGUI", "UIState")` заданы явно и не
+   зависят от имени exe. Новую версию тестируем отдельно.
+
+---
+
+## 1. Принципы архитектуры (независимые блоки)
+
+- **Сохраняемость `self.*`**: `main.py` ссылается на ~200 атрибутов
+  `self.ui.*` и коннектит сигналы напрямую. Любой рефакторинг меняет только
+  *контейнеры*, но оставляет все виджетные атрибуты (`self.start_btn`,
+  `self.ctx_size`, `self.logs`, `self.autotune`, …) на месте.
+- **Страницы = классы-виджеты** (Этап 4): каждая секция (`PathsPage`,
+  `PerformancePage`, `SamplingPage`, `ServerPage`, `ModelLibraryPage`,
+  `IntegrationPage`, `BenchmarkPage`, `DashboardPage`, `AutoTunePage`) —
+  отдельный класс, экспонирующий свои виджеты как атрибуты. `MainWindowUI`
+  только собирает страницы в `QStackedWidget` и пробрасывает их атрибуты
+  наружу (как `PathsPanel` уже делает через реэкспорт).
+- **Сигналы наружу**: сложные страницы общаются с `LlamaGUI` через `Signal`,
+  как `PathsPanel.browse_exe_requested`. Это держит блоки изолированными.
+- **Один источник правды для layout**: порядок/видимость страниц задаётся
+  только в одном месте (`_assemble_nav`), как сейчас `_assemble_left_sections`.
+
+---
+
+## 2. Исследование эталона (LlamaServerLauncherAvalonia)
+
+Эталон — Avalonia/C# (MVVM). Код напрямую не переносим, берём **только UX-идеи**:
+
+| Идея эталона | Как применим в PySide6 |
+|---|---|
+| Сетка 3 зон: шапка / контент / логи | `QVBoxLayout` окна: `[header][content][logdock]` |
+| Сворачиваемый icon nav-рейл (48→220px) | `QListWidget` с иконками + `QStackedWidget` (или `QToolBox`/`QTabWidget` без заголовков) |
+| Headerless TabControl | `QStackedWidget`, переключаемый рейлом |
+| Логи внизу с `GridSplitter` + maximize | `QSplitter` (Vertical) + кнопка разворачивания лог-дока |
+| Компактная шапка (профиль + Save flyout + язык) | `QHBoxLayout` сверху: комбо профиля, `QMenu` Save/Clone/Export/Import, комбо языка |
+| Полоса управления (гейджи + чипы инстансов + Start/Stop) | Отдельный `QWidget` между контентом и лог-доком |
+| Toast overlay | `QWidget` поверх с `Qt.FramelessWindowHint` (опционально, Этап 5) |
+| Drag-drop overlay | `dragEnter/Leave` на центральном виджете (опционально, Этап 5) |
+
+**Что НЕ берём** (нет в нашем проекте / избыточно): мульти-инстанс сервера,
+MCP, Docker, on-demand proxy, scenarios — это фичи эталона, не относящиеся к
+UI-паттерну. Их добавлять не будем.
+
+---
+
+## 3. Текущее состояние проекта
+
+- `src/ui/main_window.py` — `MainWindowUI(QMainWindow)`, ~1712 строк.
+  Методы `_build_*` создают виджеты и задают `self.*`. `_assemble_left_sections`
+  собирает их в один `QScrollArea`. Правая панель — `QTabWidget` (Overview/Logs).
+- Уже реализовано (из старого `uiux_analysis_*`): статус-бар, CLI `QTextEdit`,
+  Force-Stop таймер, 2-рядный Context, `tr()`-тултипы, `CollapsiblePanel`
+  persistence, лейблы сэмплинга без флагов. **Повторно не делаем.**
+- `src/ui/panels/paths_panel.py` — `PathsPanel(CollapsiblePanel)` — эталон
+  выделенного блока. Содержит строку языка (перенесём в шапку в Этапе 1).
+- `src/ui/autotune_widget.py` — `AutoTuneWidget` — независимый блок, дорабатывается отдельно.
+- `src/ui/widgets.py` — `CollapsiblePanel`, `NoWheelValueChangeFilter`.
+- `main.py` — `LlamaGUI`, жёстко связан с `self.ui.*`. Не трогаем.
+
+---
+
+## 4. Целевой layout
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ HEADER: [☰] Profile[▼ Save▾] · [Update llama.cpp] · Lang[en▾]          │  Этап 1
+├──────┬───────────────────────────────────────────────────────────────┤
+│ NAV  │  QStackedWidget — страница выбранного раздела (вся ширина)      │
+│ рейл │                                                                 │
+│(икон-│  Pages:                                                         │
+│ ки + │   • Dashboard  (Overview: статус + 6 карточек + preflight)      │
+│ лейб │   • Paths      (llama.cpp / models / CUDA / update)            │
+│ лы)  │   • Performance(M launch settings + adv perf/MTP + preflight)   │
+│      │   • Sampling   (sampling grid + reasoning)                     │
+│ Dash │   • Server     (server opts + diagnostics + templates + extra)│
+│ Path │   • Library    (local models + HF download)                    │
+│ Perf │   • Integration(OpenCode/PI)                                   │
+│ Samp │   • Benchmark  (prompt/gen + Test Speed + AutoTune вложен)     │
+│ Srv  │   • AutoTune   (обёртка над AutoTuneWidget)                   │
+│ Lib  │                                                                 │
+│ Int  │                                                                 │
+│ Bench│                                                                 │
+│ ATune│                                                                 │
+├──────┴───────────────────────────────────────────────────────────────┤
+│ CONTROL STRIP: гейджи (CPU/RAM/VRAM) · Start/Stop/Restart/Unload · cmd▸│  Этап 3
+├──────────────────────────────────────────────────────────────────────┤
+│ LOG DOCK (ресайз через QSplitter, кнопка maximize): auto/clear/copy/.. │  Этап 2
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Структура файлов и рефакторинг
+
+Новые/изменённые файлы:
+
+| Файл | Роль | Этап |
+|---|---|---|
+| `src/ui/main_window.py` | Контейнер: header + nav + stacked + control + logdock. Делегирует страницы. | 1–3 |
+| `src/ui/panels/paths_panel.py` | Убрать строку языка (→ шапка). | 1 |
+| `src/ui/panels/dashboard_page.py` | **НОВЫЙ** класс-страница (Overview-карточки + preflight). | 1/4 |
+| `src/ui/panels/performance_page.py` | **НОВЫЙ** (launch + adv + preflight). | 4 |
+| `src/ui/panels/sampling_page.py` | **НОВЫЙ**. | 4 |
+| `src/ui/panels/server_page.py` | **НОВЫЙ** (server opts + diagnostics + templates + extra). | 4 |
+| `src/ui/panels/library_page.py` | **НОВЫЙ** (local models + HF). | 4 |
+| `src/ui/panels/integration_page.py` | **НОВЫЙ**. | 4 |
+| `src/ui/panels/benchmark_page.py` | **НОВЫЙ** (prompt/gen + Test + AutoTune). | 4 |
+| `src/ui/panels/autotune_page.py` | **НОВЫЙ** — обёртка над `AutoTuneWidget`. | 1/4 |
+| `src/ui/header_bar.py` | **НОВЫЙ** — шапка (профиль + Save flyout + язык). | 1 |
+| `src/ui/log_dock.py` | **НОВЫЙ** — нижний док логов. | 2 |
+| `src/ui/control_strip.py` | **НОВЫЙ** — полоса управления. | 3 |
+| `src/ui/nav_rail.py` | **НОВЫЙ** — icon list-widget. | 1 |
+
+> Примечание: Этапы 1–3 можно сделать «лениво» — страницы сначала это просто
+> `QWidget`-контейнеры, в которые переносятся существующие группы из
+> `main_window.py` (без выноса в классы). Этап 4 выносит логику в классы для
+> полной независимости. Это снижает риск: сначала работает layout, потом —
+> чистая архитектура.
+
+---
+
+## 6. Этапы реализации (чеклисты)
+
+### ✅ Этап 0 — Ветка и план
+- [x] Создана ветка `ui/navigation-rail-layout`
+- [x] Записан план в `.zcode/plans/plan-ui-nav-rail.md`
+- [x] Зафиксирован план коммитом (только файл плана; чужие изменения не трогаем)
+
+### ✅ Этап 1 — Каркас: шапка + nav-рейл + страницы (Dashboard как пункт рейла)
+- [x] `src/ui/header_bar.py`: `HeaderBar(QWidget)` — комбо профиля, `QPushButton`
+      Save с `QMenu` (Save/SaveAs/Rename/Clone/Export/Import/Delete), кнопка
+      Update llama.cpp, комбо языка. Сигналы: `profile_selected`,
+      `save_requested`, `language_changed` (пока заглушки/проброс к main.py).
+- [x] `src/ui/nav_rail.py`: `NavRail(QListWidget)` — элементы с иконкой
+      (`QStyle.StandardPixmap`) + текстом; `currentRowChanged` →
+      `page_selected(int)`.
+- [x] `main_window.py`: переписать `_setup_ui` →
+      `QVBoxLayout`: `[header][status_bar][launch_controls][splitter: nav|stacked][logdock]`.
+- [x] Создать `QStackedWidget`; страницы = `QWidget`-контейнеры (9 шт.), в которые
+      перенесены группы из `_build_*` (без выноса в классы — Этап 4).
+- [x] **Dashboard** — перенести Overview-карточки + preflight + runtime_stats_group
+      из правой панели в страницу Dashboard. Правая `QTabWidget` удалена.
+- [x] Убрать строку языка из `paths_panel.py` (переехала в шапку).
+- [x] Все `self.*` атрибуты сохранены (имена не меняем) → `main.py` работает.
+- [x] `_runtime_lockable` и `_load_ui_state`/`save_ui_state` адаптированы под
+      новые контейнеры (`contentSplitterState`, `navIndex`).
+- [x] **Верификация Этапа 1**: `verify_phase1.py` (offscreen) — PASSED
+      (75 атрибутов, 9 страниц, переключение, advanced toggle, state round-trip).
+      Также исправлены: двойной вызов `_build_launch_controls_section`,
+      `self.language_combo` реэкспорт из `paths_panel` (→ header), 4 строки
+      `self.ui.tabs.setCurrentWidget` в `main.py`, импорты/иконки под PySide6 6.11.
+
+### ⬜ Этап 2 — Лог-док снизу
+- [ ] `src/ui/log_dock.py`: `LogDock(QWidget)` — `QTextEdit` (self.logs, то же
+      имя), заголовок с auto-scroll/clear/copy/save + кнопка maximize.
+- [ ] Встроить в `QSplitter` (Vertical) между контентом и низом окна.
+- [ ] Кнопка maximize: разворачивает док на всю высоту (скрывает контент) и
+      обратно; состояние в `QSettings`.
+- [ ] `LogManager(self.ui.logs)` из `main.py` работает без изменений (имя атрибута
+      сохранено).
+- [ ] **Верификация Этапа 2**.
+
+### ⬜ Этап 3 — Полоса управления сервером
+- [ ] `src/ui/control_strip.py`: `ControlStrip(QWidget)` — переиспользовать
+      `self.start_btn/stop_btn/reload_btn/force_stop_btn`, гейджи
+      (CPU/RAM/VRAM — если есть данные) и свёртку `self.cli_preview`.
+- [ ] Разместить между `QStackedWidget` и `LogDock`.
+- [ ] **Верификация Этапа 3**.
+
+### ⬜ Этап 4 — Вынос секций в независимые классы (интегрируемость)
+- [ ] Создать `src/ui/panels/*.py` (см. раздел 5). Каждый класс:
+  - создаёт свои виджеты и задаёт их как атрибуты;
+  - экспонирует нужное наружу (как `PathsPanel`);
+  - сложные действия — через `Signal`.
+- [ ] `MainWindowUI` инстанцирует страницы и реэкспортирует атрибуты
+      (`self.ctx_size = self.perf_page.ctx_size`, …) — `main.py` без изменений.
+- [ ] `AutoTunePage` — тонкая обёртка над существующим `AutoTuneWidget`
+      (блок дорабатывается отдельно, здесь только интеграция).
+- [ ] **Верификация Этапа 4** (полный прогон: запуск сервера, HF, autotune).
+
+### ⬜ Этап 5 — Полировка (опционально)
+- [ ] Сохранение/восстановление: nav index, log-dock height, maximize state.
+- [ ] Toast overlay (переиспользовать лог-сообщения).
+- [ ] Drag-drop overlay подсказка.
+- [ ] QSS: убрать разрозненные `setStyleSheet` в пользу централизованного
+      `theme.qss` (начато в `theme.qss`).
+- [ ] **Верификация Этапа 5**.
+
+---
+
+## 7. Процесс верификации (exe под другим именем)
+
+Конфиги (`QSettings("LlamaServerGUI", "UIState")`) не зависят от имени exe →
+новая сборка подхватит существующие настройки. Тестируем отдельно от
+основной версии.
+
+1. Найти PyInstaller spec / build-скрипт (вероятно `*.spec` или
+   `.github/workflows/build.yml`).
+2. Собрать с `--name LlamaServerStudioNext` (другое имя) в отдельную папку
+   рядом (напр. `dist_next/`).
+3. Запустить `dist_next/LlamaServerStudioNext.exe`, проверить:
+   - окно открывается, шапка + nav-рейл + страницы отрисованы;
+   - переключение пунктов рейла работает;
+   - Dashboard показывает метрики;
+   - лог-док внизу (после Этапа 2) принимает логи;
+   - запуск/остановка сервера работает (связи `main.py` целы);
+   - конфиги подтянулись (те же профили/пути).
+4. При ошибках — правим, пересобираем, повторяем. Основная ветка/сборка не
+   затрагивается.
+
+---
+
+## 8. Журнал прогресса
+
+| Дата | Этап | Что сделано | Как проверено | Статус |
+|---|---|---|---|---|
+| 2026-08-25 | 0 | Создана ветка `ui/navigation-rail-layout`; записан план | `git branch`, чтение файла | ✅ |
+| 2026-08-25 | 1 | Каркас: `HeaderBar` + `NavRail` + `QStackedWidget` (9 страниц, Dashboard как пункт рейла), логи inline снизу, язык в шапку; `verify_phase1.py` | `python verify_phase1.py` (offscreen) → PASSED; `py_compile` чистый | ✅ |
+| | 2 | _ | _ | ⬜ |
+| | 3 | _ | _ | ⬜ |
+| | 4 | _ | _ | ⬜ |
+| | 5 | _ | _ | ⬜ |
+
+---
+
+*Конец плана. Версия 1.0, 2026-08-25.*
