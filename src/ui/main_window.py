@@ -58,6 +58,7 @@ from src.ui.header_bar import HeaderBar
 from src.ui.log_dock import LogDock
 from src.ui.control_strip import ControlStrip
 from src.ui.nav_rail import NavRail
+from src.ui.toast_overlay import ToastOverlay
 from src.ui.panels.generation_page import GenerationBuilder
 from src.ui.panels.dashboard_page import DashboardPage
 from src.ui.panels.library_page import ModelLibraryPage
@@ -189,6 +190,11 @@ class MainWindowUI(QMainWindow):
 
         # Стартовая страница
         self.nav_rail.setCurrentRow(0)
+
+        # === Всплывающее уведомление (Phase 5: toast) ===
+        # Родитель — центральный виджет, чтобы оверлей следовал за размером
+        # окна (перепозиционирование через eventFilter в ToastOverlay).
+        self.toast_overlay = ToastOverlay(self.centralWidget())
 
     def _direct_layout_of(self, widget):
         """Возвращает layout, который напрямую содержит виджет (с учётом вложенности).

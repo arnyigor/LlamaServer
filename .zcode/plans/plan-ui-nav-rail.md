@@ -344,13 +344,26 @@ UI-паттерну. Их добавлять не будем.
        round-trip); PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
        `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
-### ⬜ Этап 5 — Полировка (опционально)
-- [ ] Сохранение/восстановление: nav index, log-dock height, maximize state.
-- [ ] Toast overlay (переиспользовать лог-сообщения).
-- [ ] Drag-drop overlay подсказка.
+### ✅ Этап 5 — Полировка (опционально)
+- [x] Сохранение/восстановление: nav index, log-dock height, maximize state
+       (реализовано в Этапе 2; `verify_phase1.py` проверяет state round-trip).
+- [x] Toast overlay (переиспользовать лог-сообщения):
+       - `LogManager.toast_requested = Signal(str, str)` — эмитится в `append()`
+         для уровней `warn`/`error` (сразу, не из буфера сброса).
+       - Новый `src/ui/toast_overlay.py`: `ToastOverlay(QLabel)` — frameless,
+         прозрачен для мыши, закреплён сверху по центру центрального виджета,
+         перепозиционируется по `Resize` через `eventFilter`; плавное затухание
+         через `QPropertyAnimation` на `QGraphicsOpacityEffect`. Новое сообщение
+         заменяет текущее (таймер перезапускается) — стек не накапливается.
+       - `MainWindowUI` создаёт `self.toast_overlay` (родитель — central widget).
+       - `main.py` (контроллер, владеет `LogManager`): одна строка
+         `self.log_mgr.toast_requested.connect(self.ui.toast_overlay.show_message)`.
+- [ ] Drag-drop overlay подсказка (низкий приоритет, отложено).
 - [ ] QSS: убрать разрозненные `setStyleSheet` в пользу централизованного
-      `theme.qss` (начато в `theme.qss`).
-- [ ] **Верификация Этапа 5**.
+       `theme.qss` (начато в `theme.qss`; низкий приоритет, отложено — см.
+       комментарий в `theme.qss`: пер-виджетные стили приоритетнее QSS).
+- [x] **Верификация Этапа 5**: `py_compile` чистый; `verify_phase1.py` → PASSED
+       (76 атрибутов); сборка `dist_next/` + `dist/` → `verify_build.py` STARTUP_OK.
 
 ---
 
@@ -390,7 +403,7 @@ UI-паттерну. Их добавлять не будем.
 | 2026-08-25 | commit | Фазы 1.6 + 1.7 + 2 + 2.1 зафиксированы коммитом `e9edea4` (8 файлов, +311/−146). Ветка `ui/navigation-rail-layout` НЕ запушена. | — | ✅ |
 | 2026-08-25 | 3 | Полоса управления `ControlStrip` (Start/Restart/Stop/Force Stop) вынесена из верхнего launch-controls в нижнюю полосу между контентом и лог-доком; гейджи CPU/RAM/VRAM не добавлены (нет системного источника метрик) | `py_compile` чистый; `verify_phase1.py` PASSED (76, +control_strip); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
 | 2026-08-25 | 4 | Вынос секций в классы: `DashboardPage`/`ModelLibraryPage`/`IntegrationPage`/`BenchmarkPage`/`AutoTunePage` (QWidget) + `GenerationBuilder` (Launch/Sampling/Server связка). Удалены старые `_build_*_section` (~1080 строк) из `main_window.py` | `py_compile` чистый; `verify_phase1.py` PASSED (76); `verify_build.py` STARTUP_OK (обе копии Next.exe) | ✅ |
-| | 5 | _ | _ | ⬜ |
+| 2026-08-26 | 5 | Toast overlay: `LogManager.toast_requested` (warn/error) → `ToastOverlay` (`src/ui/toast_overlay.py`, QLabel, frameless, top-center, fade via `QPropertyAnimation`); `MainWindowUI.toast_overlay`; `main.py` коннект (1 строка, staged через targeted patch, без WIP-шума) | `py_compile` чистый; `verify_phase1.py` PASSED (76); `verify_build.py` STARTUP_OK (обе копии Next.exe) | ✅ |
 
 ---
 

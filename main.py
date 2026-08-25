@@ -146,6 +146,7 @@ class LlamaGUI:
         self.log_mgr = LogManager(self.ui.logs)
         self.log_mgr.speed_updated.connect(self._on_log_speed_updated)
         self.log_mgr.timing_updated.connect(self._on_log_timing_updated)
+        self.log_mgr.toast_requested.connect(self.ui.toast_overlay.show_message)
         self.ui.autoscroll_logs.toggled.connect(
             lambda checked: setattr(self.log_mgr, "autoscroll", checked)
         )

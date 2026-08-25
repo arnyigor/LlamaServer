@@ -96,6 +96,10 @@ class LogManager(QObject):
     # Точное время (секунды) prompt processing / generation завершённого
     # запроса из llama_print_timings. Эмитится, когда известны оба значения.
     timing_updated = Signal(float, float)
+    # Всплывающее уведомление (toast) — переиспользует текст лога.
+    # Аргументы: (text, level). Эмитится сразу в append() для warn/error,
+    # независимо от буфера сброса, чтобы тост появлялся без задержки.
+    toast_requested = Signal(str, str)
 
     _MAX_BUFFER = 500
 
@@ -146,6 +150,9 @@ class LogManager(QObject):
                     break
 
         self._buffer.append(LogEntry(text=text, level=level))
+        # Тост только для значимых уровней — избегаем спама обычными info-строками.
+        if level in ("warn", "error"):
+            self.toast_requested.emit(text, level)
         self._extract_speed(text)
 
     def clear(self) -> None:
