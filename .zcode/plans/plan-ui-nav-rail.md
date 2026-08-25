@@ -345,6 +345,8 @@ UI-паттерну. Их добавлять не будем.
 | 2026-08-25 | 1.6 | Реорганизация раскладки: Запуск = context+vision+CUDA; GPU offload/KV K-V/Flash-Fit/Память → Сэмплинг (QGroupBox-блоки); Пути без спойлера + версия CUDA для обновления; cuda_version_combo-зеркало на Запуске | `verify_phase1.py` PASSED; `py_compile` чистый; `verify_build.py` STARTUP_OK (обе копии Next.exe) | ✅ |
 | 2026-08-25 | 1.7 | Модель (выбор+данные) → Запуск; NAV_PAGES на английский; Dashboard=stats; удалён «GPU capacity» (VRAM-оценка preflight, не работала до запуска) | `py_compile` чистый; `grep preflight_vram`→NONE; `verify_phase1.py` PASSED (73); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
 | 2026-08-25 | 2 | Лог-док вынесен в `src/ui/log_dock.py`; контент+док в вертикальном `QSplitter` (ресайз); кнопка maximize (скрывает контент, состояние в QSettings) | `py_compile` чистый; `verify_phase1.py` PASSED (75, +main_vsplit/log_dock); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
+| 2026-08-25 | 2.1 | Убран лишний заголовок «Performance and Memory:» в панели Память (KV-кэш) на Sampling (дублировал заголовок панели); версия `APP_VERSION` (v1.5.5, `src/core/constants.py`) показана в шапке рядом с брендингом | `py_compile` чистый; `verify_phase1.py` PASSED (75); `verify_build.py` STARTUP_OK | ✅ |
+| 2026-08-25 | commit | Фазы 1.6 + 1.7 + 2 + 2.1 зафиксированы коммитом `e9edea4` (8 файлов, +311/−146). Ветка `ui/navigation-rail-layout` НЕ запушена. | — | ✅ |
 | | 3 | _ | _ | ⬜ |
 | | 4 | _ | _ | ⬜ |
 | | 5 | _ | _ | ⬜ |
