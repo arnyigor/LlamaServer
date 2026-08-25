@@ -1,7 +1,7 @@
 # План: Редизайн UI — навигационный рейл + логи снизу
 
 > **Ветка:** `ui/navigation-rail-layout`
-> **Статус:** 🟡 в разработке (Этап 1 + 1.5 + 1.6 + 1.7 + 2 + 3 — каркас, UX-доработки, реорганизация раскладки, очистка UI, лог-док и полоса управления готовы, верификация пройдена)
+> **Статус:** 🟡 в разработке (Этап 1 + 1.5 + 1.6 + 1.7 + 2 + 3 + 4 — каркас, UX-доработки, реорганизация раскладки, очистка UI, лог-док, полоса управления и вынос секций в независимые классы готовы, верификация пройдена)
 > **Дата начала:** 2026-08-25
 > **Цель:** Перенять паттерн UI из `pytraveler/LlamaServerLauncherAvalonia`
 > (иконочный nav-рейл слева, настройки в центре, логи в нижнем доке),
@@ -306,16 +306,43 @@ UI-паттерну. Их добавлять не будем.
        PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
        `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
-### ⬜ Этап 4 — Вынос секций в независимые классы (интегрируемость)
-- [ ] Создать `src/ui/panels/*.py` (см. раздел 5). Каждый класс:
-  - создаёт свои виджеты и задаёт их как атрибуты;
-  - экспонирует нужное наружу (как `PathsPanel`);
-  - сложные действия — через `Signal`.
-- [ ] `MainWindowUI` инстанцирует страницы и реэкспортирует атрибуты
-      (`self.ctx_size = self.perf_page.ctx_size`, …) — `main.py` без изменений.
-- [ ] `AutoTunePage` — тонкая обёртка над существующим `AutoTuneWidget`
-      (блок дорабатывается отдельно, здесь только интеграция).
-- [ ] **Верификация Этапа 4** (полный прогон: запуск сервера, HF, autotune).
+### ✅ Этап 4 — Вынос секций в независимые классы (интегрируемость)
+- [x] Созданы классы страниц в `src/ui/panels/*.py`:
+  - `dashboard_page.py` → `DashboardPage(QScrollArea)`: overview-карточки +
+    Runtime stats (перенесено из `_build_overview_content` и HF-секции).
+  - `library_page.py` → `ModelLibraryPage(QScrollArea)`: локальные модели + HF
+    (бывш. `_build_hf_models_section`).
+  - `integration_page.py` → `IntegrationPage(QScrollArea)`: OpenCode/PI
+    (бывш. `_build_integration_section`; `_on_integration_target_changed`
+    остался в `MainWindowUI` и коннектится из страницы).
+  - `benchmark_page.py` → `BenchmarkPage(QScrollArea)`: prompt/gen + Test Speed
+    (бывш. `_build_benchmark_section`).
+  - `autotune_page.py` → `AutoTunePage(QScrollArea)`: обёртка над
+    `AutoTuneWidget`.
+  - `generation_page.py` → `GenerationBuilder`: связка Launch (model_group +
+    g_launch + cli_group) / Sampling (sampling_panel + adv_panel) / Server
+    (server_panel) — общие `CollapsiblePanel` создаются и наполняются здесь,
+    виджеты создаются прямо на `mw` (MainWindowUI).
+- [x] `MainWindowUI._build_all_widgets` инстанцирует страницы; независимые
+       страницы (Dashboard/Library/Integration/Benchmark/AutoTune) — готовые
+       QWidget, добавляются в `QStackedWidget` напрямую; Launch/Sampling/Server
+       собираются из виджетов `GenerationBuilder` в контейнерах
+       (`_performance_page`/`_sampling_page`/`_server_page`). Все `self.*`
+       атрибуты сохранены → `main.py` без изменений.
+- [x] Удалены старые `_build_*_section` методы (~1080 строк) из `main_window.py`
+       (файл сократился с ~1812 до ~730 строк); импорт `AutoTuneWidget` убран.
+- [x] **Отклонение от плана (обосновано):** план предполагал отдельные
+       `PerformancePage`/`SamplingPage`/`ServerPage`. Из-за того, что эти три
+       страницы делят одни и те же `CollapsiblePanel` (sampling/adv/server),
+       созданные в performance-секции и наполняемые в sampling-секции, их
+       разделение на независимые QWidget-страницы потребовало бы рискованного
+       пере-parenting'а виджетов. Вместо этого связка вынесена в единый
+       `GenerationBuilder` (код в отдельном файле, достигается цель локальной
+       заменяемости блоков), а 5 независимых страниц — реальные QWidget-классы.
+- [x] **Верификация Этапа 4**: `py_compile` чистый; `verify_phase1.py` (offscreen)
+       → PASSED (76 атрибутов, 9 страниц, переключение, advanced toggle, state
+       round-trip); PyInstaller-сборка `dist_next/LlamaServerGUI_Next.exe` и
+       `dist/LlamaServerGUI_Next.exe` → `verify_build.py` STARTUP_OK (12s, без краша).
 
 ### ⬜ Этап 5 — Полировка (опционально)
 - [ ] Сохранение/восстановление: nav index, log-dock height, maximize state.
@@ -362,8 +389,7 @@ UI-паттерну. Их добавлять не будем.
 | 2026-08-25 | 2.1 | Убран лишний заголовок «Performance and Memory:» в панели Память (KV-кэш) на Sampling (дублировал заголовок панели); версия `APP_VERSION` (v1.5.5, `src/core/constants.py`) показана в шапке рядом с брендингом | `py_compile` чистый; `verify_phase1.py` PASSED (75); `verify_build.py` STARTUP_OK | ✅ |
 | 2026-08-25 | commit | Фазы 1.6 + 1.7 + 2 + 2.1 зафиксированы коммитом `e9edea4` (8 файлов, +311/−146). Ветка `ui/navigation-rail-layout` НЕ запушена. | — | ✅ |
 | 2026-08-25 | 3 | Полоса управления `ControlStrip` (Start/Restart/Stop/Force Stop) вынесена из верхнего launch-controls в нижнюю полосу между контентом и лог-доком; гейджи CPU/RAM/VRAM не добавлены (нет системного источника метрик) | `py_compile` чистый; `verify_phase1.py` PASSED (76, +control_strip); `verify_build.py` STARTUP_OK (обе копии) | ✅ |
-| | 4 | _ | _ | ⬜ |
-| | 4 | _ | _ | ⬜ |
+| 2026-08-25 | 4 | Вынос секций в классы: `DashboardPage`/`ModelLibraryPage`/`IntegrationPage`/`BenchmarkPage`/`AutoTunePage` (QWidget) + `GenerationBuilder` (Launch/Sampling/Server связка). Удалены старые `_build_*_section` (~1080 строк) из `main_window.py` | `py_compile` чистый; `verify_phase1.py` PASSED (76); `verify_build.py` STARTUP_OK (обе копии Next.exe) | ✅ |
 | | 5 | _ | _ | ⬜ |
 
 ---
