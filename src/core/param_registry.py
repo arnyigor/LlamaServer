@@ -25,7 +25,7 @@ from typing import Any, Dict, FrozenSet, Tuple, Type
 
 @dataclass(frozen=True)
 class ParamSpec:
-    name: str                       # поле AppSettings
+    name: str  # поле AppSettings
     widget_attr: str | None = None  # атрибут MainWindowUI (None — без виджета)
     cli_flags: Tuple[str, ...] = ()  # все написания флага на CLI
     cli_kind: str = "none"
@@ -50,34 +50,64 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
     ParamSpec("bench_gen", "bench_gen"),
     ParamSpec("auto_params", "auto_params"),
     ParamSpec("use_mmproj", "use_mmproj", ("--no-mmproj",), "false", bool),
-    ParamSpec("mmproj_offload", "mmproj_offload", ("--no-mmproj-offload",), "false", bool),
+    ParamSpec(
+        "mmproj_offload", "mmproj_offload", ("--no-mmproj-offload",), "false", bool
+    ),
     # gpu_auto/gpu_layers_all выставляются спец-обработчиком -ngl.
     ParamSpec("gpu_auto", "gpu_auto"),
     ParamSpec("gpu_layers", "gpu_layers", ("-ngl", "--n-gpu-layers"), "special", int),
     ParamSpec("gpu_layers_all", "gpu_layers_all"),
-    ParamSpec("cpu_moe_layers", "cpu_moe_layers", ("-ncmoe", "--n-cpu-moe"), "value", int),
+    ParamSpec(
+        "cpu_moe_layers", "cpu_moe_layers", ("-ncmoe", "--n-cpu-moe"), "value", int
+    ),
     ParamSpec("ctx_size", "ctx_size", ("-c", "--ctx-size"), "value", int),
     ParamSpec("threads", "threads", ("-t", "--threads"), "value", int),
-    ParamSpec("threads_batch", "threads_batch", ("-tb", "--threads-batch"), "value", int, server_only=True),
+    ParamSpec(
+        "threads_batch",
+        "threads_batch",
+        ("-tb", "--threads-batch"),
+        "value",
+        int,
+        server_only=True,
+    ),
     ParamSpec("port", "port", ("--port",), "value", int),
     ParamSpec("host", "host", ("--host",), "value", str),
     # --device/--split-mode/--main-gpu исторически не вырезаются из
     # extra_args (см. комментарий в MANAGED_EXTRA_FLAGS).
     ParamSpec("cuda_device", "cuda_device", ("--device",), "value", str, managed=False),
-    ParamSpec("spec_draft_device", "spec_draft_device", ("--spec-draft-device",), "value", str),
-    ParamSpec("split_mode", "split_mode", ("--split-mode",), "value", str, managed=False),
+    ParamSpec(
+        "spec_draft_device", "spec_draft_device", ("--spec-draft-device",), "value", str
+    ),
+    ParamSpec(
+        "split_mode", "split_mode", ("--split-mode",), "value", str, managed=False
+    ),
     ParamSpec("main_gpu", "main_gpu", ("--main-gpu",), "value", int, managed=False),
-    ParamSpec("cuda_visible_devices", "cuda_visible_devices"),
-    ParamSpec("cuda_module_loading", "cuda_module_loading"),
-    ParamSpec("temperature", "temperature", ("--temp", "--temperature"), "value", float),
+    # EXTRA-параметры (managed=False): живут verbatim в extra_args, не
+    # управляются builder'ом/виджетами. Флаги задаются явно в
+    # _extra_flag_tokens (config.py), т.к. в реестре cli_flags пусты.
+    ParamSpec("cuda_visible_devices", "cuda_visible_devices", managed=False),
+    ParamSpec("cuda_module_loading", "cuda_module_loading", managed=False),
+    ParamSpec(
+        "temperature", "temperature", ("--temp", "--temperature"), "value", float
+    ),
     ParamSpec("top_k", "top_k", ("--top-k",), "value", int),
     ParamSpec("top_p", "top_p", ("--top-p",), "value", float),
     ParamSpec("min_p", "min_p", ("--min-p",), "value", float),
     ParamSpec("typical_p", "typical_p", ("--typical", "--typical-p"), "value", float),
-    ParamSpec("repeat_penalty", "repeat_penalty", ("--repeat-penalty",), "value", float),
+    ParamSpec(
+        "repeat_penalty", "repeat_penalty", ("--repeat-penalty",), "value", float
+    ),
     ParamSpec("repeat_last_n", "repeat_last_n", ("--repeat-last-n",), "value", int),
-    ParamSpec("presence_penalty", "presence_penalty", ("--presence-penalty",), "value", float),
-    ParamSpec("frequency_penalty", "frequency_penalty", ("--frequency-penalty",), "value", float),
+    ParamSpec(
+        "presence_penalty", "presence_penalty", ("--presence-penalty",), "value", float
+    ),
+    ParamSpec(
+        "frequency_penalty",
+        "frequency_penalty",
+        ("--frequency-penalty",),
+        "value",
+        float,
+    ),
     ParamSpec("seed", "seed", ("-s", "--seed"), "value", int),
     ParamSpec(
         "flash_attn",
@@ -88,8 +118,12 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
         benchmark_flag="-fa",
     ),
     ParamSpec("fit_off", "fit_off", ("--fit",), "special", bool),
-    ParamSpec("reasoning_mode", "reasoning_mode", ("-rea", "--reasoning"), "value", str),
-    ParamSpec("reasoning_effort", "reasoning_effort", ("--reasoning-effort",), "value", str),
+    ParamSpec(
+        "reasoning_mode", "reasoning_mode", ("-rea", "--reasoning"), "value", str
+    ),
+    ParamSpec(
+        "reasoning_effort", "reasoning_effort", ("--reasoning-effort",), "value", str
+    ),
     ParamSpec(
         "reasoning_preserve",
         "reasoning_preserve",
@@ -97,7 +131,9 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
         "special",
         str,
     ),
-    ParamSpec("reasoning_budget", "reasoning_budget", ("--reasoning-budget",), "value", int),
+    ParamSpec(
+        "reasoning_budget", "reasoning_budget", ("--reasoning-budget",), "value", int
+    ),
     ParamSpec(
         "reasoning_budget_message",
         "reasoning_budget_message",
@@ -109,32 +145,79 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
     # совместимости/автотьюна. Флаг не managed -> не вырезается из extra params
     # (пользователь может добавить --load-mode mmap вручную).
     ParamSpec("use_mmap", None, (), "bool", bool, managed=False),
-    ParamSpec("use_mlock", "use_mlock", ("--mlock",), "bool", bool),
-    ParamSpec("verbose", "verbose", ("--verbose",), "bool", bool),
-    ParamSpec("log_timestamps", "log_timestamps", ("--log-timestamps",), "bool", bool),
+    # Ниже — EXTRA-параметры: managed=False. Ими управляет пользователь
+    # через свободное поле extra_args; builder их не эмитит, а
+    # _sanitize_extra_args/_filter_duplicate_extra_args их не вырезают.
+    ParamSpec("use_mlock", "use_mlock", ("--mlock",), "bool", bool, managed=False),
+    ParamSpec("verbose", "verbose", ("--verbose",), "bool", bool, managed=False),
+    ParamSpec(
+        "log_timestamps",
+        "log_timestamps",
+        ("--log-timestamps",),
+        "bool",
+        bool,
+        managed=False,
+    ),
     ParamSpec("cache_type_k", "cache_type_k", ("-ctk", "--cache-type-k"), "value", str),
     ParamSpec("cache_type_v", "cache_type_v", ("-ctv", "--cache-type-v"), "value", str),
     ParamSpec("batch_size", "batch_size", ("-b", "--batch-size"), "value", int),
     ParamSpec("ubatch_size", "ubatch_size", ("-ub", "--ubatch-size"), "value", int),
     ParamSpec("parallel_slots", "parallel_slots", ("-np", "--parallel"), "value", int),
-    ParamSpec("kv_unified", "kv_unified", ("--kv-unified", "-kvu"), "bool", bool),
+    ParamSpec(
+        "kv_unified",
+        "kv_unified",
+        ("--kv-unified", "-kvu"),
+        "bool",
+        bool,
+        managed=False,
+    ),
     # --spec-type draft-mtp включает speculative_mtp; -md дополнительно
     # заполняет spec_draft_model_path — см. спец-обработчики cli_parser.
     ParamSpec("speculative_mtp", "speculative_mtp", ("--spec-type",), "special", bool),
-    ParamSpec("spec_draft_model_path", "spec_draft_model_path", ("-md", "--model-draft"), "special", str),
-    ParamSpec("spec_draft_n_max", "spec_draft_n_max", ("--spec-draft-n-max",), "value", int),
-    ParamSpec("spec_draft_p_min", "spec_draft_p_min", ("--spec-draft-p-min",), "value", float),
-    ParamSpec("spec_draft_gpu_layers", "spec_draft_gpu_layers", ("--spec-draft-ngl", "-ngld"), "value", str),
-    ParamSpec("ctx_checkpoints", "ctx_checkpoints", ("--ctx-checkpoints",), "value", int),
-    ParamSpec("cache_ram", "cache_ram", ("--cache-ram",), "value", int),
+    ParamSpec(
+        "spec_draft_model_path",
+        "spec_draft_model_path",
+        ("-md", "--model-draft"),
+        "special",
+        str,
+    ),
+    ParamSpec(
+        "spec_draft_n_max", "spec_draft_n_max", ("--spec-draft-n-max",), "value", int
+    ),
+    ParamSpec(
+        "spec_draft_p_min", "spec_draft_p_min", ("--spec-draft-p-min",), "value", float
+    ),
+    ParamSpec(
+        "spec_draft_gpu_layers",
+        "spec_draft_gpu_layers",
+        ("--spec-draft-ngl", "-ngld"),
+        "value",
+        str,
+    ),
+    ParamSpec(
+        "ctx_checkpoints",
+        "ctx_checkpoints",
+        ("--ctx-checkpoints",),
+        "value",
+        int,
+        managed=False,
+    ),
+    ParamSpec("cache_ram", "cache_ram", ("--cache-ram",), "value", int, managed=False),
     # UI-галочка и серверная эмиссия --no-cont-batching убраны; поле оставлено.
     # Флаг не managed -> не вырезается из extra params.
     ParamSpec("cont_batching", None, (), "bool", bool, managed=False),
     # UI-галочка и серверная эмиссия убраны; поле оставлено. Флаг не managed ->
     # пользователь может добавить --cache-prompt вручную через extra params.
     ParamSpec("cache_prompt", None, (), "bool", bool, managed=False),
-    ParamSpec("context_shift", "context_shift", ("--context-shift",), "bool", bool),
-    ParamSpec("no_webui", "no_webui", ("--no-webui",), "bool", bool),
+    ParamSpec(
+        "context_shift",
+        "context_shift",
+        ("--context-shift",),
+        "bool",
+        bool,
+        managed=False,
+    ),
+    ParamSpec("no_webui", "no_webui", ("--no-webui",), "bool", bool, managed=False),
     ParamSpec("jinja", "jinja", ("--jinja",), "bool", bool),
     ParamSpec(
         "use_chat_template",
@@ -142,6 +225,7 @@ PARAM_REGISTRY: Tuple[ParamSpec, ...] = (
         ("--chat-template-file",),
         "special",
         bool,
+        managed=False,
     ),
     ParamSpec("chat_template_file", "chat_template_file"),
     ParamSpec("extra_args", "extra_args"),
@@ -172,6 +256,13 @@ MANAGED_EXTRA_FLAGS: FrozenSet[str] = frozenset(
     for spec in PARAM_REGISTRY
     if spec.managed
     for flag in (spec.cli_flags + spec.cli_neg_flags)
+)
+
+# Имена полей, которыми управляет UI/AutoTune. Используется в cli_builder,
+# чтобы не эмитить флаги EXTRA-параметров (managed=False): те живут verbatim
+# в extra_args и не перезаписываются builder'ом.
+MANAGED_FIELD_NAMES: FrozenSet[str] = frozenset(
+    spec.name for spec in PARAM_REGISTRY if spec.managed
 )
 
 # Sampling-поля для миграции старых флагов из extra_args (config.py).
@@ -242,12 +333,15 @@ _EXTRA_FILTER_VALUE_FLAGS = frozenset(
 )
 
 # Флаги, потребляющие следующий токен-значение.
-FILTER_VALUE_FLAGS: FrozenSet[str] = frozenset(
-    flag
-    for spec in PARAM_REGISTRY
-    if spec.cli_kind in ("value", "special", "bool_value")
-    for flag in (spec.cli_flags + spec.cli_neg_flags)
-) | _EXTRA_FILTER_VALUE_FLAGS
+FILTER_VALUE_FLAGS: FrozenSet[str] = (
+    frozenset(
+        flag
+        for spec in PARAM_REGISTRY
+        if spec.cli_kind in ("value", "special", "bool_value")
+        for flag in (spec.cli_flags + spec.cli_neg_flags)
+    )
+    | _EXTRA_FILTER_VALUE_FLAGS
+)
 
 # Автономные флаги-переключатели.
 FILTER_BOOL_FLAGS: FrozenSet[str] = frozenset(

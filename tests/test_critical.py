@@ -159,8 +159,7 @@ class TestGGUFParser(unittest.TestCase):
 
             result = list_all_local_model_entries(root)
             relatives = {
-                str(entry["relative"]).replace("\\", "/")
-                for entry in result["entries"]
+                str(entry["relative"]).replace("\\", "/") for entry in result["entries"]
             }
 
             self.assertIn("unsloth/model-a", relatives)
@@ -252,6 +251,27 @@ class TestLlamaCppUpdater(unittest.TestCase):
 
         result = self.updater.fetch_latest_release()
         self.assertEqual(result["tag_name"], "b4000")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_latest_release_skips_marker(self, mock_urlopen):
+        """Маркер-релиз (v0.2.0) без ассетов пропускается, берётся b-релиз."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            [
+                {"tag_name": "v0.2.0", "assets": []},
+                {
+                    "tag_name": "b10615",
+                    "assets": [
+                        {"name": "llama-b10615-bin-win-cuda-12.4-x64.zip"},
+                    ],
+                },
+            ]
+        ).encode()
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
+        result = self.updater.fetch_latest_release()
+        self.assertEqual(result["tag_name"], "b10615")
 
     def test_safe_extract_zip(self):
         """Безопасная распаковка ZIP."""

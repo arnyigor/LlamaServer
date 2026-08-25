@@ -78,7 +78,10 @@ def split_command_line(command: str) -> list[str]:
     if os.name == "nt":
         argc = ctypes.c_int()
         shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
-        shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        shell32.CommandLineToArgvW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
         shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
         argv = shell32.CommandLineToArgvW(ctypes.c_wchar_p(text), ctypes.byref(argc))
         if argv:
@@ -135,6 +138,7 @@ def _set_gpu_layers(settings: dict[str, Any], value: str) -> None:
 # Наборы value/optional-value флагов генерируются из реестра параметров;
 # паритет со старыми ручными таблицами фиксирует tests/test_param_registry.py.
 
+
 # Спец-обработчики для cli_kind == "special": флаги с составной логикой
 # (несколько полей или условное применение). (result, settings, extra, value).
 def _sp_model_path(result, settings, extra, value):
@@ -179,7 +183,9 @@ def _sp_no_reasoning_preserve(result, settings, extra, value):
     settings["reasoning_preserve"] = "no-preserve"
 
 
-_SPECIAL_HANDLERS: dict[str, Callable[[Any, dict[str, Any], list[str], "str | None"], None]] = {
+_SPECIAL_HANDLERS: dict[
+    str, Callable[[Any, dict[str, Any], list[str], "str | None"], None]
+] = {
     "-m": _sp_model_path,
     "--model": _sp_model_path,
     "-ngl": _sp_gpu_layers,
@@ -262,6 +268,14 @@ def parse_llama_server_command(command: str) -> ParsedCliCommand:
         try:
             spec = FLAG_TO_SPEC.get(flag)
             neg_spec = NEG_FLAG_TO_SPEC.get(flag)
+            # EXTRA-параметры (managed=False) не управляются реестром при парсинге:
+            # оставляем их verbatim в extra_args, иначе они попадут в settings и
+            # будут отброшены build_args (guard по MANAGED_FIELD_NAMES), то есть
+            # исчезнут из команды при следующей сборке.
+            if spec is not None and not spec.managed:
+                spec = None
+            if neg_spec is not None and not neg_spec.managed:
+                neg_spec = None
             if neg_spec is not None and spec is None:
                 # --no-*: выключить булево поле.
                 result.settings[neg_spec.name] = False

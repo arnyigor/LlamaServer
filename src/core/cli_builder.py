@@ -11,7 +11,11 @@ from src.core.constants import (
     SAMPLING_PENALTY_AUTO,
     SAMPLING_SEED_AUTO,
 )
-from src.core.param_registry import FILTER_BOOL_FLAGS, FILTER_VALUE_FLAGS
+from src.core.param_registry import (
+    FILTER_BOOL_FLAGS,
+    FILTER_VALUE_FLAGS,
+    MANAGED_FIELD_NAMES,
+)
 from src.utils.file_utils import validate_path
 
 
@@ -125,6 +129,80 @@ def _filter_duplicate_extra_args(
     return filtered
 
 
+def _split_extra_groups(tokens: List[str]) -> List[List[str]]:
+    """Разбивает токены на группы «флаг + опциональное значение».
+
+    Позиционные (не-флаговые) токены остаются одиночными группами.
+    Значение потребляется, если оно inline через "=" либо следующий токен —
+    не флаг (отрицательные числа считаются значениями, см. _is_value_token).
+    """
+    groups: List[List[str]] = []
+    i = 0
+    while i < len(tokens):
+        arg = tokens[i]
+        if not str(arg).startswith("-"):
+            groups.append([arg])
+            i += 1
+            continue
+        group = [arg]
+        if "=" not in arg and i + 1 < len(tokens) and _is_value_token(tokens[i + 1]):
+            group.append(tokens[i + 1])
+            i += 2
+        else:
+            i += 1
+        groups.append(group)
+    return groups
+
+
+def merge_extra_args(existing: str, incoming: str) -> str:
+    """Мержит incoming extra-флаги поверх existing (импорт побеждает).
+
+    - Флаги existing, которых нет в incoming, сохраняются.
+    - Одинаковые флаги (по базовому имени до "=") заменяются значениями из incoming.
+    - Новые флаги добавляются в конец в порядке incoming.
+
+    Используется при импорте/применении CLI-команды, чтобы пользовательские
+    extra-параметры не стирались при отсутствии unknown-флагов в команде.
+    """
+
+    def tokenize(text: str) -> List[str]:
+        text = str(text or "").strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return text.split()
+
+    existing_tokens = tokenize(existing)
+    incoming_tokens = tokenize(incoming)
+    quote_all = lambda toks: " ".join(shlex.quote(t) for t in toks)  # noqa: E731
+
+    if not incoming_tokens:
+        return quote_all(existing_tokens)
+    if not existing_tokens:
+        return quote_all(incoming_tokens)
+
+    existing_groups = _split_extra_groups(existing_tokens)
+    incoming_groups = _split_extra_groups(incoming_tokens)
+
+    incoming_bases = {
+        _flag_base(g[0]) for g in incoming_groups if str(g[0]).startswith("-")
+    }
+
+    merged: List[List[str]] = [
+        g
+        for g in existing_groups
+        if not (str(g[0]).startswith("-") and _flag_base(g[0]) in incoming_bases)
+    ]
+    merged.extend(incoming_groups)
+
+    tokens: List[str] = []
+    for group in merged:
+        tokens.extend(group)
+    return quote_all(tokens)
+
+
 def build_benchmark_args_from_params(
     model_path: str,
     params: Dict[str, Any],
@@ -224,25 +302,28 @@ def build_args(
         if cfg.threads > 0:
             args += ["-t", str(cfg.threads)]
         # Current llama-bench builds do not expose -tb/--threads-batch.
-        if getattr(cfg, "verbose", False):
+        if "verbose" in MANAGED_FIELD_NAMES and getattr(cfg, "verbose", False):
             args.append("-v")
         if cfg.cpu_moe_layers >= 0:
             args += ["-ncmoe", str(cfg.cpu_moe_layers)]
     else:
         args += ["--host", str(getattr(cfg, "host", "127.0.0.1") or "127.0.0.1")]
         args += ["--port", str(cfg.port)]
-        device = str(getattr(cfg, "cuda_device", "") or "").strip()
-        if device:
-            args += ["--device", device]
-        split_mode = str(getattr(cfg, "split_mode", "") or "").strip()
-        if split_mode:
-            args += ["--split-mode", split_mode]
-        main_gpu_raw = getattr(cfg, "main_gpu", -1)
-        main_gpu = (
-            -1 if main_gpu_raw is None or main_gpu_raw == "" else int(main_gpu_raw)
-        )
-        if main_gpu >= 0:
-            args += ["--main-gpu", str(main_gpu)]
+        if "cuda_device" in MANAGED_FIELD_NAMES:
+            device = str(getattr(cfg, "cuda_device", "") or "").strip()
+            if device:
+                args += ["--device", device]
+        if "split_mode" in MANAGED_FIELD_NAMES:
+            split_mode = str(getattr(cfg, "split_mode", "") or "").strip()
+            if split_mode:
+                args += ["--split-mode", split_mode]
+        if "main_gpu" in MANAGED_FIELD_NAMES:
+            main_gpu_raw = getattr(cfg, "main_gpu", -1)
+            main_gpu = (
+                -1 if main_gpu_raw is None or main_gpu_raw == "" else int(main_gpu_raw)
+            )
+            if main_gpu >= 0:
+                args += ["--main-gpu", str(main_gpu)]
         args += ["-ngl", gpu_val, "-t", str(cfg.threads)]
         if cfg.ctx_size >= 0:
             args += ["-c", str(cfg.ctx_size)]
@@ -254,7 +335,7 @@ def build_args(
             args += ["-b", str(bs), "-ub", str(min(ub, bs))]
         if cfg.parallel_slots >= 0:
             args += ["-np", str(cfg.parallel_slots)]
-        if getattr(cfg, "kv_unified", False):
+        if "kv_unified" in MANAGED_FIELD_NAMES and getattr(cfg, "kv_unified", False):
             args.append("--kv-unified")
         args += [
             "-ctk",
@@ -295,7 +376,9 @@ def build_args(
             effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
             if effort:
                 args += ["--reasoning-effort", effort]
-            preserve = str(getattr(cfg, "reasoning_preserve", "off") or "off").strip().lower()
+            preserve = (
+                str(getattr(cfg, "reasoning_preserve", "off") or "off").strip().lower()
+            )
             if preserve == "preserve":
                 args.append("--reasoning-preserve")
             elif preserve == "no-preserve":
@@ -306,9 +389,9 @@ def build_args(
             budget_msg = str(getattr(cfg, "reasoning_budget_message", "") or "").strip()
             if budget_msg:
                 args += ["--reasoning-budget-message", budget_msg]
-        if cfg.ctx_checkpoints >= 0:
+        if "ctx_checkpoints" in MANAGED_FIELD_NAMES and cfg.ctx_checkpoints >= 0:
             args += ["--ctx-checkpoints", str(cfg.ctx_checkpoints)]
-        if cfg.cache_ram >= -1:
+        if "cache_ram" in MANAGED_FIELD_NAMES and cfg.cache_ram >= -1:
             args += ["--cache-ram", str(cfg.cache_ram)]
         # Третий элемент — sentinel: значение не выше него означает "auto",
         # флаг не передаётся (см. constants.py).
@@ -361,21 +444,22 @@ def build_args(
         if not cfg.use_mmproj:
             args.append("--no-mmproj")
 
-        if cfg.use_mlock:
+        if "use_mlock" in MANAGED_FIELD_NAMES and cfg.use_mlock:
             args.append("--mlock")
-        if cfg.verbose:
+        if "verbose" in MANAGED_FIELD_NAMES and cfg.verbose:
             args.append("--verbose")
-        if cfg.log_timestamps:
+        if "log_timestamps" in MANAGED_FIELD_NAMES and cfg.log_timestamps:
             args.append("--log-timestamps")
-        if cfg.context_shift:
+        if "context_shift" in MANAGED_FIELD_NAMES and cfg.context_shift:
             args.append("--context-shift")
-        if cfg.no_webui:
+        if "no_webui" in MANAGED_FIELD_NAMES and cfg.no_webui:
             args.append("--no-webui")
         if cfg.jinja:
             args.append("--jinja")
-        chat_template = str(getattr(cfg, "chat_template_file", "") or "").strip()
-        if getattr(cfg, "use_chat_template", False) and chat_template:
-            args += ["--chat-template-file", chat_template]
+        if "use_chat_template" in MANAGED_FIELD_NAMES:
+            chat_template = str(getattr(cfg, "chat_template_file", "") or "").strip()
+            if getattr(cfg, "use_chat_template", False) and chat_template:
+                args += ["--chat-template-file", chat_template]
         args.append("--metrics")
 
     if cfg.extra_args.strip():

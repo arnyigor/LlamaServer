@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.core.cli_builder import (
     build_args,
     build_benchmark_args_from_params,
+    merge_extra_args,
     validate_extra_args,
 )
 
@@ -269,12 +270,12 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.gpu_auto = False
         self.cfg.gpu_layers_all = True
         self.cfg.ctx_size = 65536
-        self.cfg.cuda_device = "CUDA0"
         self.cfg.spec_draft_device = "CUDA0"
-        self.cfg.split_mode = "none"
-        self.cfg.main_gpu = 0
         self.cfg.cache_type_k = "q8_0"
         self.cfg.cache_type_v = "q8_0"
+        # cuda_device/split_mode/main_gpu теперь EXTRA (managed=False):
+        # передаются через extra_args, builder их не эмитит и не вырезает.
+        self.cfg.extra_args = "--device CUDA0 --split-mode none --main-gpu 0"
         self.cfg.speculative_mtp = True
         self.cfg.spec_draft_model_path = "/models/test-mtp-draft.gguf"
         self.cfg.spec_draft_n_max = 2
@@ -376,7 +377,7 @@ class TestBuildArgs(unittest.TestCase):
         self.cfg.ctx_checkpoints = 0
         self.cfg.cache_ram = 0
         self.cfg.jinja = True
-        self.cfg.extra_args = "--ctx-checkpoints 0 --cache-ram=0 --jinja --top-p 0.9"
+        self.cfg.extra_args = "--ctx-checkpoints 0 --cache-ram 0 --jinja --top-p 0.9"
 
         args = build_args(self.cfg, self.model)
 
@@ -396,7 +397,9 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn("--top-p", args)
         self.assertIn("0.9", args)
 
-    def test_managed_p_min_overrides_duplicate_extra_and_unmanaged_n_min_is_preserved(self):
+    def test_managed_p_min_overrides_duplicate_extra_and_unmanaged_n_min_is_preserved(
+        self,
+    ):
         self.cfg.speculative_mtp = True
         self.cfg.spec_draft_p_min = 0.8
         self.cfg.extra_args = "--spec-draft-n-min 1 --spec-draft-p-min 0.5"
@@ -438,13 +441,13 @@ class TestBuildArgs(unittest.TestCase):
         self.assertEqual(args.count("--metrics"), 1)
 
     def test_chat_template_enabled_adds_flag(self):
-        self.cfg.use_chat_template = True
-        self.cfg.chat_template_file = "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
+        # use_chat_template теперь EXTRA-параметр (managed=False): флаг
+        # передаётся через extra_args и не эмитится builder'ом, но и не
+        # вырезается — сохраняется verbatim.
+        self.cfg.extra_args = "--chat-template-file /models/custom.jinja"
         args = build_args(self.cfg, self.model)
         idx = args.index("--chat-template-file")
-        self.assertEqual(
-            args[idx + 1], "G:/AIModels/lmstudio/qwen3_claude_relaxed.jinja"
-        )
+        self.assertEqual(args[idx + 1], "/models/custom.jinja")
 
     def test_chat_template_disabled_omits_flag(self):
         self.cfg.use_chat_template = False
@@ -503,6 +506,63 @@ class TestValidateExtraArgs(unittest.TestCase):
     def test_valid_host(self):
         errs = validate_extra_args(["--host", "127.0.0.1"], "/models")
         self.assertEqual(len(errs), 0)
+
+
+class TestMergeExtraArgs(unittest.TestCase):
+    """Мерж extra-флагов при импорте CLI: existing сохраняются, incoming побеждает."""
+
+    def test_keep_old_flags_not_in_incoming(self):
+        merged = merge_extra_args("--mlock --foo bar", "--baz qux")
+        self.assertIn("--mlock", merged)
+        self.assertIn("--foo", merged)
+        self.assertIn("bar", merged)
+        self.assertIn("--baz", merged)
+        self.assertIn("qux", merged)
+
+    def test_same_flag_replaced_with_incoming_value(self):
+        merged = merge_extra_args("--top-p 0.8 --mlock", "--top-p 0.95")
+        self.assertIn("--top-p 0.95", merged)
+        self.assertNotIn("0.8", merged)
+        self.assertIn("--mlock", merged)
+
+    def test_new_flags_appended_after_existing(self):
+        merged = merge_extra_args("--a 1", "--b 2 --c 3")
+        self.assertLess(merged.index("--a"), merged.index("--b"))
+        self.assertLess(merged.index("--b"), merged.index("--c"))
+
+    def test_empty_incoming_keeps_existing(self):
+        # Главный регресс-кейс: импорт CLI без unknown-флагов не стирает extra.
+        self.assertEqual(merge_extra_args("--mlock --foo bar", ""), "--mlock --foo bar")
+
+    def test_empty_existing_returns_incoming(self):
+        self.assertEqual(merge_extra_args("", "--baz qux"), "--baz qux")
+
+    def test_both_empty(self):
+        self.assertEqual(merge_extra_args("", ""), "")
+
+    def test_inline_value_form_overrides_space_form(self):
+        merged = merge_extra_args("--top-p 0.8", "--top-p=0.95")
+        self.assertIn("--top-p=0.95", merged)
+        self.assertNotIn("0.8", merged)
+
+    def test_space_form_overrides_inline_value_form(self):
+        merged = merge_extra_args("--top-p=0.8", "--top-p 0.95")
+        self.assertIn("--top-p 0.95", merged)
+        self.assertNotIn("0.8", merged)
+
+    def test_negative_number_is_value_not_flag(self):
+        merged = merge_extra_args("--custom -5", "--other 1")
+        self.assertIn("--custom", merged)
+        self.assertIn("-5", merged)
+
+    def test_quoted_values_survive_roundtrip(self):
+        merged = merge_extra_args('--grammar-file "my grammar.gbnf"', "")
+        self.assertIn("my grammar.gbnf", merged)
+
+    def test_idempotent_merge(self):
+        first = merge_extra_args("--mlock --top-p 0.8", "--top-p 0.95")
+        second = merge_extra_args(first, "--top-p 0.95")
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

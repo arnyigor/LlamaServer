@@ -15,7 +15,11 @@ from typing import List
 
 from PySide6.QtCore import QThread, Signal
 
-from src.core.gguf_parser import extract_model_info, is_mtp_draft_file, is_projector_file
+from src.core.gguf_parser import (
+    extract_model_info,
+    is_mtp_draft_file,
+    is_projector_file,
+)
 from src.utils.subprocess_utils import no_console_kwargs
 
 
@@ -84,7 +88,7 @@ class LlamaCppUpdater(QThread):
     progress = Signal(str)
     percent = Signal(int)
     completed = Signal(bool, str)
-    API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+    API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100"
 
     def __init__(self, server_path, cuda_version="12"):
         super().__init__()
@@ -188,6 +192,12 @@ class LlamaCppUpdater(QThread):
         return int(match.group(1)) if match else None
 
     def fetch_latest_release(self):
+        """Возвращает релиз с Windows-бинарниками.
+
+        llama.cpp теперь публикует маркер-тег (напр. v0.2.0) без ассетов как
+        /releases/latest, а реальные сборки (bNNNN) — как pre-release.
+        Поэтому перебираем список и берём первый релиз с ассетами и тегом b\d+.
+        """
         request = urllib.request.Request(
             self.API_URL,
             headers={
@@ -198,11 +208,21 @@ class LlamaCppUpdater(QThread):
         self.progress.emit("Checking latest llama.cpp release")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
+                releases = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"GitHub API HTTP {e.code}: {e.reason}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error: {e.reason}") from e
+
+        if isinstance(releases, dict):
+            releases = [releases]
+        for release in releases:
+            if not (release.get("assets") or []):
+                continue
+            if not re.search(r"b\d+", release.get("tag_name", "")):
+                continue
+            return release
+        raise RuntimeError("No downloadable llama.cpp release found")
 
     def parse_build_number(self, value):
         # Сначала ищем формат bXXXX (стандартный для llama.cpp)

@@ -30,6 +30,7 @@ from src.core.constants import (
 from src.core.param_registry import (
     FIELD_WIDGET_MAP as _FIELD_WIDGET_MAP,
     MANAGED_EXTRA_FLAGS as _MANAGED_EXTRA_FLAGS,
+    PARAM_REGISTRY,
     SAMPLING_EXTRA_FIELDS as _SAMPLING_EXTRA_FIELDS,
 )
 from src.utils.file_utils import write_json_file_safely
@@ -209,6 +210,7 @@ _AUTOTUNE_PARAM_TO_SETTING = {
 # Флаги, которыми управляют UI/AutoTune, и mapping sampling-полей тоже
 # приходят из реестра параметров.
 
+
 def _is_extra_value_token(arg: str) -> bool:
     if not str(arg).startswith("-"):
         return True
@@ -249,6 +251,107 @@ def _sanitize_extra_args(value: Any) -> str:
     return " ".join(shlex.quote(p) for p in result)
 
 
+def _extra_flag_tokens(name: str, value: Any, settings: Any) -> List[str]:
+    """Формирует CLI-токены для EXTRA-поля (managed=False) по старой логике эмиссии.
+
+    Возвращает [] если флаг не должен эмититься (пустое/дефолтное значение).
+    Для use_chat_template использует chat_template_file как значение флага.
+    Несколько EXTRA-полей (cuda_visible_devices, cuda_module_loading, cont_batching,
+    cache_prompt, use_mmap) не имеют cli_flags в реестре — их флаги заданы явно.
+    """
+    if name == "ctx_checkpoints":
+        return (
+            ["--ctx-checkpoints", str(value)]
+            if isinstance(value, int) and value >= 0
+            else []
+        )
+    if name == "cache_ram":
+        return (
+            ["--cache-ram", str(value)]
+            if isinstance(value, int) and value >= -1
+            else []
+        )
+    if name == "main_gpu":
+        v = value if isinstance(value, int) else -1
+        return ["--main-gpu", str(v)] if v >= 0 else []
+    if name == "split_mode":
+        v = str(value or "").strip()
+        return ["--split-mode", v] if v else []
+    if name == "cuda_device":
+        v = str(value or "").strip()
+        return ["--device", v] if v else []
+    if name == "cuda_visible_devices":
+        v = str(value or "").strip()
+        return ["--cuda-visible-devices", v] if v else []
+    if name == "cuda_module_loading":
+        v = str(value or "").strip()
+        return ["--cuda-module-loading", v] if v and v != "LAZY" else []
+    if name in (
+        "use_mlock",
+        "verbose",
+        "log_timestamps",
+        "context_shift",
+        "no_webui",
+        "kv_unified",
+    ):
+        flag = {
+            "use_mlock": "--mlock",
+            "verbose": "--verbose",
+            "log_timestamps": "--log-timestamps",
+            "context_shift": "--context-shift",
+            "no_webui": "--no-webui",
+            "kv_unified": "--kv-unified",
+        }[name]
+        return [flag] if value else []
+    if name in ("cont_batching", "cache_prompt", "use_mmap"):
+        flag = {
+            "cont_batching": "--no-cont-batching",
+            "cache_prompt": "--no-cache-prompt",
+            "use_mmap": "--no-mmap",
+        }[name]
+        return [flag] if not value else []
+    if name == "use_chat_template":
+        path = str(getattr(settings, "chat_template_file", "") or "").strip()
+        return ["--chat-template-file", path] if path else []
+    return []
+
+
+def migrate_extra_fields_to_extra_args(settings: Any) -> None:
+    """Переносит значения EXTRA-полей (managed=False) в extra_args.
+
+    EXTRA-параметры больше не управляются registry/виджетами при сборке команды
+    (см. cli_builder.build_args + cli_parser). Чтобы старые сохранённые значения
+    не потерялись при удалении виджетов из UI, переносим их в текстовое поле
+    extra_args verbatim. Идемпотентно: после переноса поле сбрасывается в default,
+    поэтому повторная загрузка не дублирует флаги.
+    """
+    defaults = {f.name: f.default for f in fields(AppSettings)}
+    extra_tokens: List[str] = []
+    existing = str(getattr(settings, "extra_args", "") or "").strip()
+    existing_tokens = shlex.split(existing) if existing else []
+
+    for spec in PARAM_REGISTRY:
+        if spec.managed:
+            continue
+        name = spec.name
+        if name == "chat_template_file":
+            continue  # обрабатывается вместе с use_chat_template
+        value = getattr(settings, name, None)
+        default = defaults.get(name)
+        if value == default:
+            continue
+        tokens = _extra_flag_tokens(name, value, settings)
+        if tokens and tokens[0] not in existing_tokens:
+            extra_tokens += tokens
+        setattr(settings, name, default)
+        if name == "use_chat_template":
+            setattr(settings, "chat_template_file", "")
+
+    if extra_tokens:
+        merged = (existing + " " + " ".join(extra_tokens)).strip()
+        setattr(settings, "extra_args", merged)
+
+
 def _extract_sampling_extra_args(value: Any) -> tuple[str, Dict[str, Any]]:
     """Мигрирует старые sampling-флаги из Extra params в отдельные поля."""
     text = str(value or "").strip()
@@ -273,7 +376,11 @@ def _extract_sampling_extra_args(value: Any) -> tuple[str, Dict[str, Any]]:
 
         raw_value = inline_value if separator else None
         consumed = False
-        if raw_value is None and i + 1 < len(parts) and _is_extra_value_token(parts[i + 1]):
+        if (
+            raw_value is None
+            and i + 1 < len(parts)
+            and _is_extra_value_token(parts[i + 1])
+        ):
             raw_value = parts[i + 1]
             consumed = True
         if raw_value is None:
@@ -522,6 +629,9 @@ class ConfigManager:
                     if key not in data:
                         setattr(self.settings, key, value)
                 self.settings.extra_args = remaining_extra
+                # Перенос старых EXTRA-значений (managed=False) в extra_args,
+                # пока они ещё лежат в settings-полях (до apply_to_ui).
+                migrate_extra_fields_to_extra_args(self.settings)
             except (json.JSONDecodeError, OSError):
                 pass  # Используем дефолтные настройки
 
@@ -679,6 +789,9 @@ class ConfigManager:
                     setattr(self.settings, k, v)
                 except (TypeError, ValueError):
                     pass
+        # Перенос старых EXTRA-значений (managed=False) в extra_args, пока они
+        # ещё лежат в settings-полях (до apply_to_ui, который сбросит виджеты).
+        migrate_extra_fields_to_extra_args(self.settings)
         self.apply_to_ui(ui)
         return True
 

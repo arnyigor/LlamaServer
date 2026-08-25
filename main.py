@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.benchmark_plan import build_autotune_plan
-from src.core.cli_builder import build_args
+from src.core.cli_builder import build_args, merge_extra_args
 from src.core.cli_parser import parse_llama_server_command
 from src.core.config import ConfigManager
 from src.core.diagnostics import (
@@ -597,7 +597,9 @@ class LlamaGUI:
 
         detailed = self._parsed_memory_without_process_fallback() > 0
         if vram_total <= 0 and not estimate:
-            note = "Detailed or fallback memory data will appear in Overview after launch."
+            note = (
+                "Detailed or fallback memory data will appear in Overview after launch."
+            )
         elif detailed:
             note = "Overview is using detailed llama.cpp buffer breakdown."
         elif vram_total > 0:
@@ -918,9 +920,11 @@ class LlamaGUI:
         menu.addAction("Exit", self.quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
-            lambda r: self.ui.hide()
-            if self.ui.isVisible() and r == QSystemTrayIcon.DoubleClick
-            else self.ui.showNormal()
+            lambda r: (
+                self.ui.hide()
+                if self.ui.isVisible() and r == QSystemTrayIcon.DoubleClick
+                else self.ui.showNormal()
+            )
         )
         self.tray.show()
 
@@ -1517,8 +1521,10 @@ class LlamaGUI:
         self.scanner.models_found.connect(self.on_models_found)
         self.scanner.error.connect(lambda msg: self.log_mgr.append(msg, "error"))
         self.scanner.finished.connect(
-            lambda: self.ui.scan_btn.setText("Scan")
-            or self.ui.scan_progress.setVisible(False)
+            lambda: (
+                self.ui.scan_btn.setText("Scan")
+                or self.ui.scan_progress.setVisible(False)
+            )
         )
         self.scanner.start()
 
@@ -2797,7 +2803,11 @@ class LlamaGUI:
                 and "spec_draft_model_path" not in settings
             ):
                 settings["spec_draft_model_path"] = ""
-            settings["extra_args"] = parsed.extra_args
+            # Мерж extra-флагов: существующие сохраняются, импорт побеждает
+            # при конфликте, новые добавляются в конец.
+            settings["extra_args"] = merge_extra_args(
+                self.ui.extra_args.text(), parsed.extra_args
+            )
             self.config.apply_values_to_ui(self.ui, settings)
             if "spec_draft_model_path" in settings:
                 self._set_mtp_manual_draft_path(settings["spec_draft_model_path"])
@@ -4540,8 +4550,10 @@ class LlamaGUI:
             )
         )
         self.updater.finished.connect(
-            lambda: self.ui.update_progress.setVisible(False)
-            or self.update_action_buttons()
+            lambda: (
+                self.ui.update_progress.setVisible(False)
+                or self.update_action_buttons()
+            )
         )
         self.updater.start()
         self.update_action_buttons()
@@ -4574,9 +4586,7 @@ class LlamaGUI:
         # Размер контекста: ручное значение из UI либо авто-опрос сервера.
         max_context = self.ui.integration_max_context.value()
         if not max_context or max_context <= 0:
-            max_context = self.query_server_context_window(
-                self.ui.current_base_url()
-            )
+            max_context = self.query_server_context_window(self.ui.current_base_url())
 
         mgr = IntegrationManager(base_url=self.ui.current_base_url())
         result = mgr.add_model(
