@@ -1,120 +1,97 @@
-"""Вкладка AutoTune benchmark."""
+"""Вкладка AutoTune поверх движка llama_autotuner."""
 
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, Optional
+from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QProgressBar,
     QSpinBox,
-    QDoubleSpinBox,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from src.core.benchmark_models import AutoTunePlan, BenchmarkCandidate, BenchmarkResult
-
+from llama_autotuner.models import CandidateResult, LaunchProfile, RunStatus
+from src.ui.widgets import CollapsiblePanel
 
 _COLUMNS = [
     "#",
     "Status",
+    "Phase",
     "Score",
-    "%Best",
-    "ΔTG",
-    "Prompt tok/s",
-    "Gen tok/s",
-    "Load sec",
-    "VRAM",
-    "RAM",
-    "Est VRAM",
-    "Risk",
-    "ngl",
-    "ncmoe",
-    "ctk",
-    "ctv",
-    "batch",
-    "ubatch",
-    "threads",
-    "threads_batch",
-    "np",
-    "flash_attn",
-    "mmproj",
-    "ctx_checkpoints",
-    "cache_ram",
-    "error",
+    "ctx",
+    "Placement",
+    "KV",
+    "batch/ubatch",
+    "threads/tb",
+    "MTP",
+    "Vision",
+    "PP tok/s",
+    "TG tok/s",
+    "VRAM peak",
+    "VRAM class",
+    "Reason",
 ]
 
-_PARAM_COLUMNS = {
-    12: "ngl",
-    13: "ncmoe",
-    14: "cache_type_k",
-    15: "cache_type_v",
-    16: "batch_size",
-    17: "ubatch_size",
-    18: "threads",
-    19: "threads_batch",
-    20: "parallel_slots",
-    21: "flash_attn",
-    22: "use_mmproj",
-    23: "ctx_checkpoints",
-    24: "cache_ram",
+_GOAL_PRESETS = {
+    "Recommended fast": {"mode": "quick", "priority": "balanced"},
+    "Max context": {"mode": "normal", "priority": "context"},
+    "Best quality": {"mode": "normal", "priority": "quality"},
+    "Full validation": {"mode": "deep", "priority": "balanced"},
 }
 
-_INT_PARAM_KEYS = {
-    "ngl",
-    "ncmoe",
-    "batch_size",
-    "ubatch_size",
-    "threads",
-    "threads_batch",
-    "parallel_slots",
-    "ctx_checkpoints",
-    "cache_ram",
+_KV_CHOICES = ["f16/f16", "q8_0/q8_0", "q4_0/q4_0"]
+
+_PROFILE_ORDER = ["OPTIMAL", "MAX_KV_PRECISION", "FASTEST", "MAX_CONTEXT"]
+
+_PROFILE_PURPOSES = {
+    "OPTIMAL": "Best overall balance of speed, context and VRAM headroom.",
+    "MAX_KV_PRECISION": "Highest KV-cache/attention precision that still runs.",
+    "FASTEST": "Highest measured decode speed (tok/s).",
+    "MAX_CONTEXT": "Largest successfully measured, non-fragile context.",
 }
-_QUANT_CHOICES = ["f16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "f32"]
-_BOOL_CHOICES = ["true", "false"]
+
+_STATUS_COLORS = {
+    RunStatus.PASS: QColor(200, 255, 200),
+    RunStatus.PASS_DEGRADED: QColor(230, 255, 200),
+    RunStatus.EARLY_REJECT: QColor(255, 230, 190),
+    RunStatus.FAILED: QColor(255, 210, 210),
+    RunStatus.INVALID_ENVIRONMENT: QColor(255, 200, 180),
+    RunStatus.FATAL: QColor(255, 180, 180),
+}
 
 
 class AutoTuneWidget(QWidget):
-    build_plan_requested = Signal()
     start_requested = Signal()
     cancel_requested = Signal()
-    apply_best_requested = Signal()
-    apply_selected_requested = Signal(str)
-    save_best_requested = Signal()
-    export_report_requested = Signal()
+    apply_requested = Signal(str)  # имя профиля (OPTIMAL/MAX_KV_PRECISION/...)
     open_results_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._row_by_id: Dict[str, int] = {}
-        self._scores: Dict[
-            str, float
-        ] = {}  # candidate_id -> score для вычисления %Best
-        self._gen_tg: Dict[str, float] = {}  # candidate_id -> gen_tok_s для ΔTG
+        self._row_by_key: Dict[str, int] = {}
         self._done_runs = 0
-        self._total_runs = 0
-        self._launch_timeout_sec = 0
-        self._run_started_at = 0.0
-        self._current_run_started_at = 0.0
-        self._current_run_id = ""
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._update_time_labels)
+        self._max_runs = 0
+        self._profiles: List[LaunchProfile] = []
+        self._last_output_dir: str = ""
         self._build_ui()
+
+    # ------------------------------------------------------------------ UI
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -125,139 +102,148 @@ class AutoTuneWidget(QWidget):
         settings = QVBoxLayout(settings_group)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Mode:"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Smart", "Quick", "Normal", "Deep"])
-        self.mode_combo.setToolTip(
-            "Управляет числом и широтой кандидатов в плане прогона:\n"
-            "Smart — компактный план по железу/модели (рекомендуется);\n"
-            "Quick — быстрая проверка нескольких ключевых точек;\n"
-            "Normal — больше вариантов KV/batch/ubatch/threads;\n"
-            "Deep — самый широкий поиск, дольше всего."
+        row1.addWidget(QLabel("Goal:"))
+        self.goal_combo = QComboBox()
+        self.goal_combo.addItems(list(_GOAL_PRESETS.keys()))
+        self.goal_combo.setToolTip(
+            "Recommended fast — короткий прогон, сбалансированный приоритет.\n"
+            "Max context — приоритет максимально большого контекста.\n"
+            "Best quality — приоритет точности KV-кэша.\n"
+            "Full validation — самый широкий и долгий поиск."
         )
-        row1.addWidget(self.mode_combo)
+        row1.addWidget(self.goal_combo)
 
-        row1.addWidget(QLabel("Target:"))
-        self.target_combo = QComboBox()
-        self.target_combo.addItems(
-            ["Auto", "Balanced", "Max Speed", "Low VRAM", "Quality KV", "MoE Optimized"]
-        )
-        self.target_combo.setToolTip(
-            "Цель оптимизации:\n"
-            "Auto — выбирается из модели/GPU (Balanced/Low VRAM/Max Speed);\n"
-            "Balanced — скорость + стабильность + запас памяти;\n"
-            "Max Speed — приоритет tok/s;\n"
-            "Low VRAM — экономия видеопамяти;\n"
-            "Quality KV — качественный KV-кэш (f16/q8);\n"
-            "MoE Optimized — агрессивнее CPU-offload экспертов."
-        )
-        row1.addWidget(self.target_combo)
-        self.target_help_btn = QPushButton("?")
-        self.target_help_btn.setFixedWidth(24)
-        self.target_help_btn.setToolTip("Показать описание целей")
-        self.target_help_btn.clicked.connect(self._show_target_help)
-        row1.addWidget(self.target_help_btn)
+        row1.addWidget(QLabel("Context:"))
+        self.ctx_spin = QSpinBox()
+        self.ctx_spin.setRange(4096, 1_048_576)
+        self.ctx_spin.setSingleStep(1024)
+        self.ctx_spin.setValue(65536)
+        self.ctx_spin.setToolTip("Целевой контекст (токенов), который должен работать.")
+        row1.addWidget(self.ctx_spin)
         settings.addLayout(row1)
 
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Time budget (min):"))
-        self.time_budget = QSpinBox()
-        self.time_budget.setRange(1, 10)
-        self.time_budget.setValue(5)
-        self.time_budget.setToolTip("Общий лимит времени всех прогонов (макс. 10 мин).")
-        row2.addWidget(self.time_budget)
-
-        row2.addWidget(QLabel("Max runs:"))
-        self.max_runs = QSpinBox()
-        self.max_runs.setRange(1, 50)
-        self.max_runs.setValue(5)
-        row2.addWidget(self.max_runs)
-
-        row2.addWidget(QLabel("Launch timeout (sec):"))
-        self.launch_timeout = QSpinBox()
-        self.launch_timeout.setRange(10, 300)
-        self.launch_timeout.setValue(60)
-        self.launch_timeout.setToolTip(
-            "Если модель не загрузилась за это время — кандидат пропускается."
+        self.vision_chk = QCheckBox("Vision required")
+        self.vision_chk.setToolTip(
+            "Требовать рабочую поддержку изображений (mmproj) — иначе поиск "
+            "прекратится, если она недоступна."
         )
-        row2.addWidget(self.launch_timeout)
+        row2.addWidget(self.vision_chk)
+        row2.addWidget(QLabel("mmproj:"))
+        self.mmproj_edit = QLineEdit()
+        self.mmproj_edit.setPlaceholderText("auto-detect if empty")
+        row2.addWidget(self.mmproj_edit, 1)
+        self.mmproj_browse_btn = QPushButton("...")
+        self.mmproj_browse_btn.setFixedWidth(28)
+        self.mmproj_browse_btn.clicked.connect(self._browse_mmproj)
+        row2.addWidget(self.mmproj_browse_btn)
         settings.addLayout(row2)
 
-        row2b = QHBoxLayout()
-        self.early_stop_peak = QCheckBox("Early stop after peak drop")
-        self.early_stop_peak.setChecked(True)
-        self.early_stop_peak.setToolTip(
-            "Stop after at least 3 successful runs when a new successful run is slower than the current peak."
-        )
-        self.verify_server_after_apply = QCheckBox(
-            "Start server and verify after Apply Best"
-        )
-        self.verify_server_after_apply.setChecked(True)
-        self.verify_server_after_apply.setToolTip(
-            "After Apply Best, start/restart llama-server with the same saved parameters and send one short test request."
-        )
-        row2b.addWidget(self.early_stop_peak)
-        row2b.addWidget(self.verify_server_after_apply)
-        row2b.addStretch(1)
-        settings.addLayout(row2b)
+        advanced = CollapsiblePanel("Advanced", settings_key="panel_autotune_advanced")
+        adv = advanced.content_layout
+
+        adv_row1 = QHBoxLayout()
+        adv_row1.addWidget(QLabel("Search depth:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["quick", "normal", "deep"])
+        adv_row1.addWidget(self.mode_combo)
+        adv_row1.addWidget(QLabel("Priority:"))
+        self.priority_combo = QComboBox()
+        self.priority_combo.addItems(["balanced", "context", "quality", "speed"])
+        adv_row1.addWidget(self.priority_combo)
+        adv_row1.addWidget(QLabel("Preferred KV:"))
+        self.kv_combo = QComboBox()
+        self.kv_combo.addItems(_KV_CHOICES)
+        adv_row1.addWidget(self.kv_combo)
+        adv.addLayout(adv_row1)
+
+        adv_row2 = QHBoxLayout()
+        adv_row2.addWidget(QLabel("Degradation policy:"))
+        self.degradation_combo = QComboBox()
+        self.degradation_combo.addItems(["auto", "report", "strict"])
+        adv_row2.addWidget(self.degradation_combo)
+        self.allow_kv_degradation_chk = QCheckBox("Allow KV degradation")
+        self.allow_kv_degradation_chk.setChecked(True)
+        adv_row2.addWidget(self.allow_kv_degradation_chk)
+        self.allow_context_reduction_chk = QCheckBox("Allow context reduction")
+        self.allow_context_reduction_chk.setChecked(True)
+        adv_row2.addWidget(self.allow_context_reduction_chk)
+        adv.addLayout(adv_row2)
+
+        adv_row3 = QHBoxLayout()
+        adv_row3.addWidget(QLabel("Min TG t/s:"))
+        self.min_tg_spin = QDoubleSpinBox()
+        self.min_tg_spin.setRange(0.0, 1000.0)
+        self.min_tg_spin.setSpecialValueText("none")
+        adv_row3.addWidget(self.min_tg_spin)
+        adv_row3.addWidget(QLabel("Min PP t/s:"))
+        self.min_pp_spin = QDoubleSpinBox()
+        self.min_pp_spin.setRange(0.0, 5000.0)
+        self.min_pp_spin.setSpecialValueText("none")
+        adv_row3.addWidget(self.min_pp_spin)
+        adv_row3.addWidget(QLabel("MTP:"))
+        self.mtp_combo = QComboBox()
+        self.mtp_combo.addItems(["auto", "on", "off"])
+        adv_row3.addWidget(self.mtp_combo)
+        adv.addLayout(adv_row3)
+
+        adv_row4 = QHBoxLayout()
+        adv_row4.addWidget(QLabel("Preferred VRAM margin (MiB):"))
+        self.vram_margin_spin = QSpinBox()
+        self.vram_margin_spin.setRange(0, 65536)
+        self.vram_margin_spin.setValue(1024)
+        adv_row4.addWidget(self.vram_margin_spin)
+        self.require_vram_margin_chk = QCheckBox("Require margin (production-safe)")
+        adv_row4.addWidget(self.require_vram_margin_chk)
+        adv_row4.addWidget(QLabel("Absolute VRAM floor (MiB):"))
+        self.vram_floor_spin = QSpinBox()
+        self.vram_floor_spin.setRange(0, 8192)
+        self.vram_floor_spin.setValue(300)
+        adv_row4.addWidget(self.vram_floor_spin)
+        adv.addLayout(adv_row4)
+
+        adv_row5 = QHBoxLayout()
+        adv_row5.addWidget(QLabel("Max time (min, 0=auto):"))
+        self.max_time_spin = QSpinBox()
+        self.max_time_spin.setRange(0, 600)
+        adv_row5.addWidget(self.max_time_spin)
+        adv_row5.addWidget(QLabel("Max runs (0=auto):"))
+        self.max_runs_spin = QSpinBox()
+        self.max_runs_spin.setRange(0, 500)
+        adv_row5.addWidget(self.max_runs_spin)
+        adv.addLayout(adv_row5)
+
+        adv_row6 = QHBoxLayout()
+        adv_row6.addWidget(QLabel("Extra runtime args:"))
+        self.runtime_args_edit = QLineEdit()
+        self.runtime_args_edit.setPlaceholderText("preserved verbatim in every tested/final command")
+        adv_row6.addWidget(self.runtime_args_edit, 1)
+        adv.addLayout(adv_row6)
+
+        settings.addWidget(advanced)
 
         row3 = QHBoxLayout()
-        self.build_plan_btn = QPushButton("Build Plan")
         self.start_btn = QPushButton("Run AutoTune")
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
-        self.apply_best_btn = QPushButton("Apply Best")
-        self.apply_best_btn.setEnabled(False)
-        self.save_best_btn = QPushButton("Save Best Preset")
-        self.save_best_btn.setEnabled(False)
-
-        for btn in [
-            self.build_plan_btn,
-            self.start_btn,
-            self.cancel_btn,
-            self.apply_best_btn,
-            self.save_best_btn,
-        ]:
-            row3.addWidget(btn)
+        self.open_results_btn = QPushButton("Open Results Folder")
+        self.open_results_btn.setEnabled(False)
+        row3.addWidget(self.start_btn)
+        row3.addWidget(self.cancel_btn)
+        row3.addWidget(self.open_results_btn)
         settings.addLayout(row3)
         layout.addWidget(settings_group)
 
-        self.hint_label = QLabel(
-            "Default Smart mode builds a short hardware-aware plan from the selected model, context, GPU estimate and CPU threads. "
-            "Build Plan is optional: Run AutoTune will build it automatically when needed."
-        )
-        self.hint_label.setWordWrap(True)
-        layout.addWidget(self.hint_label)
-
-        self.plan_summary = QLabel("Smart summary will appear after Build Plan.")
-        self.plan_summary.setWordWrap(True)
-        self.plan_summary.setStyleSheet(
-            "background-color: #f5f7fa; color: #263238; padding: 8px; border: 1px solid #d5dde5; border-radius: 4px;"
-        )
-        layout.addWidget(self.plan_summary)
-
-        self.status_label = QLabel("Build a plan or start Quick AutoTune.")
+        self.status_label = QLabel("Idle.")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        self.progress_summary = QLabel("Progress: idle")
-        self.progress_summary.setWordWrap(True)
-        self.progress_summary.setStyleSheet(
-            "background-color: #263238; color: #E0F7FA; font-weight: bold; padding: 8px; border-radius: 4px;"
-        )
-        layout.addWidget(self.progress_summary)
-
-        progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setMinimumHeight(24)
-        self.current_run_label = QLabel("Idle")
-        self.current_run_label.setWordWrap(True)
-        progress_row.addWidget(self.progress_bar, 1)
-        progress_row.addWidget(self.current_run_label, 2)
-        layout.addLayout(progress_row)
+        layout.addWidget(self.progress_bar)
 
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
@@ -267,533 +253,226 @@ class AutoTuneWidget(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table, 1)
 
-        # Параметры-кандидаты (ngl, ncmoe, KV, threads, ...) скрыты по умолчанию:
-        # 26 колонок нечитаемы на экране, а детали нужны лишь при анализе.
-        self._param_columns = list(_PARAM_COLUMNS.keys())
-        for col in self._param_columns:
-            self.table.setColumnHidden(col, True)
+        self.profiles_group = QGroupBox("Recommended profiles")
+        self.profiles_layout = QVBoxLayout(self.profiles_group)
+        self.profiles_placeholder = QLabel("Profiles will appear here after a session completes.")
+        self.profiles_placeholder.setWordWrap(True)
+        self.profiles_layout.addWidget(self.profiles_placeholder)
+        layout.addWidget(self.profiles_group)
 
-        self.show_params_btn = QPushButton("Show parameters ▶")
-        self.show_params_btn.setCheckable(True)
-        self.show_params_btn.setToolTip(
-            "Show/hide candidate parameter columns (ngl, ncmoe, KV, threads, ...)"
-        )
-        self.show_params_btn.toggled.connect(self._toggle_param_columns)
-        layout.addWidget(self.show_params_btn)
-
-        # Internal buffer only. Do not add a second console under Benchmark:
-        # the main Logs panel already receives the same AutoTune events.
-        self.activity_log = QTextEdit(readOnly=True)
-        self.activity_log.setVisible(False)
-
-        self.best_text = QTextEdit(readOnly=True)
-        self.best_text.setMaximumHeight(150)
-        self.best_text.setPlaceholderText("Best result will appear here.")
-        layout.addWidget(self.best_text)
-
-        self.build_plan_btn.clicked.connect(self.build_plan_requested.emit)
         self.start_btn.clicked.connect(self.start_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
-        self.apply_best_btn.clicked.connect(self.apply_best_requested.emit)
-        self.save_best_btn.clicked.connect(self.save_best_requested.emit)
+        self.open_results_btn.clicked.connect(self.open_results_requested.emit)
+        self.goal_combo.currentTextChanged.connect(self._apply_goal_preset)
+        self._apply_goal_preset(self.goal_combo.currentText())
+
+    def _browse_mmproj(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select mmproj GGUF", "", "GGUF files (*.gguf);;All files (*.*)"
+        )
+        if path:
+            self.mmproj_edit.setText(path)
+
+    def _apply_goal_preset(self, label: str) -> None:
+        preset = _GOAL_PRESETS.get(label)
+        if not preset:
+            return
+        self.mode_combo.setCurrentText(preset["mode"])
+        self.priority_combo.setCurrentText(preset["priority"])
+
+    # -------------------------------------------------------------- options
 
     def options(self) -> Dict[str, object]:
+        kv_k, kv_v = self.kv_combo.currentText().split("/", 1)
         return {
-            "mode": self.mode_combo.currentText().lower(),
-            "target": self.target_combo.currentText().lower().replace(" ", "_"),
-            "engine": "llama-bench",
-            "time_budget_sec": self.time_budget.value() * 60,
-            "max_runs": self.max_runs.value(),
-            "repeat_top": 1,
-            "launch_timeout_sec": self.launch_timeout.value(),
-            "early_stop_on_peak": self.early_stop_peak.isChecked(),
-            "verify_server_after_apply": self.verify_server_after_apply.isChecked(),
+            "ctx": self.ctx_spin.value(),
+            "vision": "required" if self.vision_chk.isChecked() else "auto",
+            "mmproj": self.mmproj_edit.text().strip() or None,
+            "mode": self.mode_combo.currentText(),
+            "priority": self.priority_combo.currentText(),
+            "kv_k": kv_k,
+            "kv_v": kv_v,
+            "degradation_policy": self.degradation_combo.currentText(),
+            "allow_kv_degradation": self.allow_kv_degradation_chk.isChecked(),
+            "allow_context_reduction": self.allow_context_reduction_chk.isChecked(),
+            "min_tg_tps": self.min_tg_spin.value() or None,
+            "min_pp_tps": self.min_pp_spin.value() or None,
+            "mtp_mode": self.mtp_combo.currentText(),
+            "vram_margin_mb": self.vram_margin_spin.value(),
+            "require_vram_margin": self.require_vram_margin_chk.isChecked(),
+            "absolute_vram_floor_mb": self.vram_floor_spin.value(),
+            "max_minutes": self.max_time_spin.value() or None,
+            "max_runs": self.max_runs_spin.value() or None,
+            "runtime_args": self.runtime_args_edit.text().split(),
         }
 
+    # ------------------------------------------------------------ run state
+
     def set_running(self, running: bool) -> None:
-        self.build_plan_btn.setEnabled(not running)
         self.start_btn.setEnabled(not running)
         self.start_btn.setText("AutoTune running..." if running else "Run AutoTune")
         self.cancel_btn.setEnabled(running)
         self.progress_bar.setVisible(running or self.progress_bar.value() > 0)
         if running:
-            now = time.monotonic()
-            self._run_started_at = now
-            self._current_run_started_at = now
-            self.progress_bar.setRange(0, max(self._total_runs, 1))
-            self.progress_bar.setValue(self._done_runs)
-            self.current_run_label.setText("Starting llama-bench process...")
-            self.status_label.setText("AutoTune starting...")
-            self.append_activity("AutoTune started")
-            self._timer.start()
-            self._update_time_labels()
-        else:
-            self._timer.stop()
-            self._update_time_labels(finished=True)
-        self.apply_best_btn.setEnabled(
-            False if running else self.apply_best_btn.isEnabled()
-        )
-        self.save_best_btn.setEnabled(
-            False if running else self.save_best_btn.isEnabled()
-        )
+            self.status_label.setText("Starting autotune session...")
 
     def clear_results(self) -> None:
-        self._row_by_id.clear()
-        self._scores.clear()
-        self._gen_tg.clear()
+        self._row_by_key.clear()
         self.table.setRowCount(0)
-        self.best_text.clear()
-        self.activity_log.clear()
         self._done_runs = 0
-        self._total_runs = 0
-        self._run_started_at = 0.0
-        self._current_run_started_at = 0.0
-        self._current_run_id = ""
+        self._max_runs = 0
+        self._profiles = []
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(False)
-        self.progress_summary.setText("Progress: idle")
-        self.current_run_label.setText("Idle")
-        self.plan_summary.setText("Smart summary will appear after Build Plan.")
-        self.apply_best_btn.setEnabled(False)
-        self.save_best_btn.setEnabled(False)
+        self.status_label.setText("Idle.")
+        self._clear_profiles_panel()
+        self.open_results_btn.setEnabled(False)
 
-    def set_plan(self, plan: AutoTunePlan) -> None:
+    def mark_started(self, max_runs: int) -> None:
         self.clear_results()
-        self._total_runs = len(plan.candidates)
-        self.status_label.setText(
-            f"Plan: {len(plan.candidates)} candidates | ctx={plan.ctx_size:,} | mode={plan.mode} | target={plan.target}"
-        )
-        constraints = getattr(plan, "constraints", {}) or {}
-        notes = constraints.get("notes") or []
-        risk_counts = constraints.get("risk_counts") or {}
-        note_text = "\n".join(f"• {note}" for note in notes[:6])
-        if risk_counts:
-            note_text += f"\n• risk: {risk_counts}"
-        self.plan_summary.setText(note_text or "Plan constraints unavailable.")
-        self.progress_summary.setText(
-            f"Ready: {len(plan.candidates)} runs planned. Budget: {plan.time_budget_sec // 60} min. Per-run timeout is shown above."
-        )
-        self.table.setRowCount(len(plan.candidates))
-        for row, candidate in enumerate(plan.candidates):
-            self._row_by_id[candidate.id] = row
-            self._fill_candidate_row(row, candidate)
+        self._max_runs = max(int(max_runs), 0)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, max(self._max_runs, 1))
+        self.progress_bar.setValue(0)
+        self.status_label.setText("AutoTune running...")
 
-    def _set_item(
-        self, row: int, col: int, value: object, editable: bool = False
-    ) -> None:
-        item = QTableWidgetItem(str(value))
-        item.setTextAlignment(
-            Qt.AlignmentFlag.AlignCenter
-            if col != len(_COLUMNS) - 1
-            else Qt.AlignmentFlag.AlignLeft
-        )
-        if not editable:
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+    def set_progress(self, done: int, max_runs: int) -> None:
+        self._done_runs = max(0, int(done))
+        if max_runs:
+            self._max_runs = max(int(max_runs), self._done_runs)
+        total = max(self._max_runs, self._done_runs, 1)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(self._done_runs)
+        self.progress_bar.setFormat(f"{self._done_runs}/{total} runs")
+        self.status_label.setText(f"AutoTune running: {self._done_runs}/{total} candidates tried")
+
+    def show_error(self, message: str) -> None:
+        self.status_label.setText(f"AutoTune failed: {message}")
+
+    # --------------------------------------------------------------- table
+
+    def _set_item(self, row: int, col: int, value: object) -> None:
+        item = QTableWidgetItem(str(value) if value is not None else "")
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.table.setItem(row, col, item)
 
-    _STATUS_COLORS = {
-        "success": QColor(200, 255, 200),  # светло-зелёный
-        "running": QColor(200, 230, 255),  # светло-синий
-        "failed": QColor(255, 210, 210),  # светло-красный
-        "oom": QColor(255, 200, 180),  # светло-оранжевый
-        "pending": QColor(230, 230, 230),  # серый
-    }
-
-    def _toggle_param_columns(self, show: bool) -> None:
-        for col in self._param_columns:
-            self.table.setColumnHidden(col, not show)
-        self.show_params_btn.setText(
-            "Hide parameters ◀" if show else "Show parameters ▶"
-        )
-
-    def _apply_row_color(self, row: int, status: str) -> None:
-        color = self._STATUS_COLORS.get(str(status).lower())
+    def _apply_row_color(self, row: int, status: RunStatus) -> None:
+        color = _STATUS_COLORS.get(status)
         if color is None:
             return
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)
-            if item is None:
-                item = QTableWidgetItem()
-                self.table.setItem(row, col, item)
-            item.setBackground(color)
+            if item is not None:
+                item.setBackground(color)
 
-    def _set_combo_cell(
-        self, row: int, col: int, value: object, choices: list[str]
-    ) -> None:
-        combo = QComboBox()
-        combo.addItems(choices)
-        text = str(value).strip().lower()
-        if isinstance(value, bool):
-            text = "true" if value else "false"
-        idx = combo.findText(text)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        combo.setToolTip("Editable AutoTune candidate value")
-        self.table.setCellWidget(row, col, combo)
-
-    def _set_spin_cell(self, row: int, col: int, key: str, value: object) -> bool:
-        try:
-            int_value = int(value)
-        except (TypeError, ValueError):
-            return False
-        ranges = {
-            "ngl": (0, 999),
-            "ncmoe": (-1, 999),
-            "batch_size": (1, 32768),
-            "ubatch_size": (1, 8192),
-            "threads": (1, 128),
-            "threads_batch": (0, 128),
-            "parallel_slots": (1, 32),
-            "ctx_checkpoints": (0, 128),
-            "cache_ram": (0, 262144),
-        }
-        low, high = ranges.get(key, (-999999, 999999))
-        spin = QSpinBox()
-        spin.setRange(low, high)
-        spin.setValue(max(low, min(high, int_value)))
-        spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        spin.setToolTip("Editable AutoTune candidate value")
-        self.table.setCellWidget(row, col, spin)
-        return True
-
-    def _cell_text(self, row: int, col: int) -> str:
-        widget = self.table.cellWidget(row, col)
-        if isinstance(widget, QComboBox):
-            return widget.currentText()
-        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
-            return str(widget.value())
-        item = self.table.item(row, col)
-        return item.text().strip() if item else ""
-
-    def selected_candidate_id(self) -> str:
-        selected = (
-            self.table.selectionModel().selectedRows()
-            if self.table.selectionModel()
-            else []
-        )
-        if not selected:
-            return ""
-        return self._cell_text(selected[0].row(), 0)
-
-    def _show_target_help(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
-
-        text = (
-            "Auto — цель подбирается из модели/GPU (Balanced / Low VRAM / Max Speed).\n"
-            "Balanced — скорость + стабильность + запас памяти.\n"
-            "Max Speed — приоритет tok/s.\n"
-            "Low VRAM — экономия видеопамяти.\n"
-            "Quality KV — качественный KV-кэш (f16/q8).\n"
-            "MoE Optimized — агрессивнее CPU-offload экспертов MoE."
-        )
-        QMessageBox.information(self, "AutoTune Target", text)
-
-    def _coerce_param_value(self, key: str, value: str, old_value: object) -> object:
-        text = str(value).strip()
-        if key in {"flash_attn", "use_mmproj"}:
-            return text.lower() in {"1", "true", "yes", "on"}
-        if key in _INT_PARAM_KEYS:
-            if text.lower() in {"auto", "all"} and key == "ngl":
-                return text.lower()
-            try:
-                return int(text)
-            except ValueError:
-                return old_value
-        return text
-
-    def apply_table_edits_to_plan(self, plan: AutoTunePlan) -> AutoTunePlan:
-        """Copies edited table cells back into AutoTunePlan candidates."""
-        by_id = {candidate.id: candidate for candidate in plan.candidates}
-        changed = 0
-        for row in range(self.table.rowCount()):
-            cid = self._cell_text(row, 0)
-            candidate = by_id.get(cid)
-            if not candidate:
-                continue
-            for col, key in _PARAM_COLUMNS.items():
-                old_value = candidate.params.get(key, "")
-                new_value = self._coerce_param_value(
-                    key, self._cell_text(row, col), old_value
-                )
-                if new_value != old_value:
-                    candidate.params[key] = new_value
-                    changed += 1
-        if changed:
-            self.append_activity(f"Applied {changed} edited plan value(s)")
-        return plan
-
-    def _fill_candidate_row(self, row: int, candidate: BenchmarkCandidate) -> None:
-        p = candidate.params
-        values = [
-            candidate.id,
-            "pending",
-            "",  # score
-            "",  # %Best
-            "",  # ΔTG
-            "",  # prompt tok/s
-            "",  # gen tok/s
-            "",  # load sec
-            "",  # VRAM
-            "",  # RAM
-            f"{p.get('_estimated_vram_gib', 0):.2f} GiB"
-            if p.get("_estimated_vram_gib")
-            else "",
-            p.get("_risk", ""),
-            p.get("ngl", ""),
-            p.get("ncmoe", ""),
-            p.get("cache_type_k", ""),
-            p.get("cache_type_v", ""),
-            p.get("batch_size", ""),
-            p.get("ubatch_size", ""),
-            p.get("threads", ""),
-            p.get("threads_batch", ""),
-            p.get("parallel_slots", ""),
-            p.get("flash_attn", ""),
-            p.get("use_mmproj", ""),
-            p.get("ctx_checkpoints", ""),
-            p.get("cache_ram", ""),
-            candidate.reason,
-        ]
-        for col, value in enumerate(values):
-            if col in (14, 15):
-                self._set_combo_cell(row, col, value, _QUANT_CHOICES)
-            elif col in (21, 22):
-                self._set_combo_cell(row, col, value, _BOOL_CHOICES)
-            elif col in _PARAM_COLUMNS and _PARAM_COLUMNS[col] in _INT_PARAM_KEYS:
-                if not self._set_spin_cell(row, col, _PARAM_COLUMNS[col], value):
-                    self._set_item(row, col, value, editable=True)
-            else:
-                self._set_item(row, col, value, editable=col in _PARAM_COLUMNS)
-        self._apply_row_color(row, "pending")
-
-    def _ensure_candidate_row(self, candidate: BenchmarkCandidate) -> int:
-        row = self._row_by_id.get(candidate.id)
-        if row is not None:
-            return row
+    def add_result(self, result: CandidateResult) -> None:
+        c = result.candidate
+        m = result.metrics
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self._row_by_id[candidate.id] = row
-        self._fill_candidate_row(row, candidate)
-        self._total_runs = max(self._total_runs, self.table.rowCount())
-        return row
-
-    def mark_running(self, candidate: BenchmarkCandidate) -> None:
-        row = self._ensure_candidate_row(candidate)
-        p = candidate.params
-        self._current_run_id = candidate.id
-        self._current_run_started_at = time.monotonic()
-        self.current_run_label.setText(
-            "Current: "
-            f"{candidate.id} | KV {p.get('cache_type_k')}/{p.get('cache_type_v')} | "
-            f"ngl={p.get('ngl')} | b={p.get('batch_size')} ub={p.get('ubatch_size')} | "
-            f"t={p.get('threads')} ncmoe={p.get('ncmoe')}"
-        )
-        self.append_activity(
-            f"START {candidate.id}: ngl={p.get('ngl')}, KV {p.get('cache_type_k')}/{p.get('cache_type_v')}, "
-            f"batch={p.get('batch_size')}, ubatch={p.get('ubatch_size')}, threads={p.get('threads')}"
-        )
-        self._update_time_labels()
-        self._set_item(row, 1, "running")
-        self._apply_row_color(row, "running")
-        self.table.selectRow(row)
-        self.table.scrollToItem(self.table.item(row, 0))
-
-    def update_result(self, result: BenchmarkResult) -> None:
-        row = self._row_by_id.get(result.candidate_id)
-        if row is None:
-            return
-        # Сохраняем для вычисления %Best и ΔTG
-        if result.status == "success":
-            self._scores[result.candidate_id] = result.score
-            self._gen_tg[result.candidate_id] = result.generation_tok_s
-        else:
-            self._scores.pop(result.candidate_id, None)
-            self._gen_tg.pop(result.candidate_id, None)
-        values = {
-            1: result.status,
-            2: f"{result.score:.3f}",
-            5: f"{result.prompt_tok_s:.1f}",
-            6: f"{result.generation_tok_s:.1f}",
-            7: f"{result.load_time_sec:.1f}",
-            8: f"{result.vram_used_mib:.0f}",
-            9: f"{result.ram_used_mib:.0f}",
-            25: result.error,
-        }
-        for col, value in values.items():
+        key = c.key()
+        self._row_by_key[key] = row
+        placement = f"ncmoe={c.ncmoe}" if c.ncmoe is not None else f"ngl={c.ngl}"
+        values = [
+            row + 1,
+            result.status.value,
+            result.phase,
+            f"{result.score:.3f}" if result.score is not None else "",
+            c.ctx,
+            placement,
+            f"{c.kv_k}/{c.kv_v}",
+            f"{c.batch}/{c.ubatch}",
+            f"{c.threads}/{c.threads_batch}",
+            f"{c.mtp_n_max}/{c.mtp_p_min:g}" if c.mtp else "off",
+            "on" if c.vision else "off",
+            f"{m.pp_tps:.1f}" if m.pp_tps else "",
+            f"{m.tg_tps:.1f}" if m.tg_tps else "",
+            f"{m.vram_peak_mb:.0f}" if m.vram_peak_mb else "",
+            m.vram_operating_class or "",
+            result.reason,
+        ]
+        for col, value in enumerate(values):
             self._set_item(row, col, value)
-        self._refresh_deltas()
-        self.append_activity(
-            f"DONE {result.candidate_id}: {result.status}, "
-            f"PP={result.prompt_tok_s:.1f}, TG={result.generation_tok_s:.1f}, score={result.score:.3f}"
-            + (f", error={result.error}" if result.error else "")
-        )
         self._apply_row_color(row, result.status)
+        self.table.scrollToBottom()
 
-    def _refresh_deltas(self) -> None:
-        """Пересчитывает %Best (колонка 3) и ΔTG (колонка 4) для всех строк."""
-        if not self._scores:
+    # ------------------------------------------------------------ profiles
+
+    def _clear_profiles_panel(self) -> None:
+        while self.profiles_layout.count():
+            child = self.profiles_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.profiles_layout.addWidget(self.profiles_placeholder)
+        self.profiles_placeholder.setVisible(True)
+
+    def show_session_result(self, status: str, stop_reason: str, profiles: List[LaunchProfile],
+                             elapsed_seconds: float, output_dir: str) -> None:
+        self._profiles = list(profiles)
+        self._last_output_dir = output_dir
+        self.open_results_btn.setEnabled(bool(output_dir))
+        self.status_label.setText(
+            f"Session {status} ({stop_reason}) | {self._done_runs} candidates | "
+            f"{elapsed_seconds:.0f}s | results: {output_dir}"
+        )
+        self._clear_profiles_panel()
+        if not profiles:
+            self.profiles_placeholder.setText("No stable profile found. Check the log for details.")
             return
-        max_score = (
-            max(v for v in self._scores.values() if v > 0)
-            if any(v > 0 for v in self._scores.values())
-            else None
+        self.profiles_placeholder.setVisible(False)
+        by_name = {p.name: p for p in profiles}
+        ordered = [by_name[n] for n in _PROFILE_ORDER if n in by_name]
+        ordered += [p for p in profiles if p.name not in _PROFILE_ORDER]
+        for profile in ordered:
+            self.profiles_layout.addWidget(self._build_profile_card(profile))
+
+    def _build_profile_card(self, profile: LaunchProfile) -> QGroupBox:
+        m = profile.result.metrics
+        title = profile.name + (" (provisional)" if profile.provisional else "")
+        card = QGroupBox(title)
+        card_layout = QVBoxLayout(card)
+
+        purpose = _PROFILE_PURPOSES.get(profile.name, profile.rationale)
+        purpose_label = QLabel(purpose)
+        purpose_label.setWordWrap(True)
+        card_layout.addWidget(purpose_label)
+
+        summary = QLabel(
+            f"Confidence: {profile.confidence} | ctx={profile.candidate.ctx} | "
+            f"PP={m.pp_tps:.1f} t/s | TG={m.tg_tps:.1f} t/s | VRAM class: {m.vram_operating_class or 'n/a'}"
+            if m.pp_tps and m.tg_tps
+            else f"Confidence: {profile.confidence}"
         )
-        max_tg = (
-            max(v for v in self._gen_tg.values() if v > 0)
-            if any(v > 0 for v in self._gen_tg.values())
-            else None
+        summary.setWordWrap(True)
+        card_layout.addWidget(summary)
+
+        command_label = QLabel(" ".join(profile.command))
+        command_label.setWordWrap(True)
+        command_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        command_label.setStyleSheet(
+            "font-family: Consolas, monospace; background-color: #1e1e1e; color: #d4d4d4; "
+            "padding: 6px; border-radius: 4px;"
         )
-        for cid, row in self._row_by_id.items():
-            if cid in self._scores and max_score and max_score > 0:
-                pct = (self._scores[cid] / max_score) * 100.0
-                self._set_item(row, 3, f"{pct:.0f}%")
-            else:
-                self._set_item(row, 3, "")
-            if cid in self._gen_tg and max_tg and max_tg > 0:
-                delta = self._gen_tg[cid] - max_tg
-                self._set_item(row, 4, f"{delta:+.1f}")
-            else:
-                self._set_item(row, 4, "")
+        card_layout.addWidget(command_label)
 
-    def show_best(
-        self,
-        best: Optional[BenchmarkResult],
-        params: Dict[str, object],
-        output_dir: str,
-    ) -> None:
-        self._timer.stop()
-        self.progress_bar.setRange(0, max(self._total_runs, 1))
-        self.progress_bar.setValue(self._done_runs)
-        self.progress_bar.setFormat(
-            f"{self.progress_bar.value()}/{max(self._total_runs, 1)} runs"
-        )
-        self.current_run_label.setText(
-            f"Finished. Results folder: {output_dir}" if output_dir else "Finished"
-        )
-        self._update_time_labels(finished=True)
-        if not best:
-            self.best_text.setPlainText(
-                f"No successful result. Results folder: {output_dir}"
-            )
-            self.apply_best_btn.setEnabled(False)
-            self.save_best_btn.setEnabled(False)
-            return
-        self.apply_best_btn.setEnabled(True)
-        self.save_best_btn.setEnabled(True)
+        apply_btn = QPushButton(f"Apply {profile.name}")
+        apply_btn.clicked.connect(lambda: self.apply_requested.emit(profile.name))
+        card_layout.addWidget(apply_btn)
+        return card
 
-        # Вычисляем сравнение с baseline (первый успешный кандидат)
-        baseline_tg = None
-        for cid, row in sorted(self._row_by_id.items(), key=lambda x: x[1]):
-            if cid in self._gen_tg and self._gen_tg[cid] > 0:
-                baseline_tg = self._gen_tg.get(cid)
-                break
+    def profile_by_name(self, name: str) -> Optional[LaunchProfile]:
+        for profile in self._profiles:
+            if profile.name == name:
+                return profile
+        return None
 
-        verified = str(best.candidate_id).startswith("verify_")
-        risk = str(params.get("_risk") or "").strip()
-        confidence = "verified repeat" if verified else "single run"
-        if risk:
-            confidence += f", resource risk: {risk}"
-
-        lines = [
-            "Best result",
-            "━━━━━━━━━━━━━━━━",
-            f"Run: {best.candidate_id}",
-            f"Score: {best.score:.3f}",
-            f"Prompt: {best.prompt_tok_s:.1f} tok/s",
-            f"Generation: {best.generation_tok_s:.1f} tok/s",
-            f"Load: {best.load_time_sec:.1f} sec",
-            f"VRAM: {best.vram_used_mib:.0f} MiB",
-            f"RAM: {best.ram_used_mib:.0f} MiB",
-            f"Confidence: {confidence}",
-            "",
-            "Why selected:",
-            "- highest target-specific score among successful candidates",
-            "- no detected OOM/crash",
-            "- verified repeat completed"
-            if verified
-            else "- stable llama-bench completion",
-        ]
-        if baseline_tg and baseline_tg > 0:
-            imp = ((best.generation_tok_s / baseline_tg) - 1.0) * 100.0
-            lines.append(f"- TG improvement vs baseline: {imp:+.1f}%")
-        lines += [
-            "",
-            "Parameters:",
-        ]
-        for key, value in params.items():
-            if str(key).startswith("_"):
-                continue
-            lines.append(f"- {key}: {value}")
-        lines.append(f"\nResults folder: {output_dir}")
-        self.best_text.setPlainText("\n".join(lines))
-
-    def prepare_run(self, total: int, launch_timeout_sec: int) -> None:
-        self._done_runs = 0
-        self._total_runs = max(int(total), 1)
-        self._launch_timeout_sec = max(int(launch_timeout_sec), 0)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, self._total_runs)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat(f"0/{self._total_runs} runs")
-        self.progress_summary.setText(
-            f"Prepared: 0/{self._total_runs} runs. Launch timeout: {self._format_duration(self._launch_timeout_sec)}."
-        )
-
-    def append_activity(self, text: str) -> None:
-        if not text:
-            return
-        stamp = time.strftime("%H:%M:%S")
-        self.activity_log.append(f"[{stamp}] {text}")
-
-    def _format_duration(self, seconds: float) -> str:
-        seconds = max(int(seconds), 0)
-        minutes, sec = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}h {minutes:02d}m {sec:02d}s"
-        if minutes:
-            return f"{minutes}m {sec:02d}s"
-        return f"{sec}s"
-
-    def _update_time_labels(self, finished: bool = False) -> None:
-        now = time.monotonic()
-        total_elapsed = now - self._run_started_at if self._run_started_at else 0
-        current_elapsed = (
-            now - self._current_run_started_at if self._current_run_started_at else 0
-        )
-        remaining = max(self._total_runs - self._done_runs, 0)
-        if self._done_runs > 0 and total_elapsed > 0:
-            avg = total_elapsed / self._done_runs
-            eta = avg * remaining
-            eta_text = self._format_duration(eta)
-        elif self._launch_timeout_sec and remaining:
-            eta_text = (
-                f"up to {self._format_duration(self._launch_timeout_sec * remaining)}"
-            )
-        else:
-            eta_text = "estimating"
-
-        prefix = "Finished" if finished else "Running"
-        self.progress_summary.setText(
-            f"{prefix}: {self._done_runs}/{max(self._total_runs, 1)} runs | "
-            f"elapsed {self._format_duration(total_elapsed)} | "
-            f"current {self._current_run_id or '-'} {self._format_duration(current_elapsed)} | "
-            f"ETA {eta_text}"
-        )
-
-    def set_progress(self, done: int, total: int) -> None:
-        total = max(int(total), 1)
-        done = max(0, min(int(done), total))
-        self._done_runs = done
-        self._total_runs = total
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, total)
-        self.progress_bar.setValue(done)
-        percent = int((done / total) * 100) if total else 0
-        self.progress_bar.setFormat(f"{done}/{total} runs ({percent}%)")
-        self.status_label.setText(f"AutoTune running: {done}/{total}")
-        self._update_time_labels()
+    def last_output_dir(self) -> str:
+        return self._last_output_dir

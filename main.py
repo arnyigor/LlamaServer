@@ -38,10 +38,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from src.core.benchmark_plan import build_autotune_plan
 from src.core.cli_builder import build_args, merge_extra_args
 from src.core.cli_parser import parse_llama_server_command
-from src.core.config import ConfigManager
+from src.core.config import ConfigManager, candidate_to_settings_values
 from src.core.diagnostics import (
     analyze_server_failure,
     consume_previous_native_crash,
@@ -85,6 +84,7 @@ from src.core.runtime_stats import RuntimeStatsController, format_runtime_stats_
 from src.core.server_launch import ServerLaunchController
 from src.core.server_manager import ServerManager
 from src.core.vram_estimator import full_vram_estimate
+from llama_autotuner.session import SessionConfig
 from src.services.autotune_manager import AutoTuneManager
 from src.services.hf_download_coordinator import HfDownloadCoordinator
 from src.services.integration_manager import IntegrationManager
@@ -125,12 +125,8 @@ class LlamaGUI:
         self.hf.task_finished.connect(self._on_hf_task_finished)
         self.hf_scan_result = None
         self.autotune = None
-        self.autotune_plan = None
-        self.autotune_results_dir = ""
-        self.autotune_best_result = None
-        self._autotune_best_applied = False
         self._autotune_running = False
-        self._autotune_plan_signature = None
+        self.autotune_session_result = None
         # Координация запуска (отложенные рестарты, env) — в контроллере.
         self.launcher = ServerLaunchController()
         self._pending_server_verify = None
@@ -311,13 +307,9 @@ class LlamaGUI:
         u.add_preset_btn.clicked.connect(self.add_preset)
         u.delete_preset_btn.clicked.connect(self.delete_preset)
         u.save_preset_btn.clicked.connect(self.save_preset)
-        u.autotune.build_plan_requested.connect(self.build_autotune_plan)
         u.autotune.start_requested.connect(self.start_autotune)
         u.autotune.cancel_requested.connect(self.cancel_autotune)
-        u.autotune.apply_best_requested.connect(self.apply_autotune_best)
-        u.autotune.apply_selected_requested.connect(self.apply_autotune_selected)
-        u.autotune.save_best_requested.connect(self.save_autotune_best_preset)
-        u.autotune.export_report_requested.connect(self.show_autotune_report_path)
+        u.autotune.apply_requested.connect(self.apply_autotune_profile)
         u.autotune.open_results_requested.connect(self.open_autotune_results_folder)
         u.ctx_help_btn.clicked.connect(
             lambda: self._show_parameter_help(
@@ -1322,24 +1314,12 @@ class LlamaGUI:
             )
             return
 
-        autotune_params = None
-        if (
-            self._autotune_best_applied
-            and self.autotune_plan
-            and self.autotune_best_result
-            and os.path.normcase(os.path.abspath(self.autotune_plan.model_path))
-            == os.path.normcase(os.path.abspath(model_path))
-            and int(self.autotune_plan.ctx_size) == int(ctx)
-        ):
-            autotune_params = self._best_autotune_params()
-
         try:
             preset_name = self._current_perf_preset_name()
             self.config.save_perf_preset(
                 model_path,
                 ctx,
                 self.ui,
-                autotune_params=autotune_params,
                 preset_name=preset_name,
             )
         except ValueError as e:
@@ -2580,7 +2560,6 @@ class LlamaGUI:
         ):
             return
 
-        self._autotune_best_applied = False
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if not info:
             return
@@ -2648,7 +2627,6 @@ class LlamaGUI:
         ):
             return
 
-        self._autotune_best_applied = False
         info = self.ui.models_by_path.get(self.ui.model_combo.currentData())
         if info:
             self._refresh_tooltips(info)
@@ -2814,7 +2792,6 @@ class LlamaGUI:
         finally:
             self._applying_cli = False
 
-        self._autotune_best_applied = False
         self._mark_preset_modified()
         self.update_cli_preview(force=False)
         self.save_settings()
@@ -3705,65 +3682,6 @@ class LlamaGUI:
             self.ui.models_by_path[model_path] = info
         return info
 
-    def _current_autotune_plan_signature(self, options=None):
-        if options is None:
-            options = self.ui.autotune.options()
-        model_path = self._current_model_path() or ""
-        return (
-            os.path.normcase(os.path.abspath(model_path)) if model_path else "",
-            int(self.ui.ctx_size.value()),
-            bool(self.ui.gpu_auto.isChecked()),
-            int(self.ui.gpu_layers.value()),
-            int(self.ui.cpu_moe_layers.value()),
-            int(self.ui.threads.value()),
-            int(self.ui.threads_batch.value()),
-            str(self.ui.cache_type_k.currentText()),
-            str(self.ui.cache_type_v.currentText()),
-            int(self.ui.batch_size.value()),
-            int(self.ui.ubatch_size.value()),
-            int(self.ui.parallel_slots.value()),
-            bool(self.ui.flash_attn.isChecked()),
-            bool(self.ui.use_mmproj.isChecked()),
-            int(self.ui.ctx_checkpoints.value()),
-            int(self.ui.cache_ram.value()),
-            int(self.ui.bench_prompt.value()),
-            int(self.ui.bench_gen.value()),
-            tuple(sorted((str(k), repr(v)) for k, v in options.items())),
-        )
-
-    def build_autotune_plan(self):
-        model_path = self._current_model_path()
-        if not model_path:
-            QMessageBox.warning(self.ui, "AutoTune", "Select a GGUF model first")
-            return None
-        self.config.read_from_ui(self.ui)
-        options = self.ui.autotune.options()
-        plan = build_autotune_plan(
-            self.config.settings,
-            model_path,
-            self._current_model_info(),
-            mode=options["mode"],
-            target=options["target"],
-            engine=options["engine"],
-            time_budget_sec=options["time_budget_sec"],
-            max_runs=options["max_runs"],
-            repeat_top=options["repeat_top"],
-            early_stop_on_peak=bool(options.get("early_stop_on_peak", False)),
-        )
-        self.autotune_plan = plan
-        self._autotune_plan_signature = self._current_autotune_plan_signature(options)
-        self.autotune_best_result = None
-        self._autotune_best_applied = False
-        self.autotune_results_dir = ""
-        self.ui.autotune.set_plan(plan)
-        if not self.ui.bench_panel.toggle_btn.isChecked():
-            self.ui.bench_panel.toggle_btn.setChecked(True)
-            self.ui.bench_panel.toggle_visibility()
-        self.log_mgr.append(
-            f"AutoTune plan built: {len(plan.candidates)} candidates | ctx={plan.ctx_size:,} | {plan.mode}/{plan.target}"
-        )
-        return plan
-
     def _external_llama_processes(self):
         """Ищет orphan/external llama.cpp процессы, которые ломают benchmark."""
         if not sys.platform.startswith("win"):
@@ -3826,56 +3744,51 @@ class LlamaGUI:
             return
         if self.autotune and self.autotune.isRunning():
             return
-        bexe = self.auto_detect_bench()
-        if not bexe or not os.path.exists(bexe):
+        model_path = self._current_model_path()
+        if not model_path:
+            QMessageBox.warning(self.ui, "AutoTune", "Select a GGUF model first")
+            return
+        server_exe = self._resolve_llamacpp_executable("server")
+        if not server_exe or not os.path.exists(server_exe):
             QMessageBox.critical(
                 self.ui,
                 "AutoTune",
-                "llama-bench.exe was not found in the selected CUDA build folder.",
+                "Select llama.cpp base folder with the requested CUDA build.",
             )
             return
+
         options = self.ui.autotune.options()
-        current_signature = self._current_autotune_plan_signature(options)
-        plan = self.autotune_plan
-        if not plan or self._autotune_plan_signature != current_signature:
-            plan = self.build_autotune_plan()
-        if not plan:
-            return
-        plan = self.ui.autotune.apply_table_edits_to_plan(plan)
-        self.autotune_plan = plan
-        self._autotune_plan_signature = current_signature
-        plan.early_stop_on_peak = bool(options.get("early_stop_on_peak", False))
-        if str(options.get("engine", "llama-bench")) == "llama-server":
-            QMessageBox.information(
-                self.ui,
-                "AutoTune",
-                "Server AutoTune is planned for a later version. MVP uses llama-bench.",
-            )
-            return
-        self.ui.autotune.clear_results()
-        self.ui.autotune.set_plan(plan)
-        self.autotune_best_result = None
-        self._autotune_best_applied = False
-        self.autotune_results_dir = ""
-        self.autotune = AutoTuneManager(
-            bexe,
-            plan,
-            model_info=self._current_model_info(),
-            prompt_tokens=self.ui.bench_prompt.value(),
-            generation_tokens=self.ui.bench_gen.value(),
-            launch_timeout_sec=options["launch_timeout_sec"],
+        config = SessionConfig(
+            server_exe=server_exe,
+            model_path=model_path,
+            ctx=int(options["ctx"]),
+            vision=options["vision"],
+            mmproj=options["mmproj"],
+            mode=options["mode"],
+            priority=options["priority"],
+            kv_k=options["kv_k"],
+            kv_v=options["kv_v"],
+            degradation_policy=options["degradation_policy"],
+            allow_kv_degradation=bool(options["allow_kv_degradation"]),
+            allow_context_reduction=bool(options["allow_context_reduction"]),
+            min_tg_tps=options["min_tg_tps"],
+            min_pp_tps=options["min_pp_tps"],
+            mtp_mode=options["mtp_mode"],
+            vram_margin_mb=int(options["vram_margin_mb"]),
+            require_vram_margin=bool(options["require_vram_margin"]),
+            absolute_vram_floor_mb=int(options["absolute_vram_floor_mb"]),
+            max_minutes=options["max_minutes"],
+            max_runs=options["max_runs"],
+            runtime_args=list(options["runtime_args"]),
         )
-        self.ui.autotune.prepare_run(
-            len(plan.candidates), options["launch_timeout_sec"]
-        )
+        self.autotune_session_result = None
+        self.ui.autotune.mark_started(config.max_runs or 0)
+        self.autotune = AutoTuneManager(config)
         self.autotune.log.connect(lambda text, level: self.log_mgr.append(text, level))
-        self.autotune.log.connect(
-            lambda text, _level: self.ui.autotune.append_activity(text)
-        )
+        self.autotune.result_ready.connect(self.ui.autotune.add_result)
         self.autotune.progress.connect(self.ui.autotune.set_progress)
-        self.autotune.run_started.connect(self.ui.autotune.mark_running)
-        self.autotune.run_finished.connect(self.ui.autotune.update_result)
-        self.autotune.autotune_finished.connect(self._on_autotune_finished)
+        self.autotune.session_finished.connect(self._on_autotune_finished)
+        self.autotune.session_failed.connect(self._on_autotune_failed)
         self.autotune.finished.connect(self.update_action_buttons)
         self._autotune_running = True
         self.ui.autotune.set_running(True)
@@ -3887,520 +3800,91 @@ class LlamaGUI:
             self.log_mgr.append("AutoTune cancel requested", "warn")
             self.autotune.cancel()
 
-    def _best_autotune_params(self):
-        return self._autotune_params_for_result(self.autotune_best_result)
-
-    def _autotune_params_for_result(self, result):
-        if not self.autotune_plan or not result:
-            return {}
-        for candidate in self.autotune_plan.candidates:
-            if candidate.id == result.candidate_id:
-                params = dict(candidate.params)
-                if str(params.get("ngl", "")).strip().lower() == "auto":
-                    info = self._current_model_info()
-                    block_count = int(info.get("block_count") or 0)
-                    params["ngl"] = block_count if block_count > 0 else 99
-                return params
-        return {}
-
-    def _autotune_result_by_id(self, candidate_id: str):
-        if not candidate_id:
-            return None
-        if (
-            self.autotune_best_result
-            and self.autotune_best_result.candidate_id == candidate_id
-        ):
-            return self.autotune_best_result
-        if self.autotune:
-            for result in getattr(self.autotune, "results", []) or []:
-                if result.candidate_id == candidate_id:
-                    return result
-        return None
-
-    def _autotune_apply_diff_lines(self, params: dict) -> list[str]:
-        fields = [
-            (
-                "Context",
-                str(self.ui.ctx_size.value()),
-                str(params.get("ctx_size", self.ui.ctx_size.value())),
-            ),
-            (
-                "GPU layers",
-                "auto"
-                if self.ui.gpu_auto.isChecked()
-                else str(self.ui.gpu_layers.value()),
-                str(params.get("ngl", self.ui.gpu_layers.value())),
-            ),
-            (
-                "KV K",
-                self.ui.cache_type_k.currentText(),
-                str(params.get("cache_type_k", self.ui.cache_type_k.currentText())),
-            ),
-            (
-                "KV V",
-                self.ui.cache_type_v.currentText(),
-                str(params.get("cache_type_v", self.ui.cache_type_v.currentText())),
-            ),
-            (
-                "Batch",
-                str(self.ui.batch_size.value()),
-                str(params.get("batch_size", self.ui.batch_size.value())),
-            ),
-            (
-                "UBatch",
-                str(self.ui.ubatch_size.value()),
-                str(params.get("ubatch_size", self.ui.ubatch_size.value())),
-            ),
-            (
-                "Threads",
-                str(self.ui.threads.value()),
-                str(params.get("threads", self.ui.threads.value())),
-            ),
-            (
-                "Threads batch",
-                str(self.ui.threads_batch.value()),
-                str(params.get("threads_batch", self.ui.threads_batch.value())),
-            ),
-            (
-                "Slots",
-                str(self.ui.parallel_slots.value()),
-                str(params.get("parallel_slots", self.ui.parallel_slots.value())),
-            ),
-            (
-                "CPU MoE",
-                str(self.ui.cpu_moe_layers.value()),
-                str(params.get("ncmoe", self.ui.cpu_moe_layers.value())),
-            ),
-            (
-                "MTP",
-                "on" if self.ui.speculative_mtp.isChecked() else "off",
-                "on"
-                if bool(
-                    params.get("speculative_mtp", self.ui.speculative_mtp.isChecked())
-                )
-                else "off",
-            ),
-            (
-                "MTP n-max",
-                str(self.ui.spec_draft_n_max.value()),
-                str(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value())),
-            ),
-            (
-                "Flash Attention",
-                "on" if self.ui.flash_attn.isChecked() else "off",
-                "on"
-                if bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))
-                else "off",
-            ),
-            (
-                "Fit",
-                "off" if self.ui.fit_off.isChecked() else "auto",
-                "off"
-                if bool(params.get("fit_off", self.ui.fit_off.isChecked()))
-                else "auto",
-            ),
-        ]
-        lines = []
-        for label, current, best in fields:
-            if current != best:
-                lines.append(f"{label}: {current} -> {best}")
-        if params.get("_estimated_vram_gib"):
-            risk = str(params.get("_risk") or "unknown")
-            pct = float(params.get("_vram_pct") or 0.0)
-            lines.append(
-                f"Estimated VRAM: {float(params['_estimated_vram_gib']):.2f} GiB"
-                + (f" ({pct:.1f}%, {risk})" if pct else f" ({risk})")
-            )
-        if self.autotune_best_result:
-            lines.append(
-                f"Benchmark: TG {self.autotune_best_result.generation_tok_s:.1f} tok/s, "
-                f"PP {self.autotune_best_result.prompt_tok_s:.1f} tok/s, "
-                f"score {self.autotune_best_result.score:.3f}"
-            )
-        return lines or ["No setting changes; best result already matches the UI."]
-
-    def _confirm_apply_autotune_best(self, params: dict) -> bool:
-        lines = self._autotune_apply_diff_lines(params)
-        text = "Apply AutoTune best result?\n\n" + "\n".join(lines[:22])
-        if len(lines) > 22:
-            text += f"\n... and {len(lines) - 22} more"
-        reply = QMessageBox.question(
-            self.ui,
-            "Apply AutoTune Best",
-            text,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        return reply == QMessageBox.StandardButton.Yes
-
-    def _on_autotune_finished(self, best, output_dir):
-        self.autotune_best_result = best
-        self.autotune_results_dir = output_dir
+    def _on_autotune_finished(self, session_result):
+        self.autotune_session_result = session_result
         self._autotune_running = False
         self.ui.autotune.set_running(False)
-        self.ui.autotune.show_best(best, self._best_autotune_params(), output_dir)
-        if best:
+        self.ui.autotune.show_session_result(
+            session_result.status,
+            session_result.stop_reason,
+            session_result.profiles,
+            session_result.elapsed_seconds,
+            str(session_result.output_dir),
+        )
+        if session_result.profiles:
             self.log_mgr.append(
-                f"AutoTune finished: best={best.candidate_id}, score={best.score:.3f}, results={output_dir}"
+                f"AutoTune finished: {session_result.status}, "
+                f"{len(session_result.profiles)} profile(s), results={session_result.output_dir}"
             )
             self.log_mgr.append(
-                "Review the best result, then click Apply Best to update the UI.",
-                "info",
+                "Review the profiles, then click Apply on the one you want.", "info"
             )
         else:
             self.log_mgr.append(
-                f"AutoTune finished: no successful result, results={output_dir}", "warn"
+                f"AutoTune finished: {session_result.status}, no stable profile, "
+                f"results={session_result.output_dir}",
+                "warn",
             )
         self.update_action_buttons()
 
-    def apply_autotune_best(self, silent=False):
-        params = self._best_autotune_params()
-        if not params:
-            if not silent:
-                QMessageBox.warning(self.ui, "AutoTune", "No best result to apply")
-            return False
+    def _on_autotune_failed(self, message: str):
+        self._autotune_running = False
+        self.ui.autotune.set_running(False)
+        self.ui.autotune.show_error(message)
+        self.log_mgr.append(f"AutoTune failed: {message}", "error")
+        self.update_action_buttons()
+        QMessageBox.critical(self.ui, "AutoTune", message)
 
-        if not silent and not self._confirm_apply_autotune_best(params):
-            return False
+    def apply_autotune_profile(self, profile_name: str):
+        profile = self.ui.autotune.profile_by_name(profile_name)
+        if not profile:
+            QMessageBox.warning(self.ui, "AutoTune", "Profile not available")
+            return
+        reply = QMessageBox.question(
+            self.ui,
+            "Apply AutoTune profile",
+            f"Apply {profile_name}?\n\n" + " ".join(profile.command),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
-        # Убеждаемся что ngl — число, не "auto", для reproducibility
-        ngl_raw = params.get("ngl", "auto")
-        if str(ngl_raw).strip().lower() == "auto":
-            info = self._current_model_info()
-            block_count = int(info.get("block_count") or 0)
-            ngl_val = block_count if block_count > 0 else 99
-            params["ngl"] = ngl_val
-        else:
-            ngl_val = int(ngl_raw)
-
+        values = candidate_to_settings_values(profile.candidate)
         self._loading_preset = True
         try:
-            self.ui.gpu_auto.setChecked(False)
-            self.ui.gpu_layers.setValue(ngl_val)
-            self.ui.ctx_size.setValue(
-                int(params.get("ctx_size", self.ui.ctx_size.value()))
-            )
-            self.ui.batch_size.setValue(
-                int(params.get("batch_size", self.ui.batch_size.value()))
-            )
-            self.ui.ubatch_size.setValue(
-                int(params.get("ubatch_size", self.ui.ubatch_size.value()))
-            )
-            self.ui.cache_type_k.setCurrentText(
-                str(params.get("cache_type_k", self.ui.cache_type_k.currentText()))
-            )
-            self.ui.cache_type_v.setCurrentText(
-                str(params.get("cache_type_v", self.ui.cache_type_v.currentText()))
-            )
-            self.ui.threads.setValue(
-                int(params.get("threads", self.ui.threads.value()))
-            )
-            self.ui.threads_batch.setValue(
-                int(params.get("threads_batch", self.ui.threads_batch.value()))
-            )
-            self.ui.parallel_slots.setValue(
-                int(params.get("parallel_slots", self.ui.parallel_slots.value()))
-            )
-            self.ui.kv_unified.setChecked(
-                bool(params.get("kv_unified", self.ui.kv_unified.isChecked()))
-            )
-            self.ui.speculative_mtp.setChecked(
-                bool(params.get("speculative_mtp", self.ui.speculative_mtp.isChecked()))
-            )
-            self.ui.spec_draft_n_max.setValue(
-                int(params.get("spec_draft_n_max", self.ui.spec_draft_n_max.value()))
-            )
-            self.ui.spec_draft_p_min.setValue(
-                float(params.get("spec_draft_p_min", self.ui.spec_draft_p_min.value()))
-            )
-            self.ui.flash_attn.setChecked(
-                bool(params.get("flash_attn", self.ui.flash_attn.isChecked()))
-            )
-            self.ui.fit_off.setChecked(
-                bool(params.get("fit_off", self.ui.fit_off.isChecked()))
-            )
-            self.ui.cpu_moe_layers.setValue(
-                int(params.get("ncmoe", self.ui.cpu_moe_layers.value()))
-            )
-            self.ui.ctx_checkpoints.setValue(
-                int(params.get("ctx_checkpoints", self.ui.ctx_checkpoints.value()))
-            )
-            self.ui.cache_ram.setValue(
-                int(params.get("cache_ram", self.ui.cache_ram.value()))
-            )
-            self.ui.use_mmproj.setChecked(
-                bool(params.get("use_mmproj", self.ui.use_mmproj.isChecked()))
-            )
-
-            # Санитизируем extra_args от флагов, управляемых UI/AutoTune
-            current_extra = self.ui.extra_args.text()
-            if current_extra.strip():
-                from src.core.config import _sanitize_extra_args
-
-                sanitized = _sanitize_extra_args(current_extra)
-                self.ui.extra_args.setText(sanitized)
+            self.config.apply_values_to_ui(self.ui, values)
+            if profile.candidate.extra_args:
+                merged = merge_extra_args(
+                    self.ui.extra_args.text(), " ".join(profile.candidate.extra_args)
+                )
+                self.ui.extra_args.setText(merged)
+                self.config.settings.extra_args = merged
         finally:
             self._loading_preset = False
 
         self.update_cli_preview()
         self._mark_restart_needed()
-        self._autotune_best_applied = True
         self.save_settings()
-        self.log_mgr.append(
-            f"AutoTune best applied: {self.autotune_best_result.candidate_id if self.autotune_best_result else ''}; "
-            f"ngl={ngl_val} KV {params.get('cache_type_k', '?')}/{params.get('cache_type_v', '?')} "
-            f"b={params.get('batch_size', '?')} ub={params.get('ubatch_size', '?')} "
-            f"t={params.get('threads', '?')} tb={params.get('threads_batch', '?')}"
-        )
-        if not silent:
-            options = self.ui.autotune.options()
-            if options.get("verify_server_after_apply"):
-                self._start_or_restart_server_with_verification()
-                QMessageBox.information(
-                    self.ui,
-                    "AutoTune",
-                    "Best parameters applied. Server verification has been started.",
-                )
-            else:
-                QMessageBox.information(
-                    self.ui, "AutoTune", "Best parameters applied to UI"
-                )
-        return True
-
-    def apply_autotune_selected(self, candidate_id: str = ""):
-        result = self._autotune_result_by_id(candidate_id)
-        if not result:
-            QMessageBox.warning(self.ui, "AutoTune", "Select a completed run first")
-            return False
-        if result.status != "success":
-            QMessageBox.warning(
-                self.ui,
-                "AutoTune",
-                f"Selected run is not successful: {result.status}",
-            )
-            return False
-        if not self._autotune_params_for_result(result):
-            QMessageBox.warning(self.ui, "AutoTune", "Selected run has no parameters")
-            return False
-
-        self.autotune_best_result = result
-        self.ui.autotune.show_best(
-            result, self._best_autotune_params(), self.autotune_results_dir
-        )
-        return self.apply_autotune_best(silent=False)
-
-    def _start_or_restart_server_with_verification(self):
-        launch = self._prepare_server_launch()
-        if not launch:
-            return
-        exe, args, env = launch
-        expected_cli = f"{exe} {' '.join(args)}"
-        self._pending_server_verify = {
-            "started_at": time.monotonic(),
-            "attempts": 0,
-            "expected_cli": expected_cli,
-        }
-        self.log_mgr.append(
-            "AutoTune server verification: launching llama-server with applied best params\n"
-            f"   Expected CLI: {expected_cli}",
-            "info",
-        )
-        if self.server.is_server_running():
-            self.launcher.request_restart((exe, args, env))
-            self.server.stop_server()
-        else:
-            self._launch_server(
-                exe, args, env=env, action="Starting verified AutoTune server"
-            )
-        QTimer.singleShot(1200, self._poll_verified_server)
-
-    def _poll_verified_server(self):
-        state = getattr(self, "_pending_server_verify", None)
-        if not state:
-            return
-        state["attempts"] += 1
-        if state["attempts"] > 60:
-            self.log_mgr.append("AutoTune server verification timed out", "warn")
-            self._pending_server_verify = None
-            return
-        if not self.server.is_server_running():
-            QTimer.singleShot(1000, self._poll_verified_server)
-            return
-
-        base_url = self.ui.current_base_url().rstrip("/")
-        try:
-            with urllib.request.urlopen(f"{base_url}/models", timeout=2) as resp:
-                if resp.status >= 400:
-                    raise urllib.error.URLError(f"HTTP {resp.status}")
-            self._send_verified_server_request(base_url, state)
-        except Exception:
-            QTimer.singleShot(1000, self._poll_verified_server)
-
-    def _send_verified_server_request(self, base_url: str, state: dict):
-        payload = json.dumps(
-            {
-                "model": self.ui.current_model_id(),
-                "messages": [{"role": "user", "content": "Reply with OK."}],
-                "max_tokens": 8,
-                "temperature": 0,
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{base_url}/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        started = time.monotonic()
-        try:
-            with urllib.request.urlopen(request, timeout=60) as resp:
-                text = resp.read().decode("utf-8", errors="ignore")
-            elapsed = time.monotonic() - started
-            tokens = 0
-            try:
-                data = json.loads(text)
-                tokens = int(data.get("usage", {}).get("completion_tokens") or 0)
-            except Exception:
-                pass
-            speed = f", ~{tokens / elapsed:.1f} tok/s" if tokens and elapsed > 0 else ""
-            total_elapsed = time.monotonic() - float(state.get("started_at", started))
-            self.log_mgr.append(
-                f"AutoTune server verification OK: test request completed in {elapsed:.1f}s{speed}; "
-                f"server ready after {total_elapsed:.1f}s",
-                "info",
-            )
-
-            # Сравнение benchmark TG с реальной server TG
-            if tokens and elapsed > 0:
-                server_tg = tokens / elapsed
-                bench_tg = (
-                    float(self.autotune_best_result.generation_tok_s)
-                    if self.autotune_best_result
-                    else 0.0
-                )
-                if bench_tg > 0:
-                    ratio = server_tg / bench_tg
-                    if ratio < 0.8:
-                        msg = (
-                            f"⚠️ Server TG ({server_tg:.1f}) is {int((1 - ratio) * 100)}% slower than "
-                            f"benchmark TG ({bench_tg:.1f}). "
-                            f"Consider reviewing KV cache, flash_attn or ctx_checkpoints settings."
-                        )
-                        self.log_mgr.append(msg, "warn")
-                    elif ratio < 0.95:
-                        self.log_mgr.append(
-                            f"📊 Server TG {server_tg:.1f} vs benchmark TG {bench_tg:.1f} "
-                            f"({int(ratio * 100)}% — acceptable difference)",
-                            "info",
-                        )
-                    else:
-                        self.log_mgr.append(
-                            f"✓ Server TG {server_tg:.1f} matches benchmark TG {bench_tg:.1f} "
-                            f"({int(ratio * 100)}% — excellent reproducibility)",
-                            "info",
-                        )
-
-            # Auto-save preset на успешной verification
-            if tokens > 0:
-                try:
-                    model_path = self._current_model_path()
-                    if model_path and self.autotune_best_result and self.autotune_plan:
-                        ctx = self.ui.ctx_size.value()
-                        metadata = {
-                            "source": "autotune_verified",
-                            "run_id": self.autotune_best_result.candidate_id,
-                            "bench_tg": self.autotune_best_result.generation_tok_s,
-                            "server_tg": tokens / elapsed if elapsed > 0 else 0,
-                            "score": self.autotune_best_result.score,
-                            "results_dir": self.autotune_results_dir,
-                        }
-                        self.config.save_perf_preset(
-                            model_path,
-                            ctx,
-                            self.ui,
-                            metadata=metadata,
-                            autotune_params=self._best_autotune_params(),
-                        )
-                        self.log_mgr.append(
-                            f"AutoTune preset auto-saved after verification: ctx={ctx:,}",
-                            "info",
-                        )
-                except Exception as e:
-                    self.log_mgr.append(
-                        f"Auto-save preset failed (non-critical): {e}", "warn"
-                    )
-        except Exception as exc:
-            self.log_mgr.append(
-                f"AutoTune server verification request failed: {exc}", "warn"
-            )
-        finally:
-            self._pending_server_verify = None
+        self.log_mgr.append(f"AutoTune profile applied: {profile_name}")
+        QMessageBox.information(self.ui, "AutoTune", f"{profile_name} applied to UI")
 
     def _reveal_force_stop(self):
         """Показать кнопку Force Stop, если сервер всё ещё запущен."""
         if self.server.is_server_running():
             self.ui.force_stop_btn.setVisible(True)
 
-    def save_autotune_best_preset(self):
-        model_path = self._current_model_path()
-        if not model_path or not self.autotune_best_result:
-            QMessageBox.warning(self.ui, "AutoTune", "No best result to save")
-            return
-        if not self.apply_autotune_best(silent=True):
-            return
-        ctx = self.ui.ctx_size.value()
-        metadata = {
-            "source": "autotune",
-            "run_id": self.autotune_best_result.candidate_id,
-            "score": self.autotune_best_result.score,
-            "prompt_tok_s": self.autotune_best_result.prompt_tok_s,
-            "generation_tok_s": self.autotune_best_result.generation_tok_s,
-            "load_time_sec": self.autotune_best_result.load_time_sec,
-            "vram_used_mib": self.autotune_best_result.vram_used_mib,
-            "ram_used_mib": self.autotune_best_result.ram_used_mib,
-            "results_dir": self.autotune_results_dir,
-        }
-        try:
-            preset_name = self._current_perf_preset_name()
-            self.config.save_perf_preset(
-                model_path,
-                ctx,
-                self.ui,
-                metadata=metadata,
-                autotune_params=self._best_autotune_params(),
-                preset_name=preset_name,
-            )
-        except (ValueError, OSError) as e:
-            QMessageBox.warning(self.ui, "AutoTune", str(e))
-            return
-        self._refresh_perf_preset_names(preset_name)
-        self.log_mgr.append(
-            f"AutoTune preset saved: {preset_name} | {Path(model_path).name} | ctx={ctx:,}"
-        )
-        QMessageBox.information(self.ui, "AutoTune", "Best AutoTune preset saved")
-
-    def show_autotune_report_path(self):
-        if not self.autotune_results_dir:
-            QMessageBox.information(self.ui, "AutoTune", "No report yet")
-            return
-        QMessageBox.information(
-            self.ui,
-            "AutoTune Report",
-            f"results.json and report.md are saved in:\n{self.autotune_results_dir}",
-        )
-
     def open_autotune_results_folder(self):
-        if not self.autotune_results_dir or not os.path.isdir(
-            self.autotune_results_dir
-        ):
+        output_dir = self.ui.autotune.last_output_dir()
+        if not output_dir or not os.path.isdir(output_dir):
             QMessageBox.information(self.ui, "AutoTune", "No results folder yet")
             return
         if sys.platform.startswith("win"):
-            os.startfile(self.autotune_results_dir)  # type: ignore[attr-defined]
+            os.startfile(output_dir)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", self.autotune_results_dir])
+            subprocess.Popen(["open", output_dir])
         else:
-            subprocess.Popen(["xdg-open", self.autotune_results_dir])
+            subprocess.Popen(["xdg-open", output_dir])
 
     def stop_work(self):
         if self.launcher.cancel_pending():
@@ -4514,7 +3998,6 @@ class LlamaGUI:
         )
         self.ui.test_btn.setEnabled(not busy and not upd)
         self.ui.autotune.start_btn.setEnabled(not busy and not upd)
-        self.ui.autotune.build_plan_btn.setEnabled(not busy and not upd)
         self.ui.autotune.cancel_btn.setEnabled(bool(tune))
         if not srv and not self.launcher.is_pending:
             self._reset_restart_indicator()

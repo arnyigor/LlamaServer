@@ -203,67 +203,6 @@ def merge_extra_args(existing: str, incoming: str) -> str:
     return quote_all(tokens)
 
 
-def build_benchmark_args_from_params(
-    model_path: str,
-    params: Dict[str, Any],
-    prompt_tokens: int = 128,
-    generation_tokens: int = 256,
-) -> Optional[List[str]]:
-    """Сборка аргументов llama-bench для одного AutoTune-кандидата."""
-    if not model_path:
-        return None
-
-    args = [
-        "-m",
-        model_path,
-        "-p",
-        str(prompt_tokens),
-        "-n",
-        str(generation_tokens),
-        "-r",
-        "1",
-    ]
-
-    # Важно: llama-bench CLI отличается от llama-server.
-    # В актуальных сборках llama-bench нет -c/-np/--ctx-checkpoints/--cache-ram/--no-mmproj.
-    # Context Size остаётся частью AutoTune-плана/пресета, но в llama-bench проверяется через
-    # выбранные prompt/gen размеры; полный server-context тест будет отдельным server-engine этапом.
-    ngl = params.get("ngl", "auto")
-    ngl_text = str(ngl).strip().lower()
-    args += ["-ngl", "99" if ngl_text in {"auto", "all"} else str(ngl)]
-
-    flash_attn = bool(params.get("flash_attn", True))
-    # Modern llama-bench expects on/off/auto for -fa. Older 1/0 values now
-    # trigger "invalid argument" and break AutoTune before the benchmark starts.
-    args += ["-fa", "on" if flash_attn else "off"]
-
-    args += [
-        "-ctk",
-        str(params.get("cache_type_k", "q8_0")),
-        "-ctv",
-        str(params.get("cache_type_v", "q8_0")),
-    ]
-
-    batch_size = int(params.get("batch_size") or 512)
-    ubatch_size = int(params.get("ubatch_size") or min(batch_size, 512))
-    args += ["-b", str(batch_size), "-ub", str(min(ubatch_size, batch_size))]
-
-    threads = int(params.get("threads") or 0)
-    if threads > 0:
-        args += ["-t", str(threads)]
-
-    # llama-bench has no -tb/--threads-batch in current builds.
-    # threads_batch remains in AutoTune plan/preset metadata for llama-server only.
-    if bool(params.get("verbose", False)):
-        args.append("-v")
-
-    ncmoe = int(params.get("ncmoe", -1))
-    if ncmoe >= 0:
-        args += ["-ncmoe", str(ncmoe)]
-
-    return args
-
-
 def build_args(
     cfg: Any, model_path: str, for_benchmark: bool = False
 ) -> Optional[List[str]]:

@@ -113,7 +113,6 @@ _OLD_MANAGED_EXTRA_FLAGS = {
     "-md",
     "--model-draft",
     "--jinja",
-    "--chat-template-file",
     "--flash-attn",
     "-fa",
     "--fit",

@@ -7,8 +7,11 @@ import os
 import hashlib
 import shlex
 from dataclasses import dataclass, field, asdict, fields
-from typing import Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from llama_autotuner.models import Candidate
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -182,30 +185,6 @@ _PERF_PRESET_FIELDS = (
     "extra_args",
     "enable_thinking",
 )
-
-_AUTOTUNE_PARAM_TO_SETTING = {
-    "ngl": "gpu_layers",
-    "gpu_layers_all": "gpu_layers_all",
-    "batch_size": "batch_size",
-    "ubatch_size": "ubatch_size",
-    "cache_type_k": "cache_type_k",
-    "cache_type_v": "cache_type_v",
-    "threads": "threads",
-    "threads_batch": "threads_batch",
-    "parallel_slots": "parallel_slots",
-    "kv_unified": "kv_unified",
-    "speculative_mtp": "speculative_mtp",
-    "spec_draft_model_path": "spec_draft_model_path",
-    "spec_draft_n_max": "spec_draft_n_max",
-    "spec_draft_p_min": "spec_draft_p_min",
-    "spec_draft_gpu_layers": "spec_draft_gpu_layers",
-    "flash_attn": "flash_attn",
-    "fit_off": "fit_off",
-    "cache_prompt": "cache_prompt",
-    "ctx_checkpoints": "ctx_checkpoints",
-    "cache_ram": "cache_ram",
-    "use_mmproj": "use_mmproj",
-}
 
 # Флаги, которыми управляют UI/AutoTune, и mapping sampling-полей тоже
 # приходят из реестра параметров.
@@ -413,41 +392,42 @@ def _perf_params_from_settings(settings: AppSettings) -> Dict[str, Any]:
     }
 
 
-def _apply_autotune_params_to_perf_params(
-    params: Dict[str, Any], autotune_params: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
-    if not autotune_params:
-        return params
+def candidate_to_settings_values(candidate: "Candidate") -> Dict[str, Any]:
+    """Строит dict полей AppSettings из выбранного Candidate автотюнера.
 
-    merged = dict(params)
-    ngl = autotune_params.get("ngl")
-    if ngl is not None:
-        ngl_text = str(ngl).strip().lower()
-        is_auto = ngl_text == "auto"
-        is_all = ngl_text == "all"
-        merged["gpu_auto"] = is_auto
-        merged["gpu_layers_all"] = is_all
-        if not is_auto and not is_all:
-            merged["gpu_layers"] = int(ngl)
-
-    if "ncmoe" in autotune_params:
-        merged["cpu_moe_layers"] = int(autotune_params["ncmoe"])
-
-    if "ctx_size" in autotune_params:
-        merged["ctx_size"] = int(autotune_params["ctx_size"])
-
-    for source_key, setting_key in _AUTOTUNE_PARAM_TO_SETTING.items():
-        if source_key == "ngl":
-            # ngl already needs special gpu_auto/gpu_layers handling above.
-            # Do not copy literal "auto" into gpu_layers.
-            continue
-        if source_key in autotune_params:
-            merged[setting_key] = autotune_params[source_key]
-
-    # AutoTune не тестирует sampling/reasoning/mmproj-extra args. Но managed extra
-    # flags от старых ручных запусков могут переопределить best preset при старте.
-    merged["extra_args"] = _sanitize_extra_args(merged.get("extra_args", ""))
-    return merged
+    Передаётся в ``apply_values_to_ui()``, которая одновременно обновляет
+    ``self.settings`` и синхронизированные виджеты — единый путь применения,
+    которым также пользуются импорт CLI и загрузка пресетов/профилей.
+    ``extra_args`` сюда не входит: вызывающая сторона должна слить
+    ``candidate.extra_args`` через ``merge_extra_args`` (src/core/cli_builder.py),
+    иначе накопленные вручную флаги будут потеряны при перезаписи.
+    """
+    values: Dict[str, Any] = {
+        "ctx_size": int(candidate.ctx),
+        "batch_size": int(candidate.batch),
+        "ubatch_size": int(candidate.ubatch),
+        "threads": int(candidate.threads),
+        "threads_batch": int(candidate.threads_batch),
+        "cache_type_k": candidate.kv_k,
+        "cache_type_v": candidate.kv_v,
+        "speculative_mtp": bool(candidate.mtp),
+        "use_mmproj": bool(candidate.vision),
+    }
+    ngl_text = str(candidate.ngl).strip().lower()
+    if ngl_text == "all":
+        values["gpu_auto"] = True
+    else:
+        try:
+            values["gpu_layers"] = int(candidate.ngl)
+            values["gpu_auto"] = False
+        except (TypeError, ValueError):
+            pass
+    if candidate.ncmoe is not None:
+        values["cpu_moe_layers"] = int(candidate.ncmoe)
+    if candidate.mtp:
+        values["spec_draft_n_max"] = int(candidate.mtp_n_max)
+        values["spec_draft_p_min"] = float(candidate.mtp_p_min)
+    return values
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -841,7 +821,6 @@ class ConfigManager:
         ctx_size: int,
         ui: Any,
         metadata: Optional[Dict[str, Any]] = None,
-        autotune_params: Optional[Dict[str, Any]] = None,
         preset_name: Optional[str] = None,
     ) -> None:
         """
@@ -857,7 +836,6 @@ class ConfigManager:
         self.read_from_ui(ui)
 
         params = _perf_params_from_settings(self.settings)
-        params = _apply_autotune_params_to_perf_params(params, autotune_params)
         params = _normalize_perf_param_types(params)
 
         params["ctx_size"] = int(ctx_size)
