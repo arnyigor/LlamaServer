@@ -127,6 +127,7 @@ class LlamaGUI:
         self.autotune = None
         self._autotune_running = False
         self.autotune_session_result = None
+        self._syncing_model_combo = False
         # Координация запуска (отложенные рестарты, env) — в контроллере.
         self.launcher = ServerLaunchController()
         self._pending_server_verify = None
@@ -216,6 +217,10 @@ class LlamaGUI:
         u.hf_files.itemSelectionChanged.connect(self._update_hf_download_button)
         u.hf_downloads.itemSelectionChanged.connect(self._update_hf_download_button)
         u.model_combo.currentIndexChanged.connect(self.on_model_selected)
+        u.model_combo.currentIndexChanged.connect(self._sync_autotune_model_from_main)
+        u.autotune.model_combo.currentIndexChanged.connect(
+            self._sync_main_model_from_autotune
+        )
         u.ctx_size.valueChanged.connect(self.on_ctx_changed)
         u.preset_name_combo.activated.connect(lambda _index: self._on_preset_selected())
         u.preset_name_combo.currentIndexChanged.connect(
@@ -2216,9 +2221,14 @@ class LlamaGUI:
     def on_models_found(self, models):
         self.ui.models = models
         self.ui.models_by_path = {m["path"]: m for m in models}
-        self.ui.model_combo.clear()
-        for m in models:
-            self.ui.model_combo.addItem(m["display"], m["path"])
+        self._syncing_model_combo = True
+        try:
+            for combo in (self.ui.model_combo, self.ui.autotune.model_combo):
+                combo.clear()
+                for m in models:
+                    combo.addItem(m["display"], m["path"])
+        finally:
+            self._syncing_model_combo = False
         last = self.config.settings.last_model_path
         idx = self.ui.model_combo.findData(last)
         if idx >= 0:
@@ -2229,6 +2239,32 @@ class LlamaGUI:
         self.log_mgr.append(f"Found models: {len(models)}")
         self.ui.scan_status.setText(f"Found models: {len(models)}")
         self.refresh_local_model_manager(silent=True)
+
+    def _sync_autotune_model_from_main(self, *_):
+        if self._syncing_model_combo:
+            return
+        path = self.ui.model_combo.currentData()
+        idx = self.ui.autotune.model_combo.findData(path)
+        if idx < 0:
+            return
+        self._syncing_model_combo = True
+        try:
+            self.ui.autotune.model_combo.setCurrentIndex(idx)
+        finally:
+            self._syncing_model_combo = False
+
+    def _sync_main_model_from_autotune(self, *_):
+        if self._syncing_model_combo:
+            return
+        path = self.ui.autotune.model_combo.currentData()
+        idx = self.ui.model_combo.findData(path)
+        if idx < 0:
+            return
+        self._syncing_model_combo = True
+        try:
+            self.ui.model_combo.setCurrentIndex(idx)
+        finally:
+            self._syncing_model_combo = False
 
     def on_model_selected(self, *_):
         path = self.ui.model_combo.currentData()

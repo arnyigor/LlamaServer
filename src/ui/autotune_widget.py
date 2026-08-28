@@ -8,10 +8,12 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -101,8 +103,23 @@ class AutoTuneWidget(QWidget):
         settings_group = QGroupBox("AutoTune settings")
         settings = QVBoxLayout(settings_group)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Goal:"))
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+        model_row.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(False)
+        self.model_combo.setMinimumContentsLength(60)
+        self.model_combo.setToolTip(
+            "Target GGUF model for AutoTune (kept in sync with the model "
+            "selected on the Launch page)."
+        )
+        model_row.addWidget(self.model_combo, 1)
+        settings.addLayout(model_row)
+
+        main_grid = QGridLayout()
+        main_grid.setHorizontalSpacing(10)
+        main_grid.setVerticalSpacing(6)
+
         self.goal_combo = QComboBox()
         self.goal_combo.addItems(list(_GOAL_PRESETS.keys()))
         self.goal_combo.setToolTip(
@@ -111,114 +128,115 @@ class AutoTuneWidget(QWidget):
             "Best quality — приоритет точности KV-кэша.\n"
             "Full validation — самый широкий и долгий поиск."
         )
-        row1.addWidget(self.goal_combo)
-
-        row1.addWidget(QLabel("Context:"))
         self.ctx_spin = QSpinBox()
         self.ctx_spin.setRange(4096, 1_048_576)
         self.ctx_spin.setSingleStep(1024)
         self.ctx_spin.setValue(65536)
         self.ctx_spin.setToolTip("Целевой контекст (токенов), который должен работать.")
-        row1.addWidget(self.ctx_spin)
-        settings.addLayout(row1)
+        main_grid.addWidget(QLabel("Goal:"), 0, 0)
+        main_grid.addWidget(self.goal_combo, 0, 1)
+        main_grid.addWidget(QLabel("Context:"), 0, 2)
+        main_grid.addWidget(self.ctx_spin, 0, 3)
 
-        row2 = QHBoxLayout()
         self.vision_chk = QCheckBox("Vision required")
         self.vision_chk.setToolTip(
             "Требовать рабочую поддержку изображений (mmproj) — иначе поиск "
             "прекратится, если она недоступна."
         )
-        row2.addWidget(self.vision_chk)
-        row2.addWidget(QLabel("mmproj:"))
         self.mmproj_edit = QLineEdit()
         self.mmproj_edit.setPlaceholderText("auto-detect if empty")
-        row2.addWidget(self.mmproj_edit, 1)
         self.mmproj_browse_btn = QPushButton("...")
         self.mmproj_browse_btn.setFixedWidth(28)
         self.mmproj_browse_btn.clicked.connect(self._browse_mmproj)
-        row2.addWidget(self.mmproj_browse_btn)
-        settings.addLayout(row2)
+        mmproj_row = QHBoxLayout()
+        mmproj_row.setSpacing(6)
+        mmproj_row.addWidget(self.mmproj_edit, 1)
+        mmproj_row.addWidget(self.mmproj_browse_btn)
+        main_grid.addWidget(self.vision_chk, 1, 0, 1, 2)
+        main_grid.addWidget(QLabel("mmproj:"), 1, 2)
+        main_grid.addLayout(mmproj_row, 1, 3)
+
+        main_grid.setColumnStretch(1, 1)
+        main_grid.setColumnStretch(3, 1)
+        settings.addLayout(main_grid)
 
         advanced = CollapsiblePanel("Advanced", settings_key="panel_autotune_advanced")
         adv = advanced.content_layout
+        adv_grid = QGridLayout()
+        adv_grid.setHorizontalSpacing(10)
+        adv_grid.setVerticalSpacing(6)
 
-        adv_row1 = QHBoxLayout()
-        adv_row1.addWidget(QLabel("Search depth:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["quick", "normal", "deep"])
-        adv_row1.addWidget(self.mode_combo)
-        adv_row1.addWidget(QLabel("Priority:"))
         self.priority_combo = QComboBox()
         self.priority_combo.addItems(["balanced", "context", "quality", "speed"])
-        adv_row1.addWidget(self.priority_combo)
-        adv_row1.addWidget(QLabel("Preferred KV:"))
+        adv_grid.addWidget(QLabel("Search depth:"), 0, 0)
+        adv_grid.addWidget(self.mode_combo, 0, 1)
+        adv_grid.addWidget(QLabel("Priority:"), 0, 2)
+        adv_grid.addWidget(self.priority_combo, 0, 3)
+
         self.kv_combo = QComboBox()
         self.kv_combo.addItems(_KV_CHOICES)
-        adv_row1.addWidget(self.kv_combo)
-        adv.addLayout(adv_row1)
-
-        adv_row2 = QHBoxLayout()
-        adv_row2.addWidget(QLabel("Degradation policy:"))
         self.degradation_combo = QComboBox()
         self.degradation_combo.addItems(["auto", "report", "strict"])
-        adv_row2.addWidget(self.degradation_combo)
+        adv_grid.addWidget(QLabel("Preferred KV:"), 1, 0)
+        adv_grid.addWidget(self.kv_combo, 1, 1)
+        adv_grid.addWidget(QLabel("Degradation policy:"), 1, 2)
+        adv_grid.addWidget(self.degradation_combo, 1, 3)
+
         self.allow_kv_degradation_chk = QCheckBox("Allow KV degradation")
         self.allow_kv_degradation_chk.setChecked(True)
-        adv_row2.addWidget(self.allow_kv_degradation_chk)
         self.allow_context_reduction_chk = QCheckBox("Allow context reduction")
         self.allow_context_reduction_chk.setChecked(True)
-        adv_row2.addWidget(self.allow_context_reduction_chk)
-        adv.addLayout(adv_row2)
+        adv_grid.addWidget(self.allow_kv_degradation_chk, 2, 0, 1, 2)
+        adv_grid.addWidget(self.allow_context_reduction_chk, 2, 2, 1, 2)
 
-        adv_row3 = QHBoxLayout()
-        adv_row3.addWidget(QLabel("Min TG t/s:"))
         self.min_tg_spin = QDoubleSpinBox()
         self.min_tg_spin.setRange(0.0, 1000.0)
         self.min_tg_spin.setSpecialValueText("none")
-        adv_row3.addWidget(self.min_tg_spin)
-        adv_row3.addWidget(QLabel("Min PP t/s:"))
         self.min_pp_spin = QDoubleSpinBox()
         self.min_pp_spin.setRange(0.0, 5000.0)
         self.min_pp_spin.setSpecialValueText("none")
-        adv_row3.addWidget(self.min_pp_spin)
-        adv_row3.addWidget(QLabel("MTP:"))
+        adv_grid.addWidget(QLabel("Min TG t/s:"), 3, 0)
+        adv_grid.addWidget(self.min_tg_spin, 3, 1)
+        adv_grid.addWidget(QLabel("Min PP t/s:"), 3, 2)
+        adv_grid.addWidget(self.min_pp_spin, 3, 3)
+
         self.mtp_combo = QComboBox()
         self.mtp_combo.addItems(["auto", "on", "off"])
-        adv_row3.addWidget(self.mtp_combo)
-        adv.addLayout(adv_row3)
-
-        adv_row4 = QHBoxLayout()
-        adv_row4.addWidget(QLabel("Preferred VRAM margin (MiB):"))
         self.vram_margin_spin = QSpinBox()
         self.vram_margin_spin.setRange(0, 65536)
         self.vram_margin_spin.setValue(1024)
-        adv_row4.addWidget(self.vram_margin_spin)
-        self.require_vram_margin_chk = QCheckBox("Require margin (production-safe)")
-        adv_row4.addWidget(self.require_vram_margin_chk)
-        adv_row4.addWidget(QLabel("Absolute VRAM floor (MiB):"))
+        adv_grid.addWidget(QLabel("MTP:"), 4, 0)
+        adv_grid.addWidget(self.mtp_combo, 4, 1)
+        adv_grid.addWidget(QLabel("Preferred VRAM margin (MiB):"), 4, 2)
+        adv_grid.addWidget(self.vram_margin_spin, 4, 3)
+
         self.vram_floor_spin = QSpinBox()
         self.vram_floor_spin.setRange(0, 8192)
         self.vram_floor_spin.setValue(300)
-        adv_row4.addWidget(self.vram_floor_spin)
-        adv.addLayout(adv_row4)
+        self.require_vram_margin_chk = QCheckBox("Require margin (production-safe)")
+        adv_grid.addWidget(self.require_vram_margin_chk, 5, 0, 1, 2)
+        adv_grid.addWidget(QLabel("Absolute VRAM floor (MiB):"), 5, 2)
+        adv_grid.addWidget(self.vram_floor_spin, 5, 3)
 
-        adv_row5 = QHBoxLayout()
-        adv_row5.addWidget(QLabel("Max time (min, 0=auto):"))
         self.max_time_spin = QSpinBox()
         self.max_time_spin.setRange(0, 600)
-        adv_row5.addWidget(self.max_time_spin)
-        adv_row5.addWidget(QLabel("Max runs (0=auto):"))
         self.max_runs_spin = QSpinBox()
         self.max_runs_spin.setRange(0, 500)
-        adv_row5.addWidget(self.max_runs_spin)
-        adv.addLayout(adv_row5)
+        adv_grid.addWidget(QLabel("Max time (min, 0=auto):"), 6, 0)
+        adv_grid.addWidget(self.max_time_spin, 6, 1)
+        adv_grid.addWidget(QLabel("Max runs (0=auto):"), 6, 2)
+        adv_grid.addWidget(self.max_runs_spin, 6, 3)
 
-        adv_row6 = QHBoxLayout()
-        adv_row6.addWidget(QLabel("Extra runtime args:"))
         self.runtime_args_edit = QLineEdit()
         self.runtime_args_edit.setPlaceholderText("preserved verbatim in every tested/final command")
-        adv_row6.addWidget(self.runtime_args_edit, 1)
-        adv.addLayout(adv_row6)
+        adv_grid.addWidget(QLabel("Extra runtime args:"), 7, 0)
+        adv_grid.addWidget(self.runtime_args_edit, 7, 1, 1, 3)
+
+        adv_grid.setColumnStretch(1, 1)
+        adv_grid.setColumnStretch(3, 1)
+        adv.addLayout(adv_grid)
 
         settings.addWidget(advanced)
 
@@ -463,9 +481,18 @@ class AutoTuneWidget(QWidget):
         )
         card_layout.addWidget(command_label)
 
+        buttons_row = QHBoxLayout()
         apply_btn = QPushButton(f"Apply {profile.name}")
         apply_btn.clicked.connect(lambda: self.apply_requested.emit(profile.name))
-        card_layout.addWidget(apply_btn)
+        buttons_row.addWidget(apply_btn)
+        copy_btn = QPushButton("Copy command")
+        command_text = " ".join(profile.command)
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(command_text)
+        )
+        buttons_row.addWidget(copy_btn)
+        buttons_row.addStretch(1)
+        card_layout.addLayout(buttons_row)
         return card
 
     def profile_by_name(self, name: str) -> Optional[LaunchProfile]:

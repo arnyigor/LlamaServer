@@ -42,6 +42,12 @@ class NavRail(QListWidget):
         self.setIconSize(QSize(20, 20))
         self.setUniformItemSizes(True)
         self.currentRowChanged.connect(self._emit_page_selected)
+        # currentRowChanged does not fire when the user clicks the item that
+        # is already selected, so a click there would silently do nothing
+        # (e.g. after the log dock was maximized and pages got hidden).
+        # itemClicked always fires on click, giving the host window a chance
+        # to restore the page view even when the row itself did not change.
+        self.itemClicked.connect(lambda item: self._emit_page_selected(self.row(item)))
         if items:
             self.set_items(items)
 

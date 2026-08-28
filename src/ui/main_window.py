@@ -548,20 +548,33 @@ class MainWindowUI(QMainWindow):
         return page
 
     def _on_nav_selected(self, index: int):
+        # Клик по nav-рейлу — явное намерение открыть страницу; если лог был
+        # увеличен, возвращаем обычные пропорции, чтобы страница получила
+        # нормальное место, а не узкую полоску.
+        if self._log_maximized:
+            self._apply_log_maximize(False)
         self.pages.setCurrentIndex(index)
         self.ui_settings.setValue("navIndex", index)
 
     def _apply_log_maximize(self, on: bool) -> None:
-        """Hide (on=True) or show (on=False) the content area so the log dock
-        takes full height. Docked sizes are remembered for restore. State is
-        persisted via ``save_ui_state``."""
+        """Give the log dock most of the vertical space (on=True) or restore
+        the previous docked proportions (on=False).
+
+        The content area (nav rail + pages) is intentionally never hidden —
+        only shrunk to a small minimum — so the page a user was on is still
+        visible and nothing appears to vanish. Docked sizes are remembered
+        for restore; state is persisted via ``save_ui_state``.
+        """
         if on == self._log_maximized:
             return
         if on:
             self._main_vsplit_docked = self.main_vsplit.sizes()
-            self.content_splitter.setVisible(False)
+            total = sum(self._main_vsplit_docked) or 1
+            control_h = self._main_vsplit_docked[1] if len(self._main_vsplit_docked) > 1 else 44
+            content_h = max(120, int(total * 0.12))
+            log_h = max(100, total - content_h - control_h)
+            self.main_vsplit.setSizes([content_h, control_h, log_h])
         else:
-            self.content_splitter.setVisible(True)
             self.main_vsplit.setSizes(self._main_vsplit_docked)
         self._log_maximized = on
         self.log_dock.set_maximized(on)
@@ -649,8 +662,9 @@ class MainWindowUI(QMainWindow):
                 self.main_vsplit.setSizes([int(x) for x in vstate])
             except (TypeError, ValueError):
                 pass
-        if self.ui_settings.value("logDockMaximized", False, type=bool):
-            self._apply_log_maximize(True)
+        # Лог-док всегда стартует в обычном режиме: сохранённый maximized-флаг
+        # намеренно не восстанавливается, иначе окно открывается с развёрнутым
+        # логом и скрытым nav-рейлом/страницами без явного объяснения почему.
         nav_index = self.ui_settings.value("navIndex")
         if nav_index is not None and hasattr(self, "nav_rail"):
             try:
