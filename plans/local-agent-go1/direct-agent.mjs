@@ -14,10 +14,12 @@ function parseArgs(argv) {
     model: DEFAULT_MODEL,
     maxSteps: 20,
     maxToolCalls: 30,
+    maxFilesRead: 15,
     maxToolOutputBytes: 1024 * 1024,
     maxFileBytes: 256 * 1024,
     maxGrepMatches: 100,
     maxTokens: 2048,
+    finalizeMaxTokens: 8192,
     traceOut: "",
     repoWorkdir: "",
   };
@@ -37,7 +39,9 @@ function parseArgs(argv) {
     else if (arg === "--model") parsed.model = next();
     else if (arg === "--max-steps") parsed.maxSteps = Number(next());
     else if (arg === "--max-tool-calls") parsed.maxToolCalls = Number(next());
+    else if (arg === "--max-files-read") parsed.maxFilesRead = Number(next());
     else if (arg === "--max-tokens") parsed.maxTokens = Number(next());
+    else if (arg === "--finalize-max-tokens") parsed.finalizeMaxTokens = Number(next());
     else if (arg === "--trace-out") parsed.traceOut = next();
     else if (arg === "--help" || arg === "-h") parsed.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
@@ -58,7 +62,11 @@ function usage() {
     "  --repo-workdir <dir>    Directory where --repo is cloned",
     "  --max-steps <n>         Maximum model turns (default: 20)",
     "  --max-tool-calls <n>    Maximum total tool calls (default: 30)",
+    "  --max-files-read <n>    Maximum distinct files read (default: 15)",
     "  --max-tokens <n>        Maximum tokens per model response (default: 2048)",
+    "  --finalize-max-tokens <n>  Token budget for the forced finalize turn (default: 8192);",
+    "                          should exceed the server's --reasoning-budget so thinking",
+    "                          doesn't crowd out the final answer content.",
     "  --trace-out <file>      Write full trace JSON to this file",
   ].join("\n");
 }
@@ -177,6 +185,13 @@ class ReadOnlyTools {
 
   async readFile(args) {
     const { real, relative } = await this.resolveInside(args.path);
+    const relSlash = slash(relative);
+    if (!this.filesRead.has(relSlash) && this.filesRead.size >= this.limits.maxFilesRead) {
+      throw new Error(
+        `Reached max distinct files read (${this.limits.maxFilesRead}). ` +
+        `Stop exploring and answer now using what you already read: ${[...this.filesRead].join(", ")}`
+      );
+    }
     const stat = await fs.stat(real);
     if (!stat.isFile()) throw new Error(`Not a file: ${args.path}`);
     if (stat.size > this.limits.maxFileBytes) {
@@ -351,22 +366,28 @@ function parseToolArguments(raw) {
   return JSON.parse(raw);
 }
 
-async function callModel(options, messages) {
+async function callModel(options, messages, { toolChoice = "auto", maxTokens } = {}) {
+  const body = {
+    model: options.model,
+    messages,
+    temperature: 0,
+    max_tokens: maxTokens ?? options.maxTokens,
+    stream: false,
+  };
+  if (toolChoice === "none") {
+    body.tool_choice = "none";
+  } else {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+
   const response = await fetch(`${options.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: "Bearer local",
     },
-    body: JSON.stringify({
-      model: options.model,
-      messages,
-      tools,
-      tool_choice: "auto",
-      temperature: 0,
-      max_tokens: options.maxTokens,
-      stream: false,
-    }),
+    body: JSON.stringify(body),
   });
 
   const text = await response.text();
@@ -417,9 +438,28 @@ async function main() {
   let toolCallCount = 0;
   let finalMessage = null;
   let finalFinishReason = null;
+  let budgetLimited = false;
+  let forceFinalize = false;
 
   for (let step = 1; step <= options.maxSteps; step++) {
-    const response = await callModel(options, messages);
+    const isLastStep = step === options.maxSteps;
+    const mustFinalizeNow = forceFinalize || isLastStep;
+
+    if (mustFinalizeNow) {
+      budgetLimited = true;
+      messages.push({
+        role: "user",
+        content:
+          "BUDGET_LOW: You have reached the exploration budget. " +
+          "Answer directly now, with minimal or no step-by-step reasoning. " +
+          "Give your final concise answer using only what you already found. Do not call any tools.",
+      });
+    }
+
+    const response = await callModel(options, messages, {
+      toolChoice: mustFinalizeNow ? "none" : "auto",
+      maxTokens: mustFinalizeNow ? Math.max(options.maxTokens, options.finalizeMaxTokens) : undefined,
+    });
     const choice = response.choices?.[0];
     const assistant = choice?.message;
     if (!assistant) throw new Error("Model response did not include choices[0].message");
@@ -432,7 +472,7 @@ async function main() {
     });
     messages.push(assistant);
 
-    const calls = assistant.tool_calls || [];
+    const calls = mustFinalizeNow ? [] : (assistant.tool_calls || []);
     if (calls.length === 0) {
       finalMessage = assistant;
       finalFinishReason = choice.finish_reason;
@@ -442,7 +482,14 @@ async function main() {
     for (const call of calls) {
       toolCallCount++;
       if (toolCallCount > options.maxToolCalls) {
-        throw new Error(`Exceeded max tool calls: ${options.maxToolCalls}`);
+        forceFinalize = true;
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name: call.function?.name,
+          content: JSON.stringify({ ok: false, error: `Reached max tool calls (${options.maxToolCalls}); skipped.` }),
+        });
+        continue;
       }
 
       let payload;
@@ -471,15 +518,23 @@ async function main() {
     }
   }
 
-  if (!finalMessage) throw new Error(`No final answer within ${options.maxSteps} steps`);
+  if (!finalMessage) {
+    finalMessage = { content: "" };
+    finalFinishReason = "budget_exhausted";
+    budgetLimited = true;
+  }
 
-  const text = typeof finalMessage.content === "string"
+  const content = typeof finalMessage.content === "string"
     ? finalMessage.content
     : JSON.stringify(finalMessage.content ?? "");
+  const reasoning = typeof finalMessage.reasoning_content === "string" ? finalMessage.reasoning_content : "";
+  const usedReasoningFallback = !content.trim() && Boolean(reasoning.trim());
+  const text = usedReasoningFallback ? reasoning : content;
   const output = {
-    status: finalFinishReason === "length" ? "incomplete" : "completed",
+    status: finalFinishReason === "length" || (budgetLimited && !text.trim()) ? "incomplete" : "completed",
     finish_reason: finalFinishReason,
     answer: text.trim(),
+    answer_source: usedReasoningFallback ? "reasoning_fallback" : "content",
     stats: {
       steps: trace.filter(entry => entry.assistant).length,
       tool_calls: toolCallCount,
@@ -487,6 +542,7 @@ async function main() {
       files_read_paths: [...toolRunner.filesRead].sort(),
       total_tool_output_bytes: toolRunner.totalOutputBytes,
       duration_ms: Date.now() - startedAt,
+      budget_limited: budgetLimited,
     },
     repo: prepared.repo ? { url: prepared.repo.url, path: prepared.repo.path } : undefined,
   };

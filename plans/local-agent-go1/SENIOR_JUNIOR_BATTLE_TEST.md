@@ -165,6 +165,71 @@ ambiguous root-cause analysis, synthesis по нескольким подсис�
 **JUNIOR-READY.** Не READY FOR MCP — для MCP нужен более жёсткий machine-enforced
 contract (см. следующий раздел / план).
 
+## Addendum: P0 budget fix (2026-09-02)
+
+После этого отчёта в [direct-agent.mjs](direct-agent.mjs) закрыты два конкретных P0-пробела,
+которые и вызывали failure job A1:
+
+1. **`max_files_read` был не enforced** (только считался) — добавлен `--max-files-read`
+   (default 15), проверяется в `ReadOnlyTools.readFile` до чтения нового файла.
+2. **Превышение `--max-tool-calls` было фатальным** (`throw`, весь прогон терялся без
+   ответа) — заменено на graceful forced-finalize: последний шаг (`step === maxSteps`)
+   и любой шаг после исчерпания tool-budget теперь принудительно вызывают модель с
+   `tool_choice: "none"` и системным сообщением `BUDGET_LOW: ...`, вместо падения.
+3. **Найдена настоящая причина `finish_reason=length`**: сервер запущен с
+   `--reasoning-budget 6144 --reasoning-effort medium --no-reasoning-preserve`
+   (полные параметры запуска зафиксированы ниже) — модель пишет весь анализ в
+   `reasoning_content`, и клиентский `max_tokens` (1024-2048) обрезал ответ раньше, чем
+   reasoning заканчивался и начинался `content`. Добавлен `--finalize-max-tokens`
+   (default 8192, заведомо больше reasoning-budget) — используется только на
+   forced-finalize шаге. Также добавлен fallback: если `content` пуст, а
+   `reasoning_content` непустой, он используется как `answer` с пометкой
+   `answer_source: "reasoning_fallback"`, чтобы evidence не терялся даже при обрезке.
+
+### Верификация
+
+Прогнан тот же тип задачи, что провалился в job A1 (широкий VERIFY по всем миграциям),
+с намеренно тесным бюджетом (`--max-tool-calls 8 --max-files-read 4 --max-tokens 1024`):
+
+- **До фикса** (`max_tokens` без `finalize-max-tokens` override): `status=incomplete`,
+  `finish_reason=length`, `answer=""` — весь анализ остался в обрезанном
+  `reasoning_content` и терялся.
+- **После фикса**: `status=completed`, `finish_reason=stop`, `exit_code=0`,
+  `budget_limited=true`, `answer_source="content"` — полный структурированный отчёт на
+  11 конкретных находок с точными строками (`DatabaseMigrations.kt`, `MainDB.kt`,
+  `DataModule.kt`), включая ранее найденные проблемы (потеря `ground_time`/`night_time`,
+  `runMigration` вне транзакции, silent exception swallowing, отсутствие
+  `fallbackToDestructiveMigration()`).
+
+Трейсы: `senior-junior-flightlogbook-20260902-105414/job-a3-budget-fix-check-trace.json`
+(до фикса) и `job-a4-budget-fix-check-trace.json` (после фикса).
+
+### Параметры запуска llama-server (для справки, вошли в Skill как факт о junior)
+
+```
+llama-server.exe -m unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --host 127.0.0.1 --port 8080 -ngl all -t 16 -c 65536 -tb 16 -b 512 -ub 512 -np 1 \
+  -ctk q4_0 -ctv q4_0 --fit off --reasoning on --reasoning-effort medium \
+  --no-reasoning-preserve --reasoning-budget 6144 --temp 0.6 --top-k 20 --top-p 0.95 \
+  --min-p 0.0 --repeat-penalty 1.0 --presence-penalty 0.52 --frequency-penalty 0.0 \
+  --flash-attn on --no-mmproj --jinja --metrics --load-mode mmap --cache-prompt \
+  --alias qwen-27b
+```
+
+Ключевое для клиента: `reasoning-budget=6144` и `--no-reasoning-preserve` — значит
+любой forced-finalize/retry запрос должен резервировать `max_tokens` заметно больше
+6144, иначе thinking снова съест весь ответ. Эти параметры признаны хорошо
+сбалансированными (glubina мышления vs решение задачи) и трогать их не нужно — фикс
+только на стороне клиента (`direct-agent.mjs`).
+
+**Важно про доступ senior-модели к этим параметрам**: они нигде не отражены в
+OpenAI-совместимом API (`/v1/models` отдаёт только `n_ctx_train`, `n_params`, `ftype` —
+без `reasoning_budget`/`reasoning_effort`/текущего `-c`). Senior не может их
+интроспектировать сам; их нужно либо зашить статически в Skill
+`local-junior-delegation` (сделано здесь, в этом файле), либо (если моделей/профилей
+станет несколько) завести отдельный `local_info` MCP-тул, читающий конфиг рядом со
+скриптом запуска.
+
 ---
 
 ## Следующий шаг: MCP v0.1 + Skill (архитектурный план)
