@@ -2,9 +2,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
 const DEFAULT_MODEL = "qwen-27b";
+let lastFailureTrace = null;
 
 function parseArgs(argv) {
   const parsed = {
@@ -15,7 +17,9 @@ function parseArgs(argv) {
     maxToolOutputBytes: 1024 * 1024,
     maxFileBytes: 256 * 1024,
     maxGrepMatches: 100,
+    maxTokens: 2048,
     traceOut: "",
+    repoWorkdir: "",
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -26,11 +30,14 @@ function parseArgs(argv) {
     };
 
     if (arg === "--cwd") parsed.cwd = next();
+    else if (arg === "--repo") parsed.repo = next();
+    else if (arg === "--repo-workdir") parsed.repoWorkdir = next();
     else if (arg === "--task") parsed.task = next();
     else if (arg === "--base-url") parsed.baseUrl = next();
     else if (arg === "--model") parsed.model = next();
     else if (arg === "--max-steps") parsed.maxSteps = Number(next());
     else if (arg === "--max-tool-calls") parsed.maxToolCalls = Number(next());
+    else if (arg === "--max-tokens") parsed.maxTokens = Number(next());
     else if (arg === "--trace-out") parsed.traceOut = next();
     else if (arg === "--help" || arg === "-h") parsed.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
@@ -43,14 +50,64 @@ function usage() {
   return [
     "Usage:",
     "  node direct-agent.mjs --cwd <repo-or-dir> --task <task>",
+    "  node direct-agent.mjs --repo <git-url> --task <task>",
     "",
     "Options:",
     "  --base-url <url>        OpenAI-compatible base URL (default: http://127.0.0.1:8080/v1)",
     "  --model <id>            Model id/alias (default: qwen-27b)",
+    "  --repo-workdir <dir>    Directory where --repo is cloned",
     "  --max-steps <n>         Maximum model turns (default: 20)",
     "  --max-tool-calls <n>    Maximum total tool calls (default: 30)",
+    "  --max-tokens <n>        Maximum tokens per model response (default: 2048)",
     "  --trace-out <file>      Write full trace JSON to this file",
   ].join("\n");
+}
+
+async function prepareRepo(options) {
+  if (!options.repo) return { cwd: options.cwd, repo: null };
+  if (options.cwd) throw new Error("Use either --cwd or --repo, not both");
+
+  const repoUrl = String(options.repo);
+  if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(repoUrl)) {
+    throw new Error(`Only simple GitHub HTTPS repo URLs are supported by --repo: ${repoUrl}`);
+  }
+
+  const parent = options.repoWorkdir
+    ? path.resolve(options.repoWorkdir)
+    : await fs.mkdtemp(path.join(tmpdir(), "direct-agent-repo-"));
+  await fs.mkdir(parent, { recursive: true });
+
+  const repoName = repoUrl.replace(/\.git$/, "").split("/").pop();
+  const target = path.join(parent, repoName);
+  const relativeTarget = path.relative(parent, target);
+  if (relativeTarget === "" || relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) {
+    throw new Error(`Refusing to clone outside repo workdir: ${target}`);
+  }
+  try {
+    await fs.rm(target, { recursive: true, force: true });
+  } catch {
+    // Best effort cleanup before cloning into the eval work directory.
+  }
+
+  const clone = spawnSync("git", ["clone", "--depth", "1", repoUrl, target], {
+    encoding: "utf8",
+    timeout: 120_000,
+    windowsHide: true,
+  });
+  if (clone.error) throw clone.error;
+  if (clone.status !== 0) {
+    throw new Error((clone.stderr || `git clone exited with ${clone.status}`).trim());
+  }
+
+  return {
+    cwd: target,
+    repo: {
+      url: repoUrl,
+      path: target,
+      cloneStdout: clone.stdout,
+      cloneStderr: clone.stderr,
+    },
+  };
 }
 
 function truncateUtf8(text, maxBytes) {
@@ -307,7 +364,7 @@ async function callModel(options, messages) {
       tools,
       tool_choice: "auto",
       temperature: 0,
-      max_tokens: 2048,
+      max_tokens: options.maxTokens,
       stream: false,
     }),
   });
@@ -328,12 +385,16 @@ async function executeTool(toolRunner, call) {
 }
 
 async function main() {
+  const startedAt = Date.now();
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     console.log(usage());
     return;
   }
-  if (!options.cwd || !options.task) throw new Error("--cwd and --task are required");
+  if ((!options.cwd && !options.repo) || !options.task) throw new Error("--cwd or --repo, and --task are required");
+
+  const prepared = await prepareRepo(options);
+  options.cwd = prepared.cwd;
 
   const toolRunner = new ReadOnlyTools(options.cwd, options);
   await toolRunner.init();
@@ -352,8 +413,10 @@ async function main() {
   ];
 
   const trace = [];
+  lastFailureTrace = { trace, options };
   let toolCallCount = 0;
   let finalMessage = null;
+  let finalFinishReason = null;
 
   for (let step = 1; step <= options.maxSteps; step++) {
     const response = await callModel(options, messages);
@@ -372,6 +435,7 @@ async function main() {
     const calls = assistant.tool_calls || [];
     if (calls.length === 0) {
       finalMessage = assistant;
+      finalFinishReason = choice.finish_reason;
       break;
     }
 
@@ -413,7 +477,8 @@ async function main() {
     ? finalMessage.content
     : JSON.stringify(finalMessage.content ?? "");
   const output = {
-    status: "completed",
+    status: finalFinishReason === "length" ? "incomplete" : "completed",
+    finish_reason: finalFinishReason,
     answer: text.trim(),
     stats: {
       steps: trace.filter(entry => entry.assistant).length,
@@ -421,18 +486,36 @@ async function main() {
       files_read: toolRunner.filesRead.size,
       files_read_paths: [...toolRunner.filesRead].sort(),
       total_tool_output_bytes: toolRunner.totalOutputBytes,
+      duration_ms: Date.now() - startedAt,
     },
+    repo: prepared.repo ? { url: prepared.repo.url, path: prepared.repo.path } : undefined,
   };
 
   if (options.traceOut) {
     await fs.mkdir(path.dirname(path.resolve(options.traceOut)), { recursive: true });
-    await fs.writeFile(path.resolve(options.traceOut), JSON.stringify({ output, trace }, null, 2), "utf8");
+    await fs.writeFile(path.resolve(options.traceOut), JSON.stringify({ output, trace, repo: prepared.repo }, null, 2), "utf8");
   }
 
   console.log(JSON.stringify(output, null, 2));
+  if (output.status === "incomplete") process.exitCode = 2;
 }
 
-main().catch(err => {
+main().catch(async err => {
+  const options = lastFailureTrace?.options;
+  if (options?.traceOut) {
+    try {
+      await fs.mkdir(path.dirname(path.resolve(options.traceOut)), { recursive: true });
+      await fs.writeFile(path.resolve(options.traceOut), JSON.stringify({
+        output: {
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+        },
+        trace: lastFailureTrace.trace,
+      }, null, 2), "utf8");
+    } catch {
+      // Preserve the original failure in stderr.
+    }
+  }
   console.error(JSON.stringify({
     status: "failed",
     error: err instanceof Error ? err.message : String(err),
