@@ -181,7 +181,8 @@ def _dense_gpu_weight_bytes(model: ModelInfo, ngl: int | str, include_mtp: bool 
         block_bytes = sum(model.block_tensor_bytes.get(i, 0) for i in main_ids)
         if include_mtp:
             block_bytes += sum(model.block_tensor_bytes.get(i, 0) for i in mtp_ids)
-        return block_bytes + model.non_block_tensor_bytes
+        non_block_gpu = max(0, model.non_block_tensor_bytes - model.cpu_resident_tensor_bytes)
+        return block_bytes + non_block_gpu
 
     n = min(main_blocks, max(0, int(ngl)))
     if n == 0:
@@ -210,6 +211,7 @@ def _moe_gpu_weight_bytes(model: ModelInfo, ncmoe: int, *, include_mtp: bool = F
     # -ncmoe keeps routed expert weights for the first N target-model MoE layers on CPU.
     # N=0 therefore means all routed experts stay on GPU; larger N is progressively safer
     # for VRAM but may reduce PP/TG.
+    base -= int(model.cpu_resident_tensor_bytes)
     cpu_expert = sum(int(model.block_expert_bytes.get(i, 0)) for i in range(n))
     return max(0, base - cpu_expert)
 

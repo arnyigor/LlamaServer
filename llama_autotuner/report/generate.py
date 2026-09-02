@@ -291,8 +291,30 @@ def build_profiles(results: list[CandidateResult], server_exe: str, model_path: 
 
     # MAX_CONTEXT is deliberately preserved as a user-facing launch role. It may be a LOW-confidence
     # scout when NORMAL chose to spend expensive FINAL validation on a different knee; the report says so.
-    max_ctx_value = max(r.candidate.ctx for r in measured)
-    max_ctx_pool = [r for r in measured if r.candidate.ctx == max_ctx_value]
+    #
+    # Within one exact placement/KV/Vision family, a larger raw context must not outrank a smaller
+    # one that already has full/validation evidence: MAX_CONTEXT discovery's own bisection can leave
+    # a rejected, merely-recon-probed larger rung sitting in `results` (kept as diagnostic evidence,
+    # never discarded) alongside the smaller rung it explicitly walked back to and FINAL-validated as
+    # the real safe ceiling. Live-observed: a recon ctx=262144 (794 MiB, OPERATIONAL) outranked a
+    # FINAL-validated ctx=241664 (1109 MiB, SAFE) for the same q8_0/q8_0 full-GPU family purely
+    # because 262144 > 241664, even though the search itself had already rejected 262144 as too
+    # fragile. Different families (different KV tier, placement, or Vision) are unrelated context
+    # trade-offs, not competing evidence for the same ceiling, so this only applies within a family.
+    def _context_family(r: CandidateResult) -> tuple:
+        c = r.candidate
+        return (c.kv_k, c.kv_v, c.ngl, c.ncmoe, c.vision, c.mmproj)
+
+    by_family: dict[tuple, list[CandidateResult]] = {}
+    for r in measured:
+        by_family.setdefault(_context_family(r), []).append(r)
+    max_ctx_candidates: list[CandidateResult] = []
+    for family_results in by_family.values():
+        strong = [r for r in family_results if r.metrics.benchmark_kind in {"full", "validation"}]
+        max_ctx_candidates.extend(strong or family_results)
+
+    max_ctx_value = max(r.candidate.ctx for r in max_ctx_candidates)
+    max_ctx_pool = [r for r in max_ctx_candidates if r.candidate.ctx == max_ctx_value]
     max_context = choose_preferred(max_ctx_pool, "long-context", policy) or max_ctx_pool[0]
 
     optimal_envelope = decode_speed_envelope(optimal, workload_profile)
@@ -820,6 +842,9 @@ def write_reports(out_dir: Path, profiles: list[LaunchProfile], results: list[Ca
                   f"(hard/tight/operational/preferred: {vram['hard_floor_mb']}/"
                   f"{vram['tight_floor_mb']}/{vram['operational_floor_mb']}/"
                   f"{vram['preferred_reserve_mb']} MiB)",
+                  f"- RAM peak (server process): `{m.ram_peak_mb} MiB`"
+                    + (" — relevant with MoE experts offloaded to CPU" if p.candidate.ncmoe else "")
+                    if m.ram_peak_mb is not None else "- RAM peak (server process): n/a",
                   f"- MTP acceptance (short sample): `{(m.acceptance or 0)*100:.1f}%`" if p.candidate.mtp else "- MTP: off",
                   f"- MTP stability acceptance median: `{m.stability_acceptance_median*100:.1f}%`"
                     if p.candidate.mtp and m.stability_acceptance_median is not None else "- MTP stability acceptance median: n/a",

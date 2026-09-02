@@ -15,6 +15,7 @@ from pathlib import Path
 import psutil
 
 from llama_autotuner.llama.api import get_health
+from llama_autotuner.subprocess_util import no_console_kwargs
 
 
 _DRAFT_STATS_RE = re.compile(
@@ -156,6 +157,7 @@ def terminate_captured_processes(
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     capture_output=True, timeout=8, check=False,
+                    **no_console_kwargs(),
                 )
             except (OSError, subprocess.SubprocessError):
                 pass
@@ -368,7 +370,7 @@ class ServerRunner:
     def start(self) -> None:
         flags = 0
         if os.name == "nt":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.process = subprocess.Popen(
             self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             bufsize=1, creationflags=flags, start_new_session=(os.name != "nt"),

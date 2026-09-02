@@ -556,6 +556,26 @@ class MainWindowUI(QMainWindow):
         self.pages.setCurrentIndex(index)
         self.ui_settings.setValue("navIndex", index)
 
+    def set_model_list(self, models: list) -> None:
+        """Populate the Launch page's model combo and sync the AutoTune picker.
+
+        Single entry point for a fresh scan result: replaces the previous
+        pattern of populating both combos in lockstep from ``main.py``, which
+        used to leave the AutoTune combo with a single model if a
+        ``currentIndexChanged`` handler fired mid-population.
+        """
+        self.models = models
+        self.models_by_path = {m["path"]: m for m in models}
+        self.model_combo.blockSignals(True)
+        try:
+            self.model_combo.clear()
+            for m in models:
+                self.model_combo.addItem(m["display"], m["path"])
+        finally:
+            self.model_combo.blockSignals(False)
+        if hasattr(self, "autotune"):
+            self.autotune._sync_model_items()
+
     def _apply_log_maximize(self, on: bool) -> None:
         """Give the log dock most of the vertical space (on=True) or restore
         the previous docked proportions (on=False).

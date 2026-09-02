@@ -18,6 +18,7 @@ from PySide6.QtCore import QThread, Signal
 from src.core.gguf_parser import (
     extract_model_info,
     is_mtp_draft_file,
+    is_non_primary_split_shard,
     is_projector_file,
 )
 from src.utils.subprocess_utils import no_console_kwargs
@@ -50,7 +51,11 @@ class ModelScanner(QThread):
                     self.progress.emit("вЏ№ РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ РѕС‚РјРµРЅРµРЅРѕ")
                     self.models_found.emit(models)
                     return
-                if not is_projector_file(f) and not is_mtp_draft_file(f):
+                if (
+                    not is_projector_file(f)
+                    and not is_mtp_draft_file(f)
+                    and not is_non_primary_split_shard(f)
+                ):
                     all_files.append(f)
             total = len(all_files)
 
@@ -401,3 +406,36 @@ class LlamaCppUpdater(QThread):
             shutil.rmtree(old, ignore_errors=True)
 
         return backup_subdir
+
+
+class LlamaCppUpdateChecker(QThread):
+    """Passive "is a newer build available?" check for every CUDA major
+    version — does not download anything, unlike ``LlamaCppUpdater``."""
+
+    checked = Signal(dict)  # {"12": {"current": int|None, "latest": int}, ...}
+    error = Signal(str)
+
+    def __init__(self, base_path, versions=("12", "13")):
+        super().__init__()
+        self.base_path = base_path
+        self.versions = list(versions)
+
+    def run(self):
+        probe = LlamaCppUpdater(self.base_path)
+        try:
+            release = probe.fetch_latest_release()
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        latest_build = probe.parse_build_number(release.get("tag_name", ""))
+        if latest_build is None:
+            self.error.emit(f"Cannot parse release tag: {release.get('tag_name')}")
+            return
+
+        result = {}
+        for version in self.versions:
+            updater = LlamaCppUpdater(self.base_path, cuda_version=version)
+            target_dir = updater.resolve_target_dir(updater.select_assets(release))
+            current_build = updater.get_current_build(target_dir / "llama-server.exe")
+            result[version] = {"current": current_build, "latest": latest_build}
+        self.checked.emit(result)

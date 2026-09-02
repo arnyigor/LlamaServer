@@ -57,9 +57,11 @@ class AutotuneEngine:
                  base_extra_args: list[str] | None = None, safe_perf_floor_ratio: float = 0.80,
                  workload_profile: str = "agent", noise_policy: NoisePolicy | None = None,
                  min_tg_tps: float | None = None, min_pp_tps: float | None = None,
+                 min_tg_is_default: bool = False,
                  selection_priority: str = "balanced",
                  require_preferred_vram_reserve: bool = False,
-                 server_lease_dir: Path | None = None) -> None:
+                 server_lease_dir: Path | None = None,
+                 prior_calibration_mb: dict[str, int] | None = None) -> None:
         self.server_exe = server_exe
         self.model = model
         self.hardware = hardware
@@ -71,6 +73,10 @@ class AutotuneEngine:
         self.vram_margin_mb = vram_margin_mb
         self.port = port
         self.max_runs = max_runs
+        # Phase 0 time-aware budget: max_runs is a soft target, not a hard ceiling, as long as
+        # the remaining max_minutes budget can plausibly fit another candidate. Bounded by this
+        # multiplier so a session cannot run away if per-candidate cost unexpectedly shrinks.
+        self._run_budget_ceiling_multiplier = 2.0
         self.started_monotonic = time.monotonic()
         self.deadline = self.started_monotonic + max_minutes * 60
         self.max_minutes = max_minutes
@@ -99,6 +105,11 @@ class AutotuneEngine:
         }
         self.min_tg_tps = min_tg_tps if min_tg_tps is None else max(0.0, float(min_tg_tps))
         self.min_pp_tps = min_pp_tps if min_pp_tps is None else max(0.0, float(min_pp_tps))
+        # True when min_tg_tps came from the workload-based default rather than an explicit
+        # user --min-tg. Some optimizations (e.g. deferring a redundant MoE FULL confirmation)
+        # only make sense when the user gave no target to validate against; the automatic
+        # degraded-branch abandonment gate should still apply to the default.
+        self._min_tg_is_default = bool(min_tg_is_default) and self.min_tg_tps is not None
         self.selection_priority = selection_priority if selection_priority in {"balanced", "context", "quality", "speed"} else "balanced"
         self.require_preferred_vram_reserve = bool(require_preferred_vram_reserve)
         self.server_lease_dir = Path(server_lease_dir) if server_lease_dir is not None else None
@@ -107,6 +118,11 @@ class AutotuneEngine:
         # future ngl=all/MTP predictions.
         self._static_free_corrections_mb: dict[str, int] = {}
         self._dense_numeric_correction_samples_mb: dict[str, int] = {}
+        # Hardware-scoped priors from earlier sessions (any model, same GPU). Used only as a
+        # fallback seed before this session has measured its own correction for a given
+        # placement family; a real in-session measurement always takes precedence (see
+        # ``_calibrate_from_result``, which never overwrites an already-session-calibrated key).
+        self._prior_calibration_mb: dict[str, int] = dict(prior_calibration_mb or {})
         self._dense_oversized_full_penalty_mb: dict[tuple[str, str], int] = {}
         self._tight_candidate_keys: set[str] = set()
         self._mtp_overhead_calibration_done = False
@@ -149,11 +165,25 @@ class AutotuneEngine:
     def budget_reason(self) -> str | None:
         if self._startup_blocker:
             return "MODEL_STARTUP_FAILED"
-        if len(self.results) >= self.max_runs:
-            return "RUN_BUDGET_REACHED"
         if time.monotonic() >= self.deadline:
             return "TIME_BUDGET_REACHED"
+        if len(self.results) >= self.max_runs and not self._time_remaining_for_another_run():
+            return "RUN_BUDGET_REACHED"
         return None
+
+    def _time_remaining_for_another_run(self) -> bool:
+        """True once ``max_runs`` is reached only if the remaining max-minutes budget can
+        plausibly fit one more candidate, estimated from the average cost of runs so far, and
+        the bounded run-count ceiling has not been hit. Without this, a search that is genuinely
+        time-rich (e.g. MoE+MTP finishing 12/12 runs with several minutes still unused) stops on
+        run count alone instead of on the budget the user actually configured."""
+        if not self.results:
+            return False
+        if len(self.results) >= self.max_runs * self._run_budget_ceiling_multiplier:
+            return False
+        avg_run_seconds = self.elapsed_seconds() / len(self.results)
+        remaining_seconds = self.deadline - time.monotonic()
+        return remaining_seconds > avg_run_seconds
 
     def budget_ok(self) -> bool:
         reason = self.budget_reason()
@@ -270,7 +300,24 @@ class AutotuneEngine:
         elif (self.model.kind == ModelKind.DENSE and candidate.ngl != "all"
               and self._dense_numeric_correction_samples_mb):
             predicted += int(round(median(self._dense_numeric_correction_samples_mb.values())))
+        elif key is not None and key in self._prior_calibration_mb:
+            # No measurement yet this session: fall back to a prior session's correction for
+            # this exact GPU, still scoped to the same placement family.
+            predicted += self._prior_calibration_mb[key]
+        elif (self.model.kind == ModelKind.DENSE and candidate.ngl != "all"
+              and "dense:numeric_median" in self._prior_calibration_mb):
+            predicted += self._prior_calibration_mb["dense:numeric_median"]
         return predicted
+
+    def exportable_calibration_mb(self) -> dict[str, int]:
+        """Session corrections worth persisting per-hardware for a future session's cold start.
+
+        Only placement-family-level keys generalize across different models on the same GPU
+        (an exact numeric ``dense:ngl:N`` key does not: N is model-specific layer count)."""
+        out = {k: v for k, v in self._static_free_corrections_mb.items() if k in {"dense:all", "moe"}}
+        if self._dense_numeric_correction_samples_mb:
+            out["dense:numeric_median"] = int(round(median(self._dense_numeric_correction_samples_mb.values())))
+        return out
 
     def _vram_thresholds(self, candidate: Candidate) -> VramThresholds:
         return vram_thresholds(
@@ -512,6 +559,8 @@ class AutotuneEngine:
         if m.vram_free_min_mb is not None:
             vram_class = m.vram_operating_class or self._vram_class(r).value
             parts.append(f"VRAM-free-min={m.vram_free_min_mb} MiB/{vram_class}")
+        if m.ram_peak_mb is not None:
+            parts.append(f"RAM-peak={m.ram_peak_mb} MiB")
         if m.long_context_tokens:
             # A recon-context run deliberately does not set the FINAL-only
             # ``long_context_passed`` bit.  Calling a successful occupied-cache
@@ -663,7 +712,8 @@ class AutotuneEngine:
         kind = "CONTEXT_SCOUT" if recon_context else ("SCOUT" if recon else ("PROBE" if quick else ("VALIDATE" if long_validate else ("GUARDED_FULL" if guard_probe else "FULL"))))
         self.phase = phase
         self._emit("")
-        self._emit(f"[Run {run_no}/{self.max_runs}] {phase} / {kind}")
+        budget_note = " (run budget extended, time remaining)" if run_no > self.max_runs else ""
+        self._emit(f"[Run {run_no}/{self.max_runs}] {phase} / {kind}{budget_note}")
         self._emit(f"  candidate: {c.short()}")
 
         if not self._wait_clean():
@@ -725,6 +775,8 @@ class AutotuneEngine:
                     suffix = ""
                     if snap:
                         suffix = f" | GPU {snap.used_mb}/{self.hardware.vram_total_mb} MiB, util={snap.util_percent:.0f}%"
+                    if ram_samples:
+                        suffix += f" | RAM {ram_samples[-1]}/{self.hardware.ram_total_mb} MiB"
                     self._emit(
                         f"  ... {active_step['text']} | elapsed={now-run_start:.0f}s{suffix}"
                     )
@@ -748,8 +800,9 @@ class AutotuneEngine:
             startup = runner.wait_ready(self.port, startup_timeout, stall_timeout=startup_stall_timeout)
             s0 = self.gpu.snapshot()
             samples.append(s0)
+            ram_suffix = f" | RAM {ram_samples[-1]}/{self.hardware.ram_total_mb} MiB" if ram_samples else ""
             self._emit(
-                f"  server ready in {startup:.1f}s | VRAM used/free={s0.used_mb}/{s0.free_mb} MiB"
+                f"  server ready in {startup:.1f}s | VRAM used/free={s0.used_mb}/{s0.free_mb} MiB{ram_suffix}"
             )
             # The absolute floor is a hard usability constraint, distinct from the preferred headroom reserve.
             # If loading alone consumes the floor, there is no value in executing a benchmark.
@@ -1451,7 +1504,7 @@ class AutotuneEngine:
         defer_full = bool(
             self.search_mode != "deep" and family_results and bad_n is not None
             and bad_n < int(winner_probe.candidate.ncmoe or 0)
-            and self.min_tg_tps is None and self.min_pp_tps is None
+            and (self.min_tg_tps is None or self._min_tg_is_default) and self.min_pp_tps is None
         )
         if defer_full:
             self._emit(
@@ -2139,6 +2192,57 @@ class AutotuneEngine:
                         return [final], copy.deepcopy(final.candidate)
                     self._emit(
                         "  repaired same-KV FINAL did not clear the recommendation floor; "
+                        "continue to the next semantic frontier point."
+                    )
+
+        # Second repair axis: the context-repair block above only covers a full-GPU (ngl="all"),
+        # ctx>16384, *softly* FRAGILE FINAL. A FINAL that crosses the absolute VRAM floor outright
+        # (EARLY_REJECT, e.g. from a slightly-too-optimistic placement at any context, oversized or
+        # not) fell straight through to the generic frontier queue below, which can pick an
+        # unrelated candidate over a single step of *more* CPU placement at the *same* context/KV --
+        # even when recon already measured that safer placement with a better margin. Reuse the same
+        # nearest-safer-placement machinery as live placement recovery (_safer_variants) for one
+        # bounded repair attempt before falling through to the frontier queue.
+        if (failed_result is not None and self.model.kind == ModelKind.DENSE
+                and not failed_candidate.mtp and self._recoverable_boundary_reason(failed_result.reason)
+                and self.budget_ok()):
+            # max_steps=2 (not 1): for an already-numeric ngl, _safer_variants' own range excludes
+            # its stop bound, so max_steps=1 only re-yields the current placement (deduped away) and
+            # never actually produces a safer step. max_steps=2 reliably yields exactly one step
+            # more conservative than current for both the numeric and "all" starting placements;
+            # only that single first step (variants[1]) is ever used here.
+            variants = self._safer_variants(failed_candidate, max_steps=2)
+            safer_candidate = variants[1] if len(variants) > 1 else None
+            if safer_candidate is not None and safer_candidate.key() not in excluded_keys:
+                self._emit(
+                    f"  FINAL fallback repair: {failed_candidate.short()} crossed the absolute VRAM "
+                    f"floor; try one step more conservative placement (ngl={safer_candidate.ngl}) at "
+                    "the same context/KV before crossing to a different frontier point."
+                )
+                fallbacks_used += 1
+                excluded_keys.add(safer_candidate.key())
+                repair_full = self._guarded_full(safer_candidate, "FINAL_PLACEMENT_REPAIR_CONFIRM", failed_result)
+                if self._is_recommendable_full(repair_full):
+                    self._mark_tight(repair_full)
+                    final = self._run(
+                        copy.deepcopy(repair_full.candidate), quick=False,
+                        phase="FINAL_PLACEMENT_REPAIR_VALIDATION", long_validate=True,
+                        reference=repair_full,
+                    )
+                    if self._environmental_final_failure(final):
+                        self._emit(
+                            "  fallback stopped: repaired-placement FINAL environment is invalid; "
+                            "do not reinterpret it as model evidence."
+                        )
+                        return passed, selected
+                    if (self._is_recommendable_full(final) and final.metrics.benchmark_kind == "validation"
+                            and final.metrics.long_context_passed):
+                        self._emit(
+                            "  repaired same-context/KV placement FINAL passed; it replaces the failed primary."
+                        )
+                        return [final], copy.deepcopy(final.candidate)
+                    self._emit(
+                        "  repaired-placement FINAL did not clear the recommendation floor; "
                         "continue to the next semantic frontier point."
                     )
 
@@ -4931,7 +5035,13 @@ class AutotuneEngine:
             if current is not None:
                 self.provisional_recommendation_key = current.key()
                 anchor = self._best_exact_result(current, full_only=True)
-                if (self.min_tg_tps is not None or self.min_pp_tps is not None) and not self._meets_minimum_performance(anchor):
+                # anchor is None both when a candidate genuinely failed and when its FULL
+                # confirmation was deliberately deferred to a later phase (e.g. MoE placement's
+                # "defer expensive FULL to the joint ubatch/placement winner"). Only reject on an
+                # actual measured shortfall; a merely-not-yet-confirmed candidate must be allowed
+                # to reach that later phase instead of being abandoned for "no full benchmark result".
+                if (self.min_tg_tps is not None or self.min_pp_tps is not None) and anchor is not None \
+                        and not self._meets_minimum_performance(anchor):
                     self._emit(
                         "  option is technically runnable but does not satisfy the user's minimum performance target: "
                         + self._minimum_performance_text(anchor)
@@ -5329,4 +5439,144 @@ class AutotuneEngine:
             "\nAutotune search completed and final candidates were long-context validated. "
             f"Target status: {self.target_status}."
         )
+
+        self._discover_max_context_upsize(current)
         return self.results
+
+    def _discover_max_context_upsize(self, current: Candidate) -> None:
+        """Quick-probe discovery-only "upsize" candidates so MAX_CONTEXT can show a real ceiling.
+
+        When the requested target was comfortably full-GPU, the main search never tries anything
+        *larger* than what the user asked for (every other envelope family only shrinks context or
+        degrades KV), so MAX_CONTEXT would otherwise just duplicate OPTIMAL even with plainly unused
+        VRAM headroom. target.py's build_feasibility_plan generates a bounded two-tier doubling
+        ladder (Q8 first, Q4 continuing only where Q8 hit a VRAM ceiling) up to the model's native
+        context for exactly this case; probe it here with any remaining budget.
+
+        A rung that is runnable but lands below the preferred reserve (FRAGILE, not the genuinely
+        SAFE ceiling MAX_CONTEXT should report) is not simply accepted or discarded: one bounded
+        bisection refine (reusing the same _runtime_bracket_context interpolation already proven
+        for live FINAL context repair) is tried between it and the last SAFE point in the *same* KV
+        tier, so MAX_CONTEXT reports the real knee for that tier instead of stopping short at a
+        coarse doubling step. Purely additive measurement -- never touches current/selected_option/
+        target_status, so it cannot change what OPTIMAL/EXACT_TARGET is.
+        """
+        if self.model.kind != ModelKind.DENSE or current.ngl != "all" or not self.budget_ok():
+            return
+        upsize_options = sorted(
+            (o for o in self._solution_options_ordered if o.strategy == "full-gpu-context-upsize"),
+            key=lambda o: o.context,
+        )
+        if not upsize_options:
+            return
+        cores = max(1, self.hardware.physical_cores)
+        self._emit(
+            "\n[Phase 7] MAX_CONTEXT discovery: probing safe Q8/Q4 context growth beyond the "
+            "requested target while comfortable full-GPU headroom allows it."
+        )
+        last_safe_by_kv: dict[tuple[str, str], tuple[Candidate, int]] = {}
+        for opt in upsize_options:
+            if not self.budget_ok():
+                break
+            seed = opt.to_candidate(cores=cores, extra_args=self.base_extra_args)
+            kv_key = (seed.kv_k, seed.kv_v)
+            probe = self._run(seed, quick=True, phase="MAX_CONTEXT_DISCOVERY", recon=True)
+            free = int(probe.metrics.vram_free_min_mb or 0)
+            if not self._is_good(probe) or free < self._vram_thresholds(seed).hard_floor_mb:
+                self._emit(f"  MAX_CONTEXT discovery stopped at ctx={seed.ctx}: {probe.reason}.")
+                break
+            if free >= self.vram_margin_mb:
+                self._emit(f"  MAX_CONTEXT discovery: ctx={seed.ctx} confirmed runnable, {self._summary(probe)}.")
+                last_safe_by_kv[kv_key] = (copy.deepcopy(seed), free)
+                continue
+
+            self._emit(
+                f"  MAX_CONTEXT discovery: ctx={seed.ctx} runnable but only {free} MiB free "
+                f"(below the {self.vram_margin_mb} MiB preferred reserve); refine within this KV tier "
+                "instead of accepting a fragile ceiling or jumping to the next tier."
+            )
+            prior = last_safe_by_kv.get(kv_key)
+            if prior is not None:
+                low_ctx, low_free = prior[0].ctx, prior[1]
+                high_ctx, high_free = seed.ctx, free
+                # Iterative, bounded bisection -- not just one shot. A single linear interpolation
+                # between two endpoints that are far apart (e.g. 131072/262144) can land on a point
+                # that is *still* not SAFE if the real VRAM-vs-context curve isn't perfectly linear
+                # across that whole span -- observed live: two misses of only 36-54 MiB before a
+                # third attempt finally cleared the reserve. guard_mb=200 (not the small 16 MiB used
+                # for context *repair* elsewhere, which is recovering a specific known-fragile point)
+                # deliberately aims a bit past the reserve so a single interpolation usually lands
+                # SAFE on the first try, trading a modest amount of context for reliably converging
+                # in one round instead of three. Each miss still narrows the bracket (the new
+                # FRAGILE point replaces the high/fragile end) and re-interpolates as a bounded
+                # fallback, converging toward the true knee instead of giving up after one attempt.
+                for _ in range(3):
+                    if not self.budget_ok():
+                        break
+                    refined_ctx = self._runtime_bracket_context(
+                        high_context=high_ctx, high_free_mb=high_free,
+                        low_context=low_ctx, low_free_mb=low_free,
+                        target_free_mb=self.vram_margin_mb, guard_mb=200,
+                    )
+                    if refined_ctx is None:
+                        break
+                    refined = copy.deepcopy(seed)
+                    refined.ctx = refined_ctx
+                    refined_probe = self._run(refined, quick=True, phase="MAX_CONTEXT_DISCOVERY", recon=True)
+                    if not self._is_good(refined_probe):
+                        break
+                    refined_free = int(refined_probe.metrics.vram_free_min_mb or 0)
+                    if refined_free >= self.vram_margin_mb:
+                        self._emit(
+                            f"  MAX_CONTEXT discovery: refined ctx={refined_ctx} confirmed SAFE, "
+                            f"{self._summary(refined_probe)}."
+                        )
+                        last_safe_by_kv[kv_key] = (copy.deepcopy(refined), refined_free)
+                        break
+                    self._emit(
+                        f"  MAX_CONTEXT discovery: refined ctx={refined_ctx} still not SAFE "
+                        f"({refined_free} MiB); narrowing further."
+                    )
+                    high_ctx, high_free = refined_ctx, refined_free
+            # This KV tier does not grow further after a FRAGILE miss; continue to the next
+            # envelope option (e.g. the next KV tier target.py already decided was worth trying).
+
+        if not last_safe_by_kv or not self.budget_ok():
+            return
+
+        # Every point recorded above is only a short recon probe (~1-2K tokens): the same class
+        # of short-scout evidence that Phase 6 FINAL_VALIDATION exists specifically to not trust
+        # for the *requested* target, because a filled context can still cross the VRAM floor a
+        # short probe never reached (observed live: a recon-level "OPERATIONAL" ctx later measured
+        # FRAGILE once FINAL actually filled the context). MAX_CONTEXT must not be held to a lower
+        # evidentiary bar than every other reported profile, so FINAL-validate the single winning
+        # candidate (the largest safe context across KV tiers) the same way Phase 6 does.
+        best_kv, (best_candidate, best_free) = max(
+            last_safe_by_kv.items(), key=lambda item: item[1][0].ctx,
+        )
+        self._emit(
+            f"\n[Phase 7] MAX_CONTEXT FINAL validation: confirming ctx={best_candidate.ctx} "
+            f"{best_kv[0]}/{best_kv[1]} at a materially longer prompt before it can outrank the "
+            "short discovery probe."
+        )
+        final = self._run(
+            copy.deepcopy(best_candidate), quick=False, phase="MAX_CONTEXT_FINAL_VALIDATION",
+            long_validate=True,
+        )
+        if self._is_recommendable_full(final) and final.metrics.long_context_passed:
+            self._emit(f"  MAX_CONTEXT FINAL validation confirmed: {self._summary(final)}.")
+            return
+
+        self._emit(
+            f"  MAX_CONTEXT FINAL validation did not hold at ctx={best_candidate.ctx}: "
+            f"{final.reason}. Repairing context with the same KV/Vision/full-GPU semantics "
+            "instead of leaving the unvalidated recon probe as the reported ceiling."
+        )
+        repaired = self._repair_fragile_dense_full_gpu_context(best_candidate, final)
+        if repaired is not None:
+            self._emit(f"  MAX_CONTEXT repaired to ctx={repaired.ctx}.")
+        else:
+            self._emit(
+                "  MAX_CONTEXT could not be repaired to a FULL-confirmed context above the "
+                "discovery ceiling; the report will fall back to the last FINAL-validated profile."
+            )

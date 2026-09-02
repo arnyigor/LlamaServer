@@ -8,9 +8,10 @@ are preserved so the host window can simply re-export them.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -42,11 +43,13 @@ class LogDock(QWidget):
         self.autoscroll_logs = QCheckBox(self.tr("Auto-scroll"), checked=True)
         hdr.addWidget(self.autoscroll_logs)
         hdr.addStretch(1)
+        self.copy_logs_btn = QPushButton(self.tr("Copy logs"))
         self.copy_last_error_btn = QPushButton(self.tr("Copy last error"))
         self.copy_last_error_btn.setEnabled(False)
         self.open_diagnostics_btn = QPushButton(self.tr("Open diagnostics"))
         self.maximize_btn = QPushButton(self.tr("Maximize"))
         self.clear_btn = QPushButton(self.tr("Clear"))
+        hdr.addWidget(self.copy_logs_btn)
         hdr.addWidget(self.copy_last_error_btn)
         hdr.addWidget(self.open_diagnostics_btn)
         hdr.addWidget(self.maximize_btn)
@@ -59,6 +62,12 @@ class LogDock(QWidget):
 
         self.clear_btn.clicked.connect(self.logs.clear)
         self.maximize_btn.clicked.connect(self.toggle_maximize.emit)
+        self.copy_logs_btn.clicked.connect(self._copy_logs)
+
+    def _copy_logs(self) -> None:
+        QApplication.clipboard().setText(self.logs.toPlainText())
+        self.copy_logs_btn.setText(self.tr("Copied"))
+        QTimer.singleShot(1500, lambda: self.copy_logs_btn.setText(self.tr("Copy logs")))
 
     def set_maximized(self, on: bool) -> None:
         """Update the maximize button label to reflect dock state."""

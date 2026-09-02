@@ -61,6 +61,13 @@ class DegradationKind(str, Enum):
     CAPABILITY = "capability"
 
 
+# Dense CPU-layer offload is only ever considered when the model cannot become full-GPU even at
+# this absolute-minimum context (with the most aggressive KV precision available). Below this,
+# the planner must keep shrinking context/KV instead of moving target layers to CPU -- see
+# dense_can_fit_full_gpu_at_minimum in build_feasibility_plan.
+DENSE_ABSOLUTE_MIN_CONTEXT = 2048
+
+
 @dataclass(slots=True)
 class TargetSpec:
     context: int
@@ -89,6 +96,29 @@ class TargetSpec:
         data["vision"] = self.vision.value
         data["degradation_policy"] = self.degradation_policy.value
         return data
+
+
+# Practical decode-speed floor below which a branch is degraded and not worth further tuning
+# (interactive/chat < 2 t/s is impractical; agent < 5 t/s is degraded). This is only a default:
+# an explicit --min-tg always overrides it. Without it, AutotuneEngine.min_tg_tps stays None and
+# a candidate confirmed as e.g. 3 tok/s can consume its entire run/time budget on ubatch/placement
+# refinement instead of falling back to the next, less degraded solution option.
+#
+# long-context uses the agent floor, not the more lenient chat one: resolve_workload_profile()
+# only picks long-context above 64K context, which is exactly where Dense+Vision candidates get
+# pushed into heavy CPU offload. Measured on real hardware at TG=3.1-3.2 t/s: a 2.0 floor still
+# accepts that branch as "fine" and lets it burn the whole time budget on ubatch refinement that
+# can't fix a decode-side bottleneck; 5.0 correctly flags it as degraded so the optimizer moves on
+# to the next, less degraded solution option instead.
+_DEFAULT_MIN_TG_BY_WORKLOAD = {
+    "chat": 2.0,
+    "agent": 5.0,
+    "long-context": 5.0,
+}
+
+
+def default_practical_min_tg(workload: str) -> float:
+    return _DEFAULT_MIN_TG_BY_WORKLOAD.get(workload, 2.0)
 
 
 @dataclass(slots=True)
@@ -272,18 +302,24 @@ def _resource_class(free_mb: int | None, hardware: HardwareInfo, reserve_mb: int
     return ResourceClass.CONSTRAINED
 
 
-def _context_alternatives(target_ctx: int) -> list[int]:
+def _context_alternatives(target_ctx: int, *, extra_floor: int | None = None) -> list[int]:
     """Return a compact context-capability→speed ladder.
 
     The old 75/50/25% ladder stopped at 64K for a 256K request. That meant a
     16 GiB GPU could never surface obvious preferred-KV 32K/16K options,
     even though those are often the most useful full-GPU fallbacks. Keep the
-    ladder small, aligned to 4K, but continue to 16K for large requested
-    contexts. 16K is the automatic floor; users can still request smaller
+    ladder small, aligned to 4K, but continue to 8K for large requested
+    contexts. 8K is the automatic floor; users can still request smaller
     contexts explicitly.
+
+    ``extra_floor`` (Dense only; see dense_can_fit_full_gpu_at_minimum in
+    build_feasibility_plan) appends one additional, lower rung below the normal
+    automatic floor, so a real triable point exists at the absolute-minimum
+    context the Dense CPU-offload policy checks against -- not just a boolean
+    "full-GPU is possible somewhere" with nothing concrete to try.
     """
     fractions = (0.75, 0.50, 0.25, 0.125, 0.0625)
-    auto_floor = 16_384 if target_ctx >= 32_768 else 4_096
+    auto_floor = 8_192 if target_ctx >= 32_768 else 4_096
     out: list[int] = []
     for fraction in fractions:
         value = int(target_ctx * fraction)
@@ -292,27 +328,107 @@ def _context_alternatives(target_ctx: int) -> list[int]:
             out.append(value)
         if value <= auto_floor:
             break
+    if extra_floor is not None and extra_floor < auto_floor and extra_floor < target_ctx and extra_floor not in out:
+        out.append(extra_floor)
     return out
+
+
+def _dense_offload_severity(model: ModelInfo, placement: str | int | None) -> float:
+    """Fraction of a Dense model's real layers pushed to CPU (0=full GPU, 1=none on GPU).
+
+    Used to scale the sort_key CPU-offload penalty by how much is actually offloaded: a numeric
+    placement equal (or near) to the model's total layer count is effectively full-GPU and must
+    not be penalized the same as a placement that pushes most layers to CPU, even though both are
+    represented by the same "dense-cpu-offload*" strategy prefix.
+    """
+    if placement is None or placement == "all":
+        return 0.0
+    try:
+        ngl = int(placement)
+    except (TypeError, ValueError):
+        return 1.0
+    blocks = model_main_block_count(model)
+    return max(0.0, min(1.0, (blocks - ngl) / blocks))
+
+
+def _solution_sort_key(opt: SolutionOption, model: ModelInfo, target: TargetSpec) -> tuple[int, int, int, int, int]:
+    """Ranking key for one SolutionOption; lower sorts first (tried earlier).
+
+    Extracted to module level (was a nested closure in build_feasibility_plan) so ranking rules --
+    especially the Dense CPU-offload-severity dominance and the MoE expert-offload bonus/penalty --
+    can be unit-tested directly against hand-built options instead of only indirectly through the
+    full planner pipeline. Behavior is unchanged from the original closure.
+    """
+    rank = opt.recommended_rank
+    dense_cpu = model.kind == ModelKind.DENSE and opt.strategy.startswith("dense-cpu-offload")
+    moe_cpu = model.kind == ModelKind.MOE and opt.strategy.startswith("moe-expert-offload")
+    dense_severity = _dense_offload_severity(model, opt.predicted_placement) if dense_cpu else 0.0
+    kv_precision_risk = DegradationKind.QUALITY_RISK in opt.degradation
+    capability_loss = DegradationKind.CAPABILITY in opt.degradation
+
+    priority = (target.priority or "balanced").lower()
+    severity_dominant = 0
+    if priority == "context":
+        # Requested context is king: keep exact-context options ahead of lower-context alternatives.
+        rank += 50 if capability_loss else 0
+        rank += round(10 * dense_severity)
+    elif priority == "quality":
+        # Preserve KV-cache numerical precision above all: capability/performance trade-offs
+        # (including CPU offload) are explicitly preferable to KV degradation here, so offload
+        # severity must stay a mild additive penalty, never the dominant criterion.
+        rank += 60 if kv_precision_risk else 0
+        rank += round(15 * dense_severity)
+    elif priority == "speed":
+        # Static speed prior: avoid CPU execution strongly; smaller full-GPU contexts are acceptable.
+        rank += round(70 * dense_severity)
+        rank += 15 if moe_cpu else 0
+        rank -= min(20, max(0, (target.context - opt.context) // max(4096, target.context // 16))) if capability_loss else 0
+        severity_dominant = round(dense_severity * 100)
+    else:  # balanced
+        rank += round(25 * dense_severity)
+        if moe_cpu:
+            rank -= 5
+        severity_dominant = round(dense_severity * 100)
+
+    infeasible = 1 if opt.resource_class == ResourceClass.INFEASIBLE else 0
+    unknown = 1 if opt.resource_class == ResourceClass.UNKNOWN else 0
+    # Prefer more context as a final stable tie-break unless speed priority explicitly pushed it down.
+    ctx_penalty = max(0, target.context - opt.context) // 4096
+    if priority in ("balanced", "speed"):
+        # Once severity is tied (e.g. several distinct ctx/KV combinations all land on the
+        # same near-full-GPU placement), prefer the one closer to the requested context ahead
+        # of the arbitrary family rank. Measured case: ctx=16384/f16, ctx=32768/Q8 and
+        # ctx=65536/Q4 all resolved to placement=64 (full GPU) on the same 16 GiB card; without
+        # this, the family with the lowest base rank won regardless of how much context the
+        # tied alternatives actually offered.
+        return (infeasible, unknown, severity_dominant, ctx_penalty, rank)
+    return (infeasible, unknown, severity_dominant, rank, ctx_penalty)
 
 
 def _moe_floor_placement(
     model: ModelInfo, hardware: HardwareInfo, baseline_vram_mb: int, candidate: Candidate, floor_mb: int
-) -> tuple[int | None, int | None]:
-    """Return the smallest ncmoe that clears the hard floor, not the preferred reserve.
+) -> tuple[int, int | None, bool]:
+    """Return (ncmoe, free_mb, cleared) — the smallest ncmoe that clears the hard floor.
 
     For MoE, lower ncmoe keeps more routed experts on GPU and is normally the
     performance-first direction. The preferred reserve is handled later as a VRAM
     headroom property; it must not silently force extra expert layers onto CPU.
+
+    When no ncmoe clears the floor, the maximum-offload placement (all experts on
+    CPU) is still returned as a best-effort estimate with ``cleared=False``, instead
+    of discarding the MoE-aware number entirely. Callers must not silently revert to
+    a pessimistic ncmoe=0/full-gpu figure just because the offload strategy itself
+    remains infeasible — that hides the fact expert offload was considered at all.
     """
     blocks = model_main_block_count(model)
-    last_free: int | None = None
+    best_effort_free: int | None = None
     for n in range(0, blocks + 1):
         c = replace(candidate, ncmoe=n)
         free = estimate_candidate_free_mb(model, hardware, baseline_vram_mb, c)
-        last_free = free
+        best_effort_free = free
         if free is not None and free >= floor_mb:
-            return n, free
-    return None, last_free
+            return n, free, True
+    return blocks, best_effort_free, False
 
 
 def _kv_ladder(k: str, v: str) -> list[tuple[str, str, str]]:
@@ -360,6 +476,31 @@ def build_feasibility_plan(
     full_free = exact_est.predicted_all_free_mb if model.kind == ModelKind.DENSE else exact_est.predicted_moe_all_free_mb
     exact_class = _resource_class(full_free, hardware, target.preferred_vram_reserve_mb, target.absolute_vram_floor_mb)
 
+    # Dense CPU-layer offload policy: real target-layer CPU placement is drastically more expensive
+    # than shrinking context/KV (measured: full-GPU ~45 t/s vs. heavy offload ~3-5 t/s on the same
+    # 16 GiB card), so it must never be offered merely because the *requested* context/KV doesn't
+    # fit full-GPU. Only allow it when the model cannot become full-GPU even at an absolute-minimum
+    # context with the most aggressive available KV precision -- i.e. there is truly no way to keep
+    # it GPU-resident, not just "not at the size the user asked for".
+    dense_can_fit_full_gpu_at_minimum = True
+    dense_min_kv: tuple[str, str] = (target.preferred_kv_k, target.preferred_kv_v)
+    dense_min_free: int | None = None
+    if model.kind == ModelKind.DENSE:
+        aggressive_ladder = _kv_ladder(target.preferred_kv_k, target.preferred_kv_v)
+        dense_min_kv = aggressive_ladder[-1][:2] if aggressive_ladder else dense_min_kv
+        dense_min_seed = Candidate(
+            ctx=DENSE_ABSOLUTE_MIN_CONTEXT, ngl="all", batch=512, ubatch=256,
+            threads=cores, threads_batch=cores, kv_k=dense_min_kv[0], kv_v=dense_min_kv[1],
+            vision=target.vision == VisionRequirement.REQUIRED, mmproj=target.mmproj,
+        )
+        dense_min_est = estimate_static_memory(
+            model, hardware, baseline_vram_mb, target.preferred_vram_reserve_mb, dense_min_seed
+        )
+        dense_min_free = dense_min_est.predicted_all_free_mb
+        dense_can_fit_full_gpu_at_minimum = (
+            dense_min_free is not None and dense_min_free >= target.absolute_vram_floor_mb
+        )
+
     options: list[SolutionOption] = []
     exact_strategy = "full-gpu"
     exact_place: str | int | None = "all"
@@ -372,28 +513,39 @@ def build_feasibility_plan(
     # extra headroom before we have measured whether that headroom is actually necessary.
     full_gpu_clears_floor = full_free is not None and full_free >= target.absolute_vram_floor_mb
 
-    if not full_gpu_clears_floor and model.kind == ModelKind.DENSE and exact_est.predicted_dense_ngl != "all":
+    if (not full_gpu_clears_floor and model.kind == ModelKind.DENSE and exact_est.predicted_dense_ngl != "all"
+            and not dense_can_fit_full_gpu_at_minimum):
         exact_strategy = "dense-cpu-offload"
         exact_place = exact_est.predicted_dense_ngl
         exact_degradation = [DegradationKind.PERFORMANCE]
         exact_notes.append(
-            "Full-GPU is predicted below the absolute VRAM floor; target layers may need CPU placement "
-            "to preserve the requested context/KV. Expected generation penalty is HIGH for Dense models."
+            f"This model does not fit on your GPU at all, even at a minimal {DENSE_ABSOLUTE_MIN_CONTEXT}-token "
+            f"context with the most aggressive KV precision ({dense_min_kv[0]}/{dense_min_kv[1]}). Target layers "
+            "may need CPU placement to preserve the requested context/KV. Are you sure you want to offload "
+            "layers to CPU? Speed will then depend heavily on your system RAM bandwidth, and generation "
+            "penalty is HIGH for Dense models (measured: full-GPU ~45 t/s vs. heavy offload ~3-5 t/s on the "
+            "same 16 GiB card)."
         )
     elif not full_gpu_clears_floor and model.kind == ModelKind.MOE:
-        floor_place, floor_free = _moe_floor_placement(
+        floor_place, floor_free, cleared = _moe_floor_placement(
             model, hardware, baseline_vram_mb, exact_seed, target.absolute_vram_floor_mb
         )
-        if floor_place is not None:
-            exact_strategy = "moe-expert-offload"
-            exact_place = floor_place
-            exact_degradation = [DegradationKind.PERFORMANCE]
+        exact_strategy = "moe-expert-offload"
+        exact_place = floor_place
+        exact_degradation = [DegradationKind.PERFORMANCE]
+        if cleared:
             exact_notes.append(
                 f"Full-expert GPU placement (ncmoe=0) is predicted below the absolute VRAM floor; "
                 f"the smallest performance-first recovery seed is ncmoe={floor_place}. "
                 "More expert offload is a headroom alternative, not part of the exact full-GPU claim."
             )
-            full_free = floor_free
+        else:
+            exact_notes.append(
+                f"Even the maximum expert-offload placement (ncmoe={floor_place}, all experts on CPU) "
+                "is predicted below the absolute VRAM floor at this context/KV; this option is not "
+                "expected to be runnable without reducing context or KV-cache precision."
+            )
+        full_free = floor_free
     elif full_gpu_clears_floor and exact_class == ResourceClass.CONSTRAINED:
         exact_notes.append(
             "Exact target is predicted to fit full-GPU, but with less than the preferred VRAM reserve. "
@@ -446,15 +598,16 @@ def build_feasibility_plan(
             # full-GPU Q8/Q4 option into a 2x-slower CPU-offload option. Only cross the PCIe/CPU
             # boundary when full GPU is predicted below the absolute safety floor.
             full_gpu_clears_floor = free is not None and free >= target.absolute_vram_floor_mb
-            if model.kind == ModelKind.DENSE and not full_gpu_clears_floor and est.predicted_dense_ngl != "all":
+            if (model.kind == ModelKind.DENSE and not full_gpu_clears_floor and est.predicted_dense_ngl != "all"
+                    and not dense_can_fit_full_gpu_at_minimum):
                 placement = est.predicted_dense_ngl
                 strategy = "dense-cpu-offload-kv-degraded"
                 free = est.predicted_free_mb
             elif model.kind == ModelKind.MOE and not full_gpu_clears_floor:
-                placement, floor_free = _moe_floor_placement(
+                placement, floor_free, _cleared = _moe_floor_placement(
                     model, hardware, baseline_vram_mb, c, target.absolute_vram_floor_mb
                 )
-                if placement is not None and placement > 0:
+                if placement > 0:
                     strategy = "moe-expert-offload-kv-degraded"
                     free = floor_free
             rc = _resource_class(free, hardware, target.preferred_vram_reserve_mb, target.absolute_vram_floor_mb)
@@ -483,7 +636,8 @@ def build_feasibility_plan(
     # Preserve preferred KV/model semantics but reduce capability (context). These are alternatives,
     # never silently re-labelled as satisfying the exact target.
     if target.allow_context_reduction:
-        for idx, ctx in enumerate(_context_alternatives(target.context), start=1):
+        dense_extra_floor = DENSE_ABSOLUTE_MIN_CONTEXT if model.kind == ModelKind.DENSE else None
+        for idx, ctx in enumerate(_context_alternatives(target.context, extra_floor=dense_extra_floor), start=1):
             c = Candidate(
                 ctx=ctx, ngl="all", batch=512, ubatch=256,
                 threads=cores, threads_batch=cores,
@@ -495,15 +649,16 @@ def build_feasibility_plan(
             placement: str | int | None = "all"
             strategy = "full-gpu-context-reduced"
             full_gpu_clears_floor = free is not None and free >= target.absolute_vram_floor_mb
-            if model.kind == ModelKind.DENSE and not full_gpu_clears_floor and est.predicted_dense_ngl != "all":
+            if (model.kind == ModelKind.DENSE and not full_gpu_clears_floor and est.predicted_dense_ngl != "all"
+                    and not dense_can_fit_full_gpu_at_minimum):
                 placement = est.predicted_dense_ngl
                 strategy = "dense-cpu-offload-context-reduced"
                 free = est.predicted_free_mb
             elif model.kind == ModelKind.MOE and not full_gpu_clears_floor:
-                placement, floor_free = _moe_floor_placement(
+                placement, floor_free, _cleared = _moe_floor_placement(
                     model, hardware, baseline_vram_mb, c, target.absolute_vram_floor_mb
                 )
-                if placement is not None and placement > 0:
+                if placement > 0:
                     strategy = "moe-expert-offload-context-reduced"
                     free = floor_free
             rc = _resource_class(free, hardware, target.preferred_vram_reserve_mb, target.absolute_vram_floor_mb)
@@ -521,11 +676,13 @@ def build_feasibility_plan(
     # Cross trade-offs matter near the memory boundary. A 75% context with only V-cache reduced
     # can be a better Pareto point than either the full requested context with Q4/Q4 or a 50%
     # context with Q8/Q8. Older planners generated only the two extremes and could miss this knee.
-    # Keep the grid deliberately small and, for Dense, only retain full-GPU mixed options; stacking
-    # both KV/context degradation *and* Dense CPU offload is almost never an attractive automatic choice.
+    # Keep the grid deliberately small. Dense mixed options that need a little CPU placement are
+    # kept (not discarded): sort_key ranks them by measured offload severity, so a near-full-GPU
+    # mild-offload point can still beat a full-context/full-KV option that needs heavy offload.
     if target.allow_context_reduction and target.allow_kv_degradation and not target.lock_kv:
         kv_steps = _kv_ladder(target.preferred_kv_k, target.preferred_kv_v)
-        for cidx, ctx in enumerate(_context_alternatives(target.context), start=1):
+        dense_extra_floor = DENSE_ABSOLUTE_MIN_CONTEXT if model.kind == ModelKind.DENSE else None
+        for cidx, ctx in enumerate(_context_alternatives(target.context, extra_floor=dense_extra_floor), start=1):
             for kidx, (kk, vv, note) in enumerate(kv_steps, start=1):
                 c = Candidate(
                     ctx=ctx, ngl="all", batch=512, ubatch=256,
@@ -537,15 +694,25 @@ def build_feasibility_plan(
                 placement: str | int | None = "all"
                 strategy = "full-gpu-mixed-tradeoff"
                 if model.kind == ModelKind.DENSE:
-                    if free is None or free < target.absolute_vram_floor_mb:
-                        continue
+                    full_gpu_clears_floor = free is not None and free >= target.absolute_vram_floor_mb
+                    if (not full_gpu_clears_floor and est.predicted_dense_ngl != "all"
+                            and not dense_can_fit_full_gpu_at_minimum):
+                        # A moderate context/KV cut can still need a *little* CPU placement rather
+                        # than none. Keep it as a mild-offload option instead of discarding it
+                        # outright: for e.g. Vision + a very large requested context, this is often
+                        # the actual sweet spot (little CPU offload, most of the context, no KV
+                        # precision loss beyond Q8) that the pure-context or pure-KV ladders alone
+                        # cannot reach at their own coarser steps.
+                        placement = est.predicted_dense_ngl
+                        strategy = "dense-cpu-offload-mixed-tradeoff"
+                        free = est.predicted_free_mb
                 elif model.kind == ModelKind.MOE:
                     full_gpu_clears_floor = free is not None and free >= target.absolute_vram_floor_mb
                     if not full_gpu_clears_floor:
-                        placement, floor_free = _moe_floor_placement(
+                        placement, floor_free, _cleared = _moe_floor_placement(
                             model, hardware, baseline_vram_mb, c, target.absolute_vram_floor_mb
                         )
-                        if placement is not None and placement > 0:
+                        if placement > 0:
                             strategy = "moe-expert-offload-mixed-tradeoff"
                             free = floor_free
                 rc = _resource_class(free, hardware, target.preferred_vram_reserve_mb, target.absolute_vram_floor_mb)
@@ -569,42 +736,99 @@ def build_feasibility_plan(
                     vision_required=target.vision == VisionRequirement.REQUIRED, mmproj=target.mmproj,
                 ))
 
-    # Architecture-aware ordering. For Dense, heavy target-layer CPU offload is intentionally pushed
-    # behind a full-GPU KV/context trade-off; for MoE, expert offload remains a first-class option.
-    def sort_key(opt: SolutionOption) -> tuple[int, int, int, int]:
-        rank = opt.recommended_rank
-        dense_cpu = model.kind == ModelKind.DENSE and opt.strategy.startswith("dense-cpu-offload")
-        moe_cpu = model.kind == ModelKind.MOE and opt.strategy.startswith("moe-expert-offload")
-        kv_precision_risk = DegradationKind.QUALITY_RISK in opt.degradation
-        capability_loss = DegradationKind.CAPABILITY in opt.degradation
+    # MAX_CONTEXT discovery-only candidates: when the exact requested target already fits full-GPU
+    # comfortably, the solution envelope otherwise never proposes anything *larger* than what the
+    # user asked for -- every other family only shrinks context or degrades KV. That leaves the
+    # MAX_CONTEXT profile unable to show anything but a duplicate of OPTIMAL even when there is
+    # plainly unused VRAM headroom that could grow the practical context ceiling. Generate a
+    # bounded doubling ladder up to the model's native context at a safe Q8 KV tier; these carry a
+    # very low recommended_rank (never win OPTIMAL/EXACT_TARGET ranking) and are only ever measured
+    # by a dedicated discovery phase in AutotuneEngine.tune(), never selected by the main search.
+    # Gate on the same "SAFE" threshold vram.py's runtime VramThresholds already uses
+    # (free >= preferred_reserve_mb), not the stricter static COMFORTABLE resource class (~25% of
+    # total VRAM free). A real live run measured 2982 MiB free -- well above a 1024 MiB preferred
+    # reserve, full requested context, full KV precision -- yet only qualified as CONSTRAINED, not
+    # COMFORTABLE, on a 16 GiB card. free >= preferred_reserve_mb already implies free >= the
+    # absolute floor (floor <= reserve by construction), so resource_class is always COMFORTABLE or
+    # CONSTRAINED here; classifying it again would be redundant.
+    if (model.kind == ModelKind.DENSE and exact_strategy == "full-gpu"
+            and full_free is not None and full_free >= target.preferred_vram_reserve_mb
+            and model.context_length and model.context_length > target.context):
+        native_ctx = int(model.context_length)
 
-        priority = (target.priority or "balanced").lower()
-        if priority == "context":
-            # Requested context is king: keep exact-context options ahead of lower-context alternatives.
-            rank += 50 if capability_loss else 0
-            rank += 10 if dense_cpu else 0
-        elif priority == "quality":
-            # Preserve KV-cache numerical precision; capability/performance trade-offs are preferable to KV degradation.
-            rank += 60 if kv_precision_risk else 0
-            rank += 15 if dense_cpu else 0
-        elif priority == "speed":
-            # Static speed prior: avoid CPU execution strongly; smaller full-GPU contexts are acceptable.
-            rank += 70 if dense_cpu else 0
-            rank += 15 if moe_cpu else 0
-            rank -= min(20, max(0, (target.context - opt.context) // max(4096, target.context // 16))) if capability_loss else 0
-        else:  # balanced
-            if dense_cpu:
-                rank += 25
-            if moe_cpu:
-                rank -= 5
+        def _upsize_rungs(kv_k: str, kv_v: str, from_ctx: int, rank_start: int) -> tuple[list[SolutionOption], int]:
+            ladder: list[int] = []
+            step = from_ctx
+            while step < native_ctx:
+                step = min(native_ctx, step * 2)
+                rounded = min(native_ctx, (step // 4096) * 4096) if step < native_ctx else native_ctx
+                if rounded > (ladder[-1] if ladder else from_ctx):
+                    ladder.append(rounded)
+            added: list[SolutionOption] = []
+            reached = from_ctx
+            for idx, ctx in enumerate(ladder, start=rank_start):
+                c = Candidate(
+                    ctx=ctx, ngl="all", batch=512, ubatch=256, threads=cores, threads_batch=cores,
+                    kv_k=kv_k, kv_v=kv_v,
+                    vision=target.vision == VisionRequirement.REQUIRED, mmproj=target.mmproj,
+                )
+                est = estimate_static_memory(model, hardware, baseline_vram_mb, target.preferred_vram_reserve_mb, c)
+                free = est.predicted_all_free_mb
+                # predicted_all_free_mb already answers "free assuming ngl=all", which is exactly
+                # what every upsize candidate is (c.ngl == "all" by construction) -- that alone is
+                # the right bound. predicted_dense_ngl != "all" is a *different*, stricter question
+                # ("does ngl=all clear the preferred reserve, not just the absolute floor" -- see
+                # weight_budget in static_memory.py), and checking it here was overly conservative:
+                # it stopped ladder generation before the FRAGILE-but-real zone the bisection refine
+                # in AutotuneEngine._discover_max_context_upsize exists specifically to explore.
+                # Static feasibility is only a bound on how far the discovery ladder is worth
+                # generating; the actual ceiling is always confirmed by a real runtime probe.
+                if free is None or free < target.absolute_vram_floor_mb:
+                    break
+                rc = _resource_class(free, hardware, target.preferred_vram_reserve_mb, target.absolute_vram_floor_mb)
+                kv_degrades = (kv_k, kv_v) != (target.preferred_kv_k, target.preferred_kv_v)
+                added.append(SolutionOption(
+                    name=f"MAX_CONTEXT_UPSIZE_{ctx}_{kv_k}", context=ctx, kv_k=kv_k, kv_v=kv_v,
+                    strategy="full-gpu-context-upsize", predicted_free_mb=free, predicted_placement="all",
+                    resource_class=rc,
+                    degradation=[DegradationKind.QUALITY_RISK] if kv_degrades else [],
+                    degradation_notes=[
+                        f"Discovery-only candidate: requested context was {target.context} and it is "
+                        f"comfortably full-GPU, so context is grown to {ctx} at KV={kv_k}/{kv_v} to "
+                        "discover a real MAX_CONTEXT ceiling instead of duplicating OPTIMAL. Never "
+                        "selected as OPTIMAL or the primary recommendation."
+                    ],
+                    recommended_rank=idx, exact_target=False,
+                    vision_required=target.vision == VisionRequirement.REQUIRED, mmproj=target.mmproj,
+                ))
+                reached = ctx
+            return added, reached
 
-        infeasible = 1 if opt.resource_class == ResourceClass.INFEASIBLE else 0
-        unknown = 1 if opt.resource_class == ResourceClass.UNKNOWN else 0
-        # Prefer more context as a final stable tie-break unless speed priority explicitly pushed it down.
-        ctx_penalty = max(0, target.context - opt.context) // 4096
-        return (infeasible, unknown, rank, ctx_penalty)
+        q8_options, q8_reached = _upsize_rungs("q8_0", "q8_0", target.context, 950)
+        options.extend(q8_options)
+        if q8_reached < native_ctx:
+            # Q8 is the near-zero-risk "automatic" KV tier and hit a VRAM ceiling before reaching
+            # native context. Q4 is a materially more aggressive quality trade-off (SPEC: "requires
+            # occupied-context throughput qualification... semantic quality still needs a
+            # task-specific evaluation"), so it only continues growth from where Q8 stopped, rather
+            # than being offered as a first-choice discovery tier.
+            q4_options, _ = _upsize_rungs("q4_0", "q4_0", q8_reached, 950 + len(q8_options))
+            options.extend(q4_options)
 
-    options.sort(key=sort_key)
+    # Architecture-aware ordering. For MoE, expert offload remains a first-class option (cheap:
+    # only the routed experts move, not whole layers). For Dense, real CPU layer offload is
+    # drastically more expensive (measured: full-GPU ~45 t/s vs. heavy offload ~3-5 t/s on the
+    # same 16 GiB card), so under "balanced"/"speed" — priorities that care about actually getting
+    # good throughput — minimizing real Dense offload severity is made the *dominant*,
+    # lexicographically-first ranking criterion below, ahead of which option "family"
+    # (preserve-context vs preserve-KV vs mixed) produced the candidate. An additive penalty was
+    # tried first and was not enough: PRESERVE_CONTEXT_KV_* options start with a much lower base
+    # rank than PRESERVE_KV_PRECISION_CTX_*/TRADEOFF_CTX_* ones, and no severity-scaled bonus small
+    # enough to leave the other priority weightings meaningful could close that gap. "context" and
+    # "quality" keep the old additive-only behavior: both explicitly mean "accept CPU offload
+    # rather than sacrifice capability/KV precision", so offload severity must stay a minor
+    # tie-break for them, never the dominant criterion.
+    options.sort(key=lambda o: _solution_sort_key(o, model, target))
     for i, option in enumerate(options, start=1):
         option.recommended_rank = i
 
@@ -630,6 +854,14 @@ def build_feasibility_plan(
             )
     else:
         summary = "No statically credible option was found; runtime probes may still be attempted only if policy permits."
+
+    if model.kind == ModelKind.DENSE and not dense_can_fit_full_gpu_at_minimum:
+        summary += (
+            f" WARNING: this model does not fit on your GPU at all, even at a minimal "
+            f"{DENSE_ABSOLUTE_MIN_CONTEXT}-token context with the most aggressive KV precision "
+            f"({dense_min_kv[0]}/{dense_min_kv[1]}). Are you sure you want to offload layers to CPU? "
+            "Speed will then depend heavily on your system RAM bandwidth."
+        )
 
     overall = exact_option_class
     if exact_strategy != "full-gpu" and model.kind == ModelKind.DENSE:

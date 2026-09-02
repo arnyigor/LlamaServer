@@ -47,17 +47,21 @@ _COLUMNS = [
     "TG tok/s",
     "VRAM peak",
     "VRAM class",
+    "RAM peak",
     "Reason",
 ]
 
-_GOAL_PRESETS = {
-    "Recommended fast": {"mode": "quick", "priority": "balanced"},
-    "Max context": {"mode": "normal", "priority": "context"},
-    "Best quality": {"mode": "normal", "priority": "quality"},
-    "Full validation": {"mode": "deep", "priority": "balanced"},
-}
-
 _KV_CHOICES = ["f16/f16", "q8_0/q8_0", "q4_0/q4_0"]
+
+# Fixed search strategy (matches upstream llama_autotuner's GUI RECOMMENDED_PROFILE):
+# exposing mode/priority/budget as user choices let people pick the wrong branch
+# under VRAM pressure before search even started, so upstream hard-coded these
+# and removed the picker. Do not reintroduce a Quick/Balanced/Thorough selector.
+_SEARCH_MODE = "quick"
+_SEARCH_PRIORITY = "balanced"
+_SEARCH_MAX_MINUTES = 8
+_SEARCH_MAX_RUNS = 12
+_ABSOLUTE_VRAM_FLOOR_MB = 300
 
 _PROFILE_ORDER = ["OPTIMAL", "MAX_KV_PRECISION", "FASTEST", "MAX_CONTEXT"]
 
@@ -84,8 +88,9 @@ class AutoTuneWidget(QWidget):
     apply_requested = Signal(str)  # имя профиля (OPTIMAL/MAX_KV_PRECISION/...)
     open_results_requested = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, main_window=None):
         super().__init__(parent)
+        self._main_window = main_window
         self._row_by_key: Dict[str, int] = {}
         self._done_runs = 0
         self._max_runs = 0
@@ -120,41 +125,43 @@ class AutoTuneWidget(QWidget):
         main_grid.setHorizontalSpacing(10)
         main_grid.setVerticalSpacing(6)
 
-        self.goal_combo = QComboBox()
-        self.goal_combo.addItems(list(_GOAL_PRESETS.keys()))
-        self.goal_combo.setToolTip(
-            "Recommended fast — короткий прогон, сбалансированный приоритет.\n"
-            "Max context — приоритет максимально большого контекста.\n"
-            "Best quality — приоритет точности KV-кэша.\n"
-            "Full validation — самый широкий и долгий поиск."
-        )
         self.ctx_spin = QSpinBox()
         self.ctx_spin.setRange(4096, 1_048_576)
         self.ctx_spin.setSingleStep(1024)
         self.ctx_spin.setValue(65536)
         self.ctx_spin.setToolTip("Целевой контекст (токенов), который должен работать.")
-        main_grid.addWidget(QLabel("Goal:"), 0, 0)
-        main_grid.addWidget(self.goal_combo, 0, 1)
-        main_grid.addWidget(QLabel("Context:"), 0, 2)
-        main_grid.addWidget(self.ctx_spin, 0, 3)
+        main_grid.addWidget(QLabel("Context:"), 0, 0)
+        main_grid.addWidget(self.ctx_spin, 0, 1, 1, 3)
+
+        # Быстрые кнопки контекста — тот же набор степеней 2, что на Launch.
+        ctx_quick_row = QHBoxLayout()
+        ctx_quick_row.setSpacing(4)
+        ctx_quick_row.addWidget(QLabel("Quick:"))
+        self.ctx_quick_buttons: List[QPushButton] = []
+        for label, value in [
+            ("8K", 8192),
+            ("16K", 16384),
+            ("32K", 32768),
+            ("64K", 65536),
+            ("128K", 131072),
+            ("256K", 262144),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(42 if len(label) <= 3 else 50)
+            btn.setFixedHeight(24)
+            btn.setToolTip(f"Set Context to {value}")
+            btn.clicked.connect(lambda _checked=False, v=value: self.ctx_spin.setValue(v))
+            self.ctx_quick_buttons.append(btn)
+            ctx_quick_row.addWidget(btn)
+        ctx_quick_row.addStretch(1)
+        main_grid.addLayout(ctx_quick_row, 1, 0, 1, 4)
 
         self.vision_chk = QCheckBox("Vision required")
         self.vision_chk.setToolTip(
             "Требовать рабочую поддержку изображений (mmproj) — иначе поиск "
-            "прекратится, если она недоступна."
+            "прекратится, если она недоступна. Путь к mmproj — на вкладке Advanced."
         )
-        self.mmproj_edit = QLineEdit()
-        self.mmproj_edit.setPlaceholderText("auto-detect if empty")
-        self.mmproj_browse_btn = QPushButton("...")
-        self.mmproj_browse_btn.setFixedWidth(28)
-        self.mmproj_browse_btn.clicked.connect(self._browse_mmproj)
-        mmproj_row = QHBoxLayout()
-        mmproj_row.setSpacing(6)
-        mmproj_row.addWidget(self.mmproj_edit, 1)
-        mmproj_row.addWidget(self.mmproj_browse_btn)
-        main_grid.addWidget(self.vision_chk, 1, 0, 1, 2)
-        main_grid.addWidget(QLabel("mmproj:"), 1, 2)
-        main_grid.addLayout(mmproj_row, 1, 3)
+        main_grid.addWidget(self.vision_chk, 2, 0, 1, 2)
 
         main_grid.setColumnStretch(1, 1)
         main_grid.setColumnStretch(3, 1)
@@ -166,73 +173,68 @@ class AutoTuneWidget(QWidget):
         adv_grid.setHorizontalSpacing(10)
         adv_grid.setVerticalSpacing(6)
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["quick", "normal", "deep"])
-        self.priority_combo = QComboBox()
-        self.priority_combo.addItems(["balanced", "context", "quality", "speed"])
-        adv_grid.addWidget(QLabel("Search depth:"), 0, 0)
-        adv_grid.addWidget(self.mode_combo, 0, 1)
-        adv_grid.addWidget(QLabel("Priority:"), 0, 2)
-        adv_grid.addWidget(self.priority_combo, 0, 3)
-
         self.kv_combo = QComboBox()
         self.kv_combo.addItems(_KV_CHOICES)
-        self.degradation_combo = QComboBox()
-        self.degradation_combo.addItems(["auto", "report", "strict"])
-        adv_grid.addWidget(QLabel("Preferred KV:"), 1, 0)
-        adv_grid.addWidget(self.kv_combo, 1, 1)
-        adv_grid.addWidget(QLabel("Degradation policy:"), 1, 2)
-        adv_grid.addWidget(self.degradation_combo, 1, 3)
+        # Q8 KV is the practical default: near-F16 quality at roughly half the
+        # KV-cache VRAM, so most searches don't need the F16 precision ceiling.
+        self.kv_combo.setCurrentText("q8_0/q8_0")
+        adv_grid.addWidget(QLabel("Preferred KV-cache precision:"), 0, 0)
+        adv_grid.addWidget(self.kv_combo, 0, 1, 1, 3)
+        kv_note = QLabel(
+            "This tunes the attention/KV cache only. The weight quantization "
+            "of the selected GGUF is fixed."
+        )
+        kv_note.setWordWrap(True)
+        adv_grid.addWidget(kv_note, 1, 0, 1, 4)
 
-        self.allow_kv_degradation_chk = QCheckBox("Allow KV degradation")
+        self.strict_chk = QCheckBox("Exact target only (do not use context/KV alternatives)")
+        adv_grid.addWidget(self.strict_chk, 2, 0, 1, 4)
+
+        self.allow_kv_degradation_chk = QCheckBox("Allow lower-precision KV cache when necessary")
         self.allow_kv_degradation_chk.setChecked(True)
-        self.allow_context_reduction_chk = QCheckBox("Allow context reduction")
+        adv_grid.addWidget(self.allow_kv_degradation_chk, 3, 0, 1, 4)
+
+        self.allow_context_reduction_chk = QCheckBox("Allow lower-context alternatives")
         self.allow_context_reduction_chk.setChecked(True)
-        adv_grid.addWidget(self.allow_kv_degradation_chk, 2, 0, 1, 2)
-        adv_grid.addWidget(self.allow_context_reduction_chk, 2, 2, 1, 2)
+        adv_grid.addWidget(self.allow_context_reduction_chk, 4, 0, 1, 4)
 
         self.min_tg_spin = QDoubleSpinBox()
         self.min_tg_spin.setRange(0.0, 1000.0)
         self.min_tg_spin.setSpecialValueText("none")
-        self.min_pp_spin = QDoubleSpinBox()
-        self.min_pp_spin.setRange(0.0, 5000.0)
-        self.min_pp_spin.setSpecialValueText("none")
-        adv_grid.addWidget(QLabel("Min TG t/s:"), 3, 0)
-        adv_grid.addWidget(self.min_tg_spin, 3, 1)
-        adv_grid.addWidget(QLabel("Min PP t/s:"), 3, 2)
-        adv_grid.addWidget(self.min_pp_spin, 3, 3)
-
-        self.mtp_combo = QComboBox()
-        self.mtp_combo.addItems(["auto", "on", "off"])
         self.vram_margin_spin = QSpinBox()
         self.vram_margin_spin.setRange(0, 65536)
         self.vram_margin_spin.setValue(1024)
-        adv_grid.addWidget(QLabel("MTP:"), 4, 0)
-        adv_grid.addWidget(self.mtp_combo, 4, 1)
-        adv_grid.addWidget(QLabel("Preferred VRAM margin (MiB):"), 4, 2)
-        adv_grid.addWidget(self.vram_margin_spin, 4, 3)
+        adv_grid.addWidget(QLabel("Minimum generation speed (t/s, optional):"), 5, 0)
+        adv_grid.addWidget(self.min_tg_spin, 5, 1)
+        adv_grid.addWidget(QLabel("Preferred free VRAM (MiB):"), 5, 2)
+        adv_grid.addWidget(self.vram_margin_spin, 5, 3)
 
-        self.vram_floor_spin = QSpinBox()
-        self.vram_floor_spin.setRange(0, 8192)
-        self.vram_floor_spin.setValue(300)
-        self.require_vram_margin_chk = QCheckBox("Require margin (production-safe)")
-        adv_grid.addWidget(self.require_vram_margin_chk, 5, 0, 1, 2)
-        adv_grid.addWidget(QLabel("Absolute VRAM floor (MiB):"), 5, 2)
-        adv_grid.addWidget(self.vram_floor_spin, 5, 3)
+        self.require_vram_margin_chk = QCheckBox(
+            "Production-safe: require the full preferred VRAM reserve in FULL/FINAL"
+        )
+        adv_grid.addWidget(self.require_vram_margin_chk, 6, 0, 1, 4)
 
-        self.max_time_spin = QSpinBox()
-        self.max_time_spin.setRange(0, 600)
-        self.max_runs_spin = QSpinBox()
-        self.max_runs_spin.setRange(0, 500)
-        adv_grid.addWidget(QLabel("Max time (min, 0=auto):"), 6, 0)
-        adv_grid.addWidget(self.max_time_spin, 6, 1)
-        adv_grid.addWidget(QLabel("Max runs (0=auto):"), 6, 2)
-        adv_grid.addWidget(self.max_runs_spin, 6, 3)
+        self.mtp_combo = QComboBox()
+        self.mtp_combo.addItems(["auto", "on", "off"])
+        adv_grid.addWidget(QLabel("MTP/speculative decoding:"), 7, 0)
+        adv_grid.addWidget(self.mtp_combo, 7, 1)
 
         self.runtime_args_edit = QLineEdit()
         self.runtime_args_edit.setPlaceholderText("preserved verbatim in every tested/final command")
-        adv_grid.addWidget(QLabel("Extra runtime args:"), 7, 0)
-        adv_grid.addWidget(self.runtime_args_edit, 7, 1, 1, 3)
+        adv_grid.addWidget(QLabel("Extra runtime args:"), 8, 0)
+        adv_grid.addWidget(self.runtime_args_edit, 8, 1, 1, 3)
+
+        self.mmproj_edit = QLineEdit()
+        self.mmproj_edit.setPlaceholderText("auto-detect if empty")
+        self.mmproj_browse_btn = QPushButton("...")
+        self.mmproj_browse_btn.setFixedWidth(28)
+        self.mmproj_browse_btn.clicked.connect(self._browse_mmproj)
+        mmproj_row = QHBoxLayout()
+        mmproj_row.setSpacing(6)
+        mmproj_row.addWidget(self.mmproj_edit, 1)
+        mmproj_row.addWidget(self.mmproj_browse_btn)
+        adv_grid.addWidget(QLabel("Vision projector override:"), 9, 0)
+        adv_grid.addLayout(mmproj_row, 9, 1, 1, 3)
 
         adv_grid.setColumnStretch(1, 1)
         adv_grid.setColumnStretch(3, 1)
@@ -284,8 +286,28 @@ class AutoTuneWidget(QWidget):
         self.start_btn.clicked.connect(self.start_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.open_results_btn.clicked.connect(self.open_results_requested.emit)
-        self.goal_combo.currentTextChanged.connect(self._apply_goal_preset)
-        self._apply_goal_preset(self.goal_combo.currentText())
+
+    def _sync_model_items(self) -> None:
+        """Repopulate ``model_combo`` from the Launch page's model combo.
+
+        Full repopulation (rather than reacting to selection changes) avoids
+        the earlier bug where ``currentIndexChanged`` fired while the source
+        combo still had a single item, leaving this picker with just one
+        entry after a scan.
+        """
+        source = getattr(self._main_window, "model_combo", None)
+        if source is None:
+            return
+        current_path = self.model_combo.currentData()
+        self.model_combo.blockSignals(True)
+        try:
+            self.model_combo.clear()
+            for i in range(source.count()):
+                self.model_combo.addItem(source.itemText(i), source.itemData(i))
+        finally:
+            self.model_combo.blockSignals(False)
+        idx = self.model_combo.findData(current_path)
+        self.model_combo.setCurrentIndex(idx if idx >= 0 else (0 if source.count() else -1))
 
     def _browse_mmproj(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -294,36 +316,37 @@ class AutoTuneWidget(QWidget):
         if path:
             self.mmproj_edit.setText(path)
 
-    def _apply_goal_preset(self, label: str) -> None:
-        preset = _GOAL_PRESETS.get(label)
-        if not preset:
-            return
-        self.mode_combo.setCurrentText(preset["mode"])
-        self.priority_combo.setCurrentText(preset["priority"])
-
     # -------------------------------------------------------------- options
 
     def options(self) -> Dict[str, object]:
         kv_k, kv_v = self.kv_combo.currentText().split("/", 1)
         return {
             "ctx": self.ctx_spin.value(),
-            "vision": "required" if self.vision_chk.isChecked() else "auto",
+            # "off", never "auto": session.py silently promotes "auto" to
+            # REQUIRED whenever an mmproj happens to be auto-detected next to
+            # the model, regardless of this checkbox. Upstream's own GUI
+            # never sends "auto" for the same reason — it's a CLI-only power
+            # option, not something a checkbox should implicitly trigger.
+            "vision": "required" if self.vision_chk.isChecked() else "off",
             "mmproj": self.mmproj_edit.text().strip() or None,
-            "mode": self.mode_combo.currentText(),
-            "priority": self.priority_combo.currentText(),
+            # Fixed search strategy — see upstream llama_autotuner's GUI hard
+            # rule (SPECIFICATION.md "GUI one-click workflow"): never expose
+            # mode/priority/budget as a pre-search choice.
+            "mode": _SEARCH_MODE,
+            "priority": _SEARCH_PRIORITY,
             "kv_k": kv_k,
             "kv_v": kv_v,
-            "degradation_policy": self.degradation_combo.currentText(),
+            "degradation_policy": "strict" if self.strict_chk.isChecked() else "auto",
             "allow_kv_degradation": self.allow_kv_degradation_chk.isChecked(),
             "allow_context_reduction": self.allow_context_reduction_chk.isChecked(),
             "min_tg_tps": self.min_tg_spin.value() or None,
-            "min_pp_tps": self.min_pp_spin.value() or None,
+            "min_pp_tps": None,
             "mtp_mode": self.mtp_combo.currentText(),
             "vram_margin_mb": self.vram_margin_spin.value(),
             "require_vram_margin": self.require_vram_margin_chk.isChecked(),
-            "absolute_vram_floor_mb": self.vram_floor_spin.value(),
-            "max_minutes": self.max_time_spin.value() or None,
-            "max_runs": self.max_runs_spin.value() or None,
+            "absolute_vram_floor_mb": _ABSOLUTE_VRAM_FLOOR_MB,
+            "max_minutes": _SEARCH_MAX_MINUTES,
+            "max_runs": _SEARCH_MAX_RUNS,
             "runtime_args": self.runtime_args_edit.text().split(),
         }
 
@@ -414,6 +437,7 @@ class AutoTuneWidget(QWidget):
             f"{m.tg_tps:.1f}" if m.tg_tps else "",
             f"{m.vram_peak_mb:.0f}" if m.vram_peak_mb else "",
             m.vram_operating_class or "",
+            f"{m.ram_peak_mb:.0f}" if m.ram_peak_mb else "",
             result.reason,
         ]
         for col, value in enumerate(values):
@@ -427,7 +451,7 @@ class AutoTuneWidget(QWidget):
         while self.profiles_layout.count():
             child = self.profiles_layout.takeAt(0)
             widget = child.widget()
-            if widget is not None:
+            if widget is not None and widget is not self.profiles_placeholder:
                 widget.deleteLater()
         self.profiles_layout.addWidget(self.profiles_placeholder)
         self.profiles_placeholder.setVisible(True)

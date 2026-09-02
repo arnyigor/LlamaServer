@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 
 from llama_autotuner.models import GpuSnapshot
+from llama_autotuner.subprocess_util import no_console_kwargs
 
 
 class NvidiaSmiError(RuntimeError):
@@ -32,7 +33,10 @@ class NvidiaSmiBackend:
     def _query(self, fields: list[str]) -> list[list[str]]:
         cmd = [self.exe, f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"]
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=True)
+            cp = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=8, check=True,
+                **no_console_kwargs(),
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             raise NvidiaSmiError(f"nvidia-smi query failed: {exc}") from exc
         return [row for row in csv.reader(io.StringIO(cp.stdout), skipinitialspace=True) if row]
@@ -72,7 +76,10 @@ class NvidiaSmiBackend:
     def compute_processes(self) -> list[dict[str, str]]:
         cmd = [self.exe, "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"]
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+            cp = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5, check=False,
+                **no_console_kwargs(),
+            )
         except OSError:
             return []
         out = []

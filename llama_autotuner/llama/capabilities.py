@@ -4,6 +4,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+from llama_autotuner.subprocess_util import no_console_kwargs
+
 
 @dataclass(slots=True)
 class LlamaCapabilities:
@@ -17,7 +19,10 @@ class LlamaCapabilities:
 
 def discover(exe: str) -> LlamaCapabilities:
     def run(arg: str) -> str:
-        cp = subprocess.run([exe, arg], capture_output=True, text=True, timeout=15, check=False)
+        cp = subprocess.run(
+            [exe, arg], capture_output=True, text=True, timeout=15, check=False,
+            **no_console_kwargs(),
+        )
         return (cp.stdout or "") + "\n" + (cp.stderr or "")
     version = run("--version")
     help_text = run("--help")

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
@@ -20,7 +21,10 @@ from src.core.gguf_parser import (
     quant_from_filename,
     detect_mtp_draft_for_model,
     is_mtp_draft_file,
+    is_non_primary_split_shard,
     is_projector_file,
+    split_shard_info,
+    split_shard_total_size,
 )
 from src.utils.file_utils import (
     validate_path,
@@ -31,7 +35,7 @@ from src.services.hf_downloader import (
     list_all_local_model_entries,
     list_all_partial_downloads,
 )
-from src.services.threads import LlamaCppUpdater
+from src.services.threads import LlamaCppUpdater, LlamaCppUpdateChecker, ModelScanner
 
 
 class TestValidatePath(unittest.TestCase):
@@ -166,6 +170,49 @@ class TestGGUFParser(unittest.TestCase):
             self.assertIn("direct-model-Q8_0.gguf", relatives)
             self.assertEqual(len(result["entries"]), 2)
 
+    def test_split_shard_detection(self):
+        """Shard 2+ of a split GGUF must be recognized and skipped by scanners."""
+        self.assertIsNone(split_shard_info("model-Q4_K_M.gguf"))
+        self.assertEqual(split_shard_info("flash-Q2_K-00001-of-00003.gguf"), (1, 3))
+        self.assertEqual(split_shard_info("flash-Q2_K-00003-of-00003.gguf"), (3, 3))
+
+        self.assertFalse(is_non_primary_split_shard("flash-Q2_K-00001-of-00003.gguf"))
+        self.assertTrue(is_non_primary_split_shard("flash-Q2_K-00002-of-00003.gguf"))
+        self.assertFalse(is_non_primary_split_shard("model-Q4_K_M.gguf"))
+
+    def test_split_shard_total_size_sums_existing_shards(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard1 = root / "flash-Q2_K-00001-of-00003.gguf"
+            shard2 = root / "flash-Q2_K-00002-of-00003.gguf"
+            shard3 = root / "flash-Q2_K-00003-of-00003.gguf"
+            shard1.write_bytes(b"a" * 1000)
+            shard2.write_bytes(b"b" * 2000)
+            shard3.write_bytes(b"c" * 3000)
+
+            self.assertEqual(split_shard_total_size(shard1), 6000)
+            # Querying from any shard finds the whole set.
+            self.assertEqual(split_shard_total_size(shard3), 6000)
+
+    def test_split_shard_total_size_non_split_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = Path(tmpdir) / "model-Q4_K_M.gguf"
+            model.write_bytes(b"x" * 1234)
+            self.assertEqual(split_shard_total_size(model), 1234)
+
+    def test_extract_model_info_size_gib_covers_all_shards(self):
+        """size_gib (used for MoE-offload/context advice) must reflect total
+        weights, not just the first shard on disk (Flash-Next-style splits)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard1 = root / "flash-Q2_K-00001-of-00002.gguf"
+            shard2 = root / "flash-Q2_K-00002-of-00002.gguf"
+            shard1.write_bytes(b"a" * (1024**3))
+            shard2.write_bytes(b"b" * (1024**3))
+
+            info = extract_model_info(shard1)
+            self.assertEqual(info["size_gib"], 2.0)
+
     def test_recommend_context(self):
         """Рекомендация размера контекста."""
         # Маленькая модель Q2 (3 GiB <= 5 threshold)
@@ -185,6 +232,33 @@ class TestGGUFParser(unittest.TestCase):
         result = recommend_context(info)
         # Q4 -> 8192, size 8 < 14 (MEDIUM) и > 5 (SMALL), нет ограничений
         self.assertEqual(result, 8192)
+
+
+class TestModelScannerSplitHandling(unittest.TestCase):
+    """Split-GGUF models (e.g. Flash-Next, 3-shard) must appear once in the
+    Launch/AutoTune model list, pointed at shard 1 — not once per shard."""
+
+    def test_scan_lists_split_model_once_at_shard_one(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            folder = root / "Flash-Next-GGUF"
+            folder.mkdir()
+            shard1 = folder / "flash-next-Q2_K_XL-00001-of-00003.gguf"
+            shard2 = folder / "flash-next-Q2_K_XL-00002-of-00003.gguf"
+            shard3 = folder / "flash-next-Q2_K_XL-00003-of-00003.gguf"
+            for shard in (shard1, shard2, shard3):
+                shard.write_bytes(b"x" * 1024)
+            other = root / "other-model-Q4_K_M.gguf"
+            other.write_bytes(b"y" * 512)
+
+            scanner = ModelScanner(str(root))
+            found = []
+            scanner.models_found.connect(found.append)
+            scanner.run()
+
+            self.assertEqual(len(found), 1)
+            paths = {m["path"] for m in found[0]}
+            self.assertEqual(paths, {str(shard1), str(other)})
 
 
 class TestLlamaCppUpdater(unittest.TestCase):
@@ -305,6 +379,56 @@ class TestLlamaCppUpdater(unittest.TestCase):
             # Должен выбросить исключение
             with self.assertRaises(RuntimeError):
                 self.updater.safe_extract_zip(zip_path, tmpdir / "extract")
+
+
+class TestLlamaCppUpdateChecker(unittest.TestCase):
+    """Passive per-CUDA-version update check (no download)."""
+
+    @patch("urllib.request.urlopen")
+    def test_flags_outdated_and_up_to_date_versions(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {
+                "tag_name": "b6702",
+                "assets": [
+                    {"name": "llama-b6702-bin-win-cuda-12.4-x64.zip"},
+                    {"name": "llama-b6702-bin-win-cuda-13.3-x64.zip"},
+                ],
+            }
+        ).encode()
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            # CUDA 12 build present but stale.
+            cuda12_dir = base / "llama-win-cuda-12.4-x64"
+            cuda12_dir.mkdir()
+            (cuda12_dir / "llama-server.exe").write_bytes(b"fake")
+            # CUDA 13 not installed at all.
+
+            checker = LlamaCppUpdateChecker(str(base))
+            with patch.object(
+                LlamaCppUpdater, "get_current_build", side_effect=[6650, None]
+            ):
+                results = []
+                checker.checked.connect(results.append)
+                checker.run()
+
+            self.assertEqual(len(results), 1)
+            result = results[0]
+            self.assertEqual(result["12"], {"current": 6650, "latest": 6702})
+            self.assertEqual(result["13"], {"current": None, "latest": 6702})
+
+    @patch("urllib.request.urlopen")
+    def test_emits_error_on_network_failure(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("boom")
+        checker = LlamaCppUpdateChecker("/fake/base")
+        errors = []
+        checker.error.connect(errors.append)
+        checker.run()
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Network error", errors[0])
 
 
 class TestMemoryVizParser(unittest.TestCase):

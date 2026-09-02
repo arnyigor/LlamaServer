@@ -5,6 +5,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from llama_autotuner.subprocess_util import no_console_kwargs
+
 
 @dataclass(slots=True)
 class FitSuggestion:
@@ -67,7 +69,10 @@ def query_fit_params(*, server_exe: str, model_path: str, context: int,
         "-fitt", str(int(margin_mb)),
     ]
     try:
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False,
+            **no_console_kwargs(),
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     text = (cp.stdout or "") + "\n" + (cp.stderr or "")

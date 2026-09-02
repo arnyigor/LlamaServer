@@ -25,6 +25,6 @@ class AutoTunePage(QScrollArea):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(10)
         self.setWidget(inner)
-        mw.autotune = AutoTuneWidget()
+        mw.autotune = AutoTuneWidget(main_window=mw)
         lay.addWidget(mw.autotune)
         lay.addStretch()

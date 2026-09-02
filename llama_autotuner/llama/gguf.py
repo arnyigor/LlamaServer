@@ -76,6 +76,13 @@ def _is_expert_tensor(name: str) -> bool:
     return any(marker in n for marker in markers)
 
 
+def _is_cpu_resident_tensor(name: str) -> bool:
+    """Gemma3n-style per-layer embedding tensors are huge per-token lookup tables that
+    llama.cpp keeps on CPU regardless of -ngl/-ncmoe; charging them against the GPU
+    weight budget produces a wildly pessimistic (and wrong) feasibility estimate."""
+    return "per_layer" in name.lower()
+
+
 def _read_gguf_shard(path: Path) -> dict[str, Any]:
     """Read one GGUF header without touching its tensor payload."""
     size = os.path.getsize(path)
@@ -173,6 +180,7 @@ def inspect_gguf(path: str) -> ModelInfo:
     block_bytes: dict[int, int] = {}
     block_expert_bytes: dict[int, int] = {}
     non_block_bytes = 0
+    cpu_resident_bytes = 0
     tensor_data_bytes = 0
 
     for shard in shards:
@@ -201,6 +209,8 @@ def inspect_gguf(path: str) -> ModelInfo:
                     block_expert_bytes[block] = block_expert_bytes.get(block, 0) + storage
             else:
                 non_block_bytes += storage
+                if _is_cpu_resident_tensor(str(info["name"])):
+                    cpu_resident_bytes += storage
 
     arch = meta.get("general.architecture")
 
@@ -272,4 +282,5 @@ def inspect_gguf(path: str) -> ModelInfo:
         mtp_block_count=int(nextn_predict_layers),
         split_count=split_count,
         split_parts_found=parts_found,
+        cpu_resident_tensor_bytes=cpu_resident_bytes,
     )

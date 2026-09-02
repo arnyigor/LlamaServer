@@ -85,6 +85,7 @@ from src.core.server_launch import ServerLaunchController
 from src.core.server_manager import ServerManager
 from src.core.vram_estimator import full_vram_estimate
 from llama_autotuner.session import SessionConfig
+from llama_autotuner.llama.library import preferred_mmproj
 from src.services.autotune_manager import AutoTuneManager
 from src.services.hf_download_coordinator import HfDownloadCoordinator
 from src.services.integration_manager import IntegrationManager
@@ -100,7 +101,7 @@ from src.services.hf_downloader import (
     normalize_hf_repo_id,
     partial_download_info,
 )
-from src.services.threads import ModelScanner, LlamaCppUpdater
+from src.services.threads import ModelScanner, LlamaCppUpdater, LlamaCppUpdateChecker
 from src.ui.dialogs import confirm_destructive_action
 from src.ui.log_manager import LogManager
 from src.ui.main_window import MainWindowUI
@@ -157,6 +158,9 @@ class LlamaGUI:
         self.stats = RuntimeStatsController()
         self._connect_stats_signals()
 
+        self._llamacpp_update_info = {}
+        self._update_checker = None
+
         self.config.load()
         self.config.apply_to_ui(self.ui)
         self._normalize_llamacpp_path_ui()
@@ -167,6 +171,7 @@ class LlamaGUI:
         self._refresh_overview()
         QTimer.singleShot(250, self.auto_scan_models)
         QTimer.singleShot(350, self._refresh_hf_partial_status)
+        QTimer.singleShot(600, self.auto_check_llamacpp_updates)
 
     @property
     def _mtp_draft_error_seen(self) -> bool:
@@ -1075,6 +1080,15 @@ class LlamaGUI:
             color = STATUS_COLOR_MUTED
 
         parts.append("model selected" if model_path else "select model")
+
+        update_info = self._llamacpp_update_info.get(cuda_ver)
+        if (
+            update_info
+            and update_info.get("current") is not None
+            and update_info["current"] < update_info["latest"]
+        ):
+            parts.append(f"update available: b{update_info['current']} → b{update_info['latest']}")
+            color = STATUS_COLOR_WARNING
 
         if cuda_ver == "13":
             note = "CUDA 13 requires NVIDIA driver 580+; best for RTX 50/Blackwell."
@@ -2219,14 +2233,9 @@ class LlamaGUI:
         self._refresh_hf_download_summary()
 
     def on_models_found(self, models):
-        self.ui.models = models
-        self.ui.models_by_path = {m["path"]: m for m in models}
         self._syncing_model_combo = True
         try:
-            for combo in (self.ui.model_combo, self.ui.autotune.model_combo):
-                combo.clear()
-                for m in models:
-                    combo.addItem(m["display"], m["path"])
+            self.ui.set_model_list(models)
         finally:
             self._syncing_model_combo = False
         last = self.config.settings.last_model_path
@@ -3708,6 +3717,19 @@ class LlamaGUI:
         self.ui.start_btn.setEnabled(False)
         self.ui.stop_btn.setEnabled(True)
 
+    def _auto_detect_mmproj(self, model_path: str) -> tuple[str, list[Path]]:
+        """Ищет companion mmproj GGUF рядом с моделью, если поле mmproj пустое."""
+        try:
+            folder = Path(model_path).expanduser().resolve().parent
+            candidates = [
+                p for p in folder.glob("*.gguf")
+                if p.name.lower().startswith("mmproj") or "-mmproj" in p.name.lower()
+            ]
+        except OSError:
+            return "", []
+        best = preferred_mmproj(candidates)
+        return (str(best) if best else ""), candidates
+
     def _current_model_info(self):
         model_path = self._current_model_path()
         if not model_path:
@@ -3757,13 +3779,22 @@ class LlamaGUI:
             f"PID {p.get('ProcessId')}: {p.get('Name')} — {p.get('ExecutablePath') or ''}"
             for p in processes[:8]
         )
-        QMessageBox.warning(
+        reply = QMessageBox.question(
             self.ui,
             "AutoTune blocked",
             "Found already running llama.cpp process. It can occupy VRAM/GPU and make AutoTune results invalid.\n\n"
-            "Stop it first, then start AutoTune again.\n\n"
+            "Stop it first, then start AutoTune again — or continue anyway if you know it's safe "
+            "(e.g. a CPU-only process that won't compete for GPU/VRAM).\n\n"
             f"{details}",
+            QMessageBox.StandardButton.Ignore | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
+        if reply == QMessageBox.StandardButton.Ignore:
+            self.log_mgr.append(
+                "AutoTune: external llama.cpp process detected, user chose to continue anyway.",
+                "warn",
+            )
+            return False
         self.log_mgr.append(
             "AutoTune blocked: external llama.cpp process is running. Stop it before benchmarking.",
             "warn",
@@ -3794,12 +3825,25 @@ class LlamaGUI:
             return
 
         options = self.ui.autotune.options()
+        mmproj = options["mmproj"]
+        if not mmproj:
+            mmproj, mmproj_candidates = self._auto_detect_mmproj(model_path)
+            if mmproj:
+                self.ui.autotune.mmproj_edit.setText(mmproj)
+                self.log_mgr.append(f"AutoTune: auto-detected mmproj {mmproj}")
+            elif mmproj_candidates:
+                self.log_mgr.append(
+                    "AutoTune: found multiple candidate mmproj files next to the model, "
+                    "pick one manually in the mmproj field: "
+                    + ", ".join(p.name for p in mmproj_candidates),
+                    "warn",
+                )
         config = SessionConfig(
             server_exe=server_exe,
             model_path=model_path,
             ctx=int(options["ctx"]),
             vision=options["vision"],
-            mmproj=options["mmproj"],
+            mmproj=mmproj,
             mode=options["mode"],
             priority=options["priority"],
             kv_k=options["kv_k"],
@@ -4038,6 +4082,57 @@ class LlamaGUI:
         if not srv and not self.launcher.is_pending:
             self._reset_restart_indicator()
         self._refresh_overview()
+
+    def auto_check_llamacpp_updates(self):
+        """Passive startup check: is a newer llama.cpp build available for
+        CUDA 12 and/or 13? Does not download — just flags it in the UI so the
+        user knows before clicking Update."""
+        exe = self.ui.exe_path.text().strip()
+        if not exe:
+            return
+        if self._update_checker and self._update_checker.isRunning():
+            return
+        self._update_checker = LlamaCppUpdateChecker(exe)
+        self._update_checker.checked.connect(self._on_llamacpp_update_checked)
+        self._update_checker.error.connect(self._on_llamacpp_update_check_error)
+        if not (self.updater and self.updater.isRunning()):
+            self.ui.update_status.setText("Checking for llama.cpp updates...")
+            self.ui.update_status.setStyleSheet("color: " + STATUS_COLOR_MUTED + ";")
+            self.ui.update_progress.setRange(0, 0)  # indeterminate
+            self.ui.update_progress.setVisible(True)
+        self._update_checker.start()
+
+    def _on_llamacpp_update_checked(self, result: dict):
+        self._llamacpp_update_info = result
+        parts = []
+        any_update = False
+        for version in ("12", "13"):
+            info = result.get(version)
+            if not info:
+                continue
+            current, latest = info.get("current"), info.get("latest")
+            if current is None:
+                parts.append(f"CUDA {version}: not installed")
+            elif current < latest:
+                parts.append(f"CUDA {version}: update available (b{current} → b{latest})")
+                any_update = True
+            else:
+                parts.append(f"CUDA {version}: up to date (b{current})")
+        if not (self.updater and self.updater.isRunning()):
+            self.ui.update_status.setText(" · ".join(parts))
+            color = STATUS_COLOR_WARNING if any_update else STATUS_COLOR_MUTED
+            self.ui.update_status.setStyleSheet("color: " + color + ";")
+            self.ui.update_progress.setRange(0, 100)
+            self.ui.update_progress.setVisible(False)
+        self._update_cuda_status()
+
+    def _on_llamacpp_update_check_error(self, message: str):
+        self.log_mgr.append(f"llama.cpp update check: {message}", "warning")
+        if not (self.updater and self.updater.isRunning()):
+            self.ui.update_status.setText(f"Update check failed: {message}")
+            self.ui.update_status.setStyleSheet("color: " + STATUS_COLOR_WARNING + ";")
+            self.ui.update_progress.setRange(0, 100)
+            self.ui.update_progress.setVisible(False)
 
     def update_llamacpp(self):
         if self.server.is_server_running() or self.server.is_bench_running():

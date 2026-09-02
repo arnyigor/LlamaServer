@@ -82,6 +82,10 @@ class ModelInfo:
     # one file.  Defaults preserve positional construction used by older callers.
     split_count: int = 1
     split_parts_found: int = 1
+    # Some architectures (Gemma3n-style per-layer embeddings) keep specific huge lookup
+    # tensors CPU-resident by design in llama.cpp, regardless of -ngl/-ncmoe. This is the
+    # subset of non_block_tensor_bytes that must never be charged against the GPU budget.
+    cpu_resident_tensor_bytes: int = 0
 
 
 @dataclass(slots=True)
