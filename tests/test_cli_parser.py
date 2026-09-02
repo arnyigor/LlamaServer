@@ -10,9 +10,9 @@ from src.core.cli_parser import parse_llama_server_command
 class TestCliParser(unittest.TestCase):
     def test_parses_known_ui_flags_and_keeps_unknown_extra(self):
         parsed = parse_llama_server_command(
-            r'llama-server.exe -m G:\Models\model.gguf --host 127.0.0.1 '
-            r'--port 8081 -c 32768 -ngl all -ncmoe 12 -ctk q8_0 -ctv q4_0 '
-            r'--flash-attn off --top-p 0.9 --min-p 0.05 --metrics'
+            r"llama-server.exe -m G:\Models\model.gguf --host 127.0.0.1 "
+            r"--port 8081 -c 32768 -ngl all -ncmoe 12 -ctk q8_0 -ctv q4_0 "
+            r"--flash-attn off --top-p 0.9 --min-p 0.05 --metrics"
         )
 
         self.assertEqual(parsed.model_path, r"G:\Models\model.gguf")
@@ -86,9 +86,8 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(parsed.model_path, "G:\\Models\\model.gguf")
         self.assertEqual(parsed.settings["host"], "127.0.0.1")
         self.assertEqual(parsed.settings["port"], 8080)
-        self.assertEqual(parsed.settings["cuda_device"], "CUDA0")
-        self.assertEqual(parsed.settings["split_mode"], "none")
-        self.assertEqual(parsed.settings["main_gpu"], 0)
+        # cuda_device / split_mode / main_gpu — EXTRA (managed=False),
+        # поэтому после правки парсера уходят в extra_args, а не в settings.
         self.assertTrue(parsed.settings["gpu_layers_all"])
         self.assertEqual(parsed.settings["ctx_size"], 65536)
         self.assertTrue(parsed.settings["speculative_mtp"])
@@ -96,9 +95,11 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(parsed.settings["spec_draft_p_min"], 0.8)
         self.assertEqual(parsed.settings["spec_draft_gpu_layers"], "all")
         self.assertEqual(parsed.settings["spec_draft_device"], "CUDA0")
-        self.assertEqual(parsed.extra_args, "--spec-draft-n-min 0")
+        self.assertEqual(
+            parsed.extra_args,
+            "--device CUDA0 --split-mode none --main-gpu 0 --spec-draft-n-min 0",
+        )
         self.assertNotIn("^", parsed.extra_args)
-
 
     def test_parses_reasoning_controls(self):
         parsed = parse_llama_server_command(

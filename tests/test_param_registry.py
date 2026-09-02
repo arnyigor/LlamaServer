@@ -105,10 +105,6 @@ _OLD_MANAGED_EXTRA_FLAGS = {
     "--n-gpu-layers",
     "-c",
     "--ctx-size",
-    "--ctx-checkpoints",
-    "--cache-ram",
-    "--kv-unified",
-    "-kvu",
     "--spec-type",
     "--spec-draft-n-max",
     "--spec-draft-p-min",
@@ -117,7 +113,6 @@ _OLD_MANAGED_EXTRA_FLAGS = {
     "-md",
     "--model-draft",
     "--jinja",
-    "--chat-template-file",
     "--flash-attn",
     "-fa",
     "--fit",
@@ -161,11 +156,6 @@ _OLD_MANAGED_EXTRA_FLAGS = {
     "--mmproj",
     "--no-mmproj",
     "--no-mmproj-offload",
-    "--mlock",
-    "--verbose",
-    "--log-timestamps",
-    "--context-shift",
-    "--no-webui",
 }
 
 # --- Старый _SAMPLING_EXTRA_FIELDS из config.py ------------------------------
@@ -354,18 +344,6 @@ class TestParamRegistryParity:
         assert set(MANAGED_EXTRA_FLAGS) - _OLD_MANAGED_EXTRA_FLAGS == {
             "-ngld",
             "--metrics",
-            "--reasoning-effort",
-            "--reasoning-preserve",
-            "--no-reasoning-preserve",
-            "--reasoning-budget",
-            "--reasoning-budget-message",
-            # Спеки use_mmap/cont_batching/cache_prompt нейтрализованы
-            # (managed=False, без cli_flags), поэтому их флаги больше не
-            # управляются реестром и не вырезаются из extra_params.
-            "--mmap",
-            "--no-mmap",
-            "--no-cont-batching",
-            "--no-cache-prompt",
         }
 
     def test_sampling_extra_fields_match_old(self):

@@ -258,6 +258,57 @@ def detect_mmproj_for_model(path: Union[str, Path]) -> str:
     return str(candidates[0])
 
 
+# llama.cpp split-GGUF naming convention: NAME-00001-of-00003.gguf. Pointing
+# `-m` at shard 1 makes llama.cpp auto-discover the remaining shards by name;
+# shards 2+ are not independently loadable and must not be listed as models.
+_SPLIT_SHARD_RE = re.compile(
+    r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<count>\d{5})\.gguf$", re.IGNORECASE
+)
+
+
+def split_shard_info(path: Union[str, Path]):
+    """Return ``(index, count)`` (1-based) for a split-GGUF shard, else ``None``."""
+    match = _SPLIT_SHARD_RE.match(Path(path).name)
+    if not match:
+        return None
+    return int(match.group("idx")), int(match.group("count"))
+
+
+def is_non_primary_split_shard(path: Union[str, Path]) -> bool:
+    """True for shard 2+ of a split GGUF (shard 1 is the canonical model path)."""
+    info = split_shard_info(path)
+    return info is not None and info[0] != 1
+
+
+def split_shard_total_size(path: Union[str, Path]) -> int:
+    """Combined size in bytes of every on-disk shard of a split GGUF.
+
+    ``path`` may be any shard of the set. Falls back to the size of ``path``
+    itself when it is not part of a split.
+    """
+    file_path = Path(path)
+    match = _SPLIT_SHARD_RE.match(file_path.name)
+    if not match:
+        try:
+            return file_path.stat().st_size
+        except OSError:
+            return 0
+    base, count = match.group("base"), int(match.group("count"))
+    total = 0
+    for idx in range(1, count + 1):
+        shard = file_path.with_name(f"{base}-{idx:05d}-of-{count:05d}.gguf")
+        try:
+            total += shard.stat().st_size
+        except OSError:
+            continue
+    if total:
+        return total
+    try:
+        return file_path.stat().st_size
+    except OSError:
+        return 0
+
+
 def is_projector_file(path: Union[str, Path]) -> bool:
     """Проверка, является ли файл projector-файлом."""
     name = Path(path).name.lower()
@@ -390,7 +441,7 @@ def extract_model_info(path: Union[str, Path]) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "path": str(file_path),
         "name": file_path.name,
-        "size_gib": round(file_path.stat().st_size / (1024**3), 2)
+        "size_gib": round(split_shard_total_size(file_path) / (1024**3), 2)
         if file_path.exists()
         else 0,
         "architecture": "",

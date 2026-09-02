@@ -8,7 +8,7 @@ LlamaGUI, действия наружу — через сигналы; MainWindo
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -28,7 +28,8 @@ class PathsPanel(CollapsiblePanel):
     browse_models_requested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("Advanced: Paths and llama.cpp", parent=parent)
+        # Спойлер убран (collapsible=False): панель всегда раскрыта.
+        super().__init__("Paths and llama.cpp", parent=parent, collapsible=False)
         box = QGroupBox("Paths")
         lay = QVBoxLayout(box)
         lay.setContentsMargins(12, 18, 12, 12)
@@ -59,6 +60,7 @@ class PathsPanel(CollapsiblePanel):
             lay.addLayout(row)
 
         upd_row = QHBoxLayout()
+        # Источник истины — версия CUDA для обновления llama.cpp (рядом с Update).
         self.cuda_version_combo = QComboBox()
         self.cuda_version_combo.addItem("CUDA 12", "12")
         self.cuda_version_combo.addItem("CUDA 13", "13")
@@ -68,39 +70,28 @@ class PathsPanel(CollapsiblePanel):
             "CUDA 13 also downloads additional cudart DLLs.\n"
             "Minor version (12.4 / 13.3) is auto-detected from release."
         )
+        # Зеркало для вкладки «Запуск» (двусторонняя синхронизация выбора).
+        self.launch_cuda_version_combo = QComboBox()
+        self.launch_cuda_version_combo.addItem("CUDA 12", "12")
+        self.launch_cuda_version_combo.addItem("CUDA 13", "13")
+        self.launch_cuda_version_combo.setMaximumWidth(110)
+        self.launch_cuda_version_combo.setToolTip(
+            "CUDA major version for llama.cpp builds (mirrors the Paths tab selection)."
+        )
+        self.cuda_version_combo.currentIndexChanged.connect(
+            lambda i: self.launch_cuda_version_combo.setCurrentIndex(i)
+        )
+        self.launch_cuda_version_combo.currentIndexChanged.connect(
+            lambda i: self.cuda_version_combo.setCurrentIndex(i)
+        )
         self.update_llama_btn = QPushButton("Update llama.cpp")
         self.update_status = QLabel("idle", wordWrap=True)
+        upd_row.addWidget(self.cuda_version_combo)
         upd_row.addWidget(self.update_llama_btn)
         upd_row.addWidget(self.update_status, 1)
         lay.addLayout(upd_row)
 
         self.update_progress = QProgressBar(visible=False, minimum=0, maximum=100)
         lay.addWidget(self.update_progress)
-        lay.addLayout(self._build_language_row())
 
         self.add_widget(box)
-
-    def _build_language_row(self) -> QHBoxLayout:
-        """Язык интерфейса (Этап 4): применяется после перезапуска приложения."""
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Language:"))
-        self.language_combo = QComboBox()
-        self.language_combo.addItem("English", "en")
-        self.language_combo.addItem("Русский", "ru")
-        ui_settings = QSettings("LlamaServerGUI", "UIState")
-        saved_lang = str(ui_settings.value("language", "en") or "en").strip().lower()
-        self.language_combo.setCurrentIndex(
-            max(self.language_combo.findData(saved_lang), 0)
-        )
-        self.language_combo.setToolTip(
-            "Interface language. Applied after the application restarts "
-            "(or launch with --lang=ru / --lang=en)."
-        )
-        self.language_combo.currentIndexChanged.connect(
-            lambda index: ui_settings.setValue(
-                "language", str(self.language_combo.itemData(index) or "en")
-            )
-        )
-        row.addWidget(self.language_combo)
-        row.addStretch(1)
-        return row

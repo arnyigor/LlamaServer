@@ -9,6 +9,7 @@ a = Analysis(
         ('assets/llama_server_icon.svg', 'assets'),
         ('src/ui/theme.qss', 'src/ui'),
         ('translations/llamaserver_ru.qm', 'translations'),
+        ('llama_autotuner/assets/vision_test_731.png', 'llama_autotuner/assets'),
     ],
     hiddenimports=[],
     hookspath=[],

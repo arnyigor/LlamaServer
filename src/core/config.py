@@ -7,8 +7,11 @@ import os
 import hashlib
 import shlex
 from dataclasses import dataclass, field, asdict, fields
-from typing import Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from llama_autotuner.models import Candidate
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -30,6 +33,7 @@ from src.core.constants import (
 from src.core.param_registry import (
     FIELD_WIDGET_MAP as _FIELD_WIDGET_MAP,
     MANAGED_EXTRA_FLAGS as _MANAGED_EXTRA_FLAGS,
+    PARAM_REGISTRY,
     SAMPLING_EXTRA_FIELDS as _SAMPLING_EXTRA_FIELDS,
 )
 from src.utils.file_utils import write_json_file_safely
@@ -182,32 +186,9 @@ _PERF_PRESET_FIELDS = (
     "enable_thinking",
 )
 
-_AUTOTUNE_PARAM_TO_SETTING = {
-    "ngl": "gpu_layers",
-    "gpu_layers_all": "gpu_layers_all",
-    "batch_size": "batch_size",
-    "ubatch_size": "ubatch_size",
-    "cache_type_k": "cache_type_k",
-    "cache_type_v": "cache_type_v",
-    "threads": "threads",
-    "threads_batch": "threads_batch",
-    "parallel_slots": "parallel_slots",
-    "kv_unified": "kv_unified",
-    "speculative_mtp": "speculative_mtp",
-    "spec_draft_model_path": "spec_draft_model_path",
-    "spec_draft_n_max": "spec_draft_n_max",
-    "spec_draft_p_min": "spec_draft_p_min",
-    "spec_draft_gpu_layers": "spec_draft_gpu_layers",
-    "flash_attn": "flash_attn",
-    "fit_off": "fit_off",
-    "cache_prompt": "cache_prompt",
-    "ctx_checkpoints": "ctx_checkpoints",
-    "cache_ram": "cache_ram",
-    "use_mmproj": "use_mmproj",
-}
-
 # Флаги, которыми управляют UI/AutoTune, и mapping sampling-полей тоже
 # приходят из реестра параметров.
+
 
 def _is_extra_value_token(arg: str) -> bool:
     if not str(arg).startswith("-"):
@@ -249,6 +230,107 @@ def _sanitize_extra_args(value: Any) -> str:
     return " ".join(shlex.quote(p) for p in result)
 
 
+def _extra_flag_tokens(name: str, value: Any, settings: Any) -> List[str]:
+    """Формирует CLI-токены для EXTRA-поля (managed=False) по старой логике эмиссии.
+
+    Возвращает [] если флаг не должен эмититься (пустое/дефолтное значение).
+    Для use_chat_template использует chat_template_file как значение флага.
+    Несколько EXTRA-полей (cuda_visible_devices, cuda_module_loading, cont_batching,
+    cache_prompt, use_mmap) не имеют cli_flags в реестре — их флаги заданы явно.
+    """
+    if name == "ctx_checkpoints":
+        return (
+            ["--ctx-checkpoints", str(value)]
+            if isinstance(value, int) and value >= 0
+            else []
+        )
+    if name == "cache_ram":
+        return (
+            ["--cache-ram", str(value)]
+            if isinstance(value, int) and value >= -1
+            else []
+        )
+    if name == "main_gpu":
+        v = value if isinstance(value, int) else -1
+        return ["--main-gpu", str(v)] if v >= 0 else []
+    if name == "split_mode":
+        v = str(value or "").strip()
+        return ["--split-mode", v] if v else []
+    if name == "cuda_device":
+        v = str(value or "").strip()
+        return ["--device", v] if v else []
+    if name == "cuda_visible_devices":
+        v = str(value or "").strip()
+        return ["--cuda-visible-devices", v] if v else []
+    if name == "cuda_module_loading":
+        v = str(value or "").strip()
+        return ["--cuda-module-loading", v] if v and v != "LAZY" else []
+    if name in (
+        "use_mlock",
+        "verbose",
+        "log_timestamps",
+        "context_shift",
+        "no_webui",
+        "kv_unified",
+    ):
+        flag = {
+            "use_mlock": "--mlock",
+            "verbose": "--verbose",
+            "log_timestamps": "--log-timestamps",
+            "context_shift": "--context-shift",
+            "no_webui": "--no-webui",
+            "kv_unified": "--kv-unified",
+        }[name]
+        return [flag] if value else []
+    if name in ("cont_batching", "cache_prompt", "use_mmap"):
+        flag = {
+            "cont_batching": "--no-cont-batching",
+            "cache_prompt": "--no-cache-prompt",
+            "use_mmap": "--no-mmap",
+        }[name]
+        return [flag] if not value else []
+    if name == "use_chat_template":
+        path = str(getattr(settings, "chat_template_file", "") or "").strip()
+        return ["--chat-template-file", path] if path else []
+    return []
+
+
+def migrate_extra_fields_to_extra_args(settings: Any) -> None:
+    """Переносит значения EXTRA-полей (managed=False) в extra_args.
+
+    EXTRA-параметры больше не управляются registry/виджетами при сборке команды
+    (см. cli_builder.build_args + cli_parser). Чтобы старые сохранённые значения
+    не потерялись при удалении виджетов из UI, переносим их в текстовое поле
+    extra_args verbatim. Идемпотентно: после переноса поле сбрасывается в default,
+    поэтому повторная загрузка не дублирует флаги.
+    """
+    defaults = {f.name: f.default for f in fields(AppSettings)}
+    extra_tokens: List[str] = []
+    existing = str(getattr(settings, "extra_args", "") or "").strip()
+    existing_tokens = shlex.split(existing) if existing else []
+
+    for spec in PARAM_REGISTRY:
+        if spec.managed:
+            continue
+        name = spec.name
+        if name == "chat_template_file":
+            continue  # обрабатывается вместе с use_chat_template
+        value = getattr(settings, name, None)
+        default = defaults.get(name)
+        if value == default:
+            continue
+        tokens = _extra_flag_tokens(name, value, settings)
+        if tokens and tokens[0] not in existing_tokens:
+            extra_tokens += tokens
+        setattr(settings, name, default)
+        if name == "use_chat_template":
+            setattr(settings, "chat_template_file", "")
+
+    if extra_tokens:
+        merged = (existing + " " + " ".join(extra_tokens)).strip()
+        setattr(settings, "extra_args", merged)
+
+
 def _extract_sampling_extra_args(value: Any) -> tuple[str, Dict[str, Any]]:
     """Мигрирует старые sampling-флаги из Extra params в отдельные поля."""
     text = str(value or "").strip()
@@ -273,7 +355,11 @@ def _extract_sampling_extra_args(value: Any) -> tuple[str, Dict[str, Any]]:
 
         raw_value = inline_value if separator else None
         consumed = False
-        if raw_value is None and i + 1 < len(parts) and _is_extra_value_token(parts[i + 1]):
+        if (
+            raw_value is None
+            and i + 1 < len(parts)
+            and _is_extra_value_token(parts[i + 1])
+        ):
             raw_value = parts[i + 1]
             consumed = True
         if raw_value is None:
@@ -306,41 +392,42 @@ def _perf_params_from_settings(settings: AppSettings) -> Dict[str, Any]:
     }
 
 
-def _apply_autotune_params_to_perf_params(
-    params: Dict[str, Any], autotune_params: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
-    if not autotune_params:
-        return params
+def candidate_to_settings_values(candidate: "Candidate") -> Dict[str, Any]:
+    """Строит dict полей AppSettings из выбранного Candidate автотюнера.
 
-    merged = dict(params)
-    ngl = autotune_params.get("ngl")
-    if ngl is not None:
-        ngl_text = str(ngl).strip().lower()
-        is_auto = ngl_text == "auto"
-        is_all = ngl_text == "all"
-        merged["gpu_auto"] = is_auto
-        merged["gpu_layers_all"] = is_all
-        if not is_auto and not is_all:
-            merged["gpu_layers"] = int(ngl)
-
-    if "ncmoe" in autotune_params:
-        merged["cpu_moe_layers"] = int(autotune_params["ncmoe"])
-
-    if "ctx_size" in autotune_params:
-        merged["ctx_size"] = int(autotune_params["ctx_size"])
-
-    for source_key, setting_key in _AUTOTUNE_PARAM_TO_SETTING.items():
-        if source_key == "ngl":
-            # ngl already needs special gpu_auto/gpu_layers handling above.
-            # Do not copy literal "auto" into gpu_layers.
-            continue
-        if source_key in autotune_params:
-            merged[setting_key] = autotune_params[source_key]
-
-    # AutoTune не тестирует sampling/reasoning/mmproj-extra args. Но managed extra
-    # flags от старых ручных запусков могут переопределить best preset при старте.
-    merged["extra_args"] = _sanitize_extra_args(merged.get("extra_args", ""))
-    return merged
+    Передаётся в ``apply_values_to_ui()``, которая одновременно обновляет
+    ``self.settings`` и синхронизированные виджеты — единый путь применения,
+    которым также пользуются импорт CLI и загрузка пресетов/профилей.
+    ``extra_args`` сюда не входит: вызывающая сторона должна слить
+    ``candidate.extra_args`` через ``merge_extra_args`` (src/core/cli_builder.py),
+    иначе накопленные вручную флаги будут потеряны при перезаписи.
+    """
+    values: Dict[str, Any] = {
+        "ctx_size": int(candidate.ctx),
+        "batch_size": int(candidate.batch),
+        "ubatch_size": int(candidate.ubatch),
+        "threads": int(candidate.threads),
+        "threads_batch": int(candidate.threads_batch),
+        "cache_type_k": candidate.kv_k,
+        "cache_type_v": candidate.kv_v,
+        "speculative_mtp": bool(candidate.mtp),
+        "use_mmproj": bool(candidate.vision),
+    }
+    ngl_text = str(candidate.ngl).strip().lower()
+    if ngl_text == "all":
+        values["gpu_auto"] = True
+    else:
+        try:
+            values["gpu_layers"] = int(candidate.ngl)
+            values["gpu_auto"] = False
+        except (TypeError, ValueError):
+            pass
+    if candidate.ncmoe is not None:
+        values["cpu_moe_layers"] = int(candidate.ncmoe)
+    if candidate.mtp:
+        values["spec_draft_n_max"] = int(candidate.mtp_n_max)
+        values["spec_draft_p_min"] = float(candidate.mtp_p_min)
+    return values
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -522,6 +609,9 @@ class ConfigManager:
                     if key not in data:
                         setattr(self.settings, key, value)
                 self.settings.extra_args = remaining_extra
+                # Перенос старых EXTRA-значений (managed=False) в extra_args,
+                # пока они ещё лежат в settings-полях (до apply_to_ui).
+                migrate_extra_fields_to_extra_args(self.settings)
             except (json.JSONDecodeError, OSError):
                 pass  # Используем дефолтные настройки
 
@@ -679,6 +769,9 @@ class ConfigManager:
                     setattr(self.settings, k, v)
                 except (TypeError, ValueError):
                     pass
+        # Перенос старых EXTRA-значений (managed=False) в extra_args, пока они
+        # ещё лежат в settings-полях (до apply_to_ui, который сбросит виджеты).
+        migrate_extra_fields_to_extra_args(self.settings)
         self.apply_to_ui(ui)
         return True
 
@@ -728,7 +821,6 @@ class ConfigManager:
         ctx_size: int,
         ui: Any,
         metadata: Optional[Dict[str, Any]] = None,
-        autotune_params: Optional[Dict[str, Any]] = None,
         preset_name: Optional[str] = None,
     ) -> None:
         """
@@ -744,7 +836,6 @@ class ConfigManager:
         self.read_from_ui(ui)
 
         params = _perf_params_from_settings(self.settings)
-        params = _apply_autotune_params_to_perf_params(params, autotune_params)
         params = _normalize_perf_param_types(params)
 
         params["ctx_size"] = int(ctx_size)

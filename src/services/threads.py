@@ -15,7 +15,12 @@ from typing import List
 
 from PySide6.QtCore import QThread, Signal
 
-from src.core.gguf_parser import extract_model_info, is_mtp_draft_file, is_projector_file
+from src.core.gguf_parser import (
+    extract_model_info,
+    is_mtp_draft_file,
+    is_non_primary_split_shard,
+    is_projector_file,
+)
 from src.utils.subprocess_utils import no_console_kwargs
 
 
@@ -46,7 +51,11 @@ class ModelScanner(QThread):
                     self.progress.emit("вЏ№ РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ РѕС‚РјРµРЅРµРЅРѕ")
                     self.models_found.emit(models)
                     return
-                if not is_projector_file(f) and not is_mtp_draft_file(f):
+                if (
+                    not is_projector_file(f)
+                    and not is_mtp_draft_file(f)
+                    and not is_non_primary_split_shard(f)
+                ):
                     all_files.append(f)
             total = len(all_files)
 
@@ -84,7 +93,7 @@ class LlamaCppUpdater(QThread):
     progress = Signal(str)
     percent = Signal(int)
     completed = Signal(bool, str)
-    API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+    API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100"
 
     def __init__(self, server_path, cuda_version="12"):
         super().__init__()
@@ -188,6 +197,12 @@ class LlamaCppUpdater(QThread):
         return int(match.group(1)) if match else None
 
     def fetch_latest_release(self):
+        """Возвращает релиз с Windows-бинарниками.
+
+        llama.cpp теперь публикует маркер-тег (напр. v0.2.0) без ассетов как
+        /releases/latest, а реальные сборки (bNNNN) — как pre-release.
+        Поэтому перебираем список и берём первый релиз с ассетами и тегом b\d+.
+        """
         request = urllib.request.Request(
             self.API_URL,
             headers={
@@ -198,11 +213,21 @@ class LlamaCppUpdater(QThread):
         self.progress.emit("Checking latest llama.cpp release")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
+                releases = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"GitHub API HTTP {e.code}: {e.reason}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error: {e.reason}") from e
+
+        if isinstance(releases, dict):
+            releases = [releases]
+        for release in releases:
+            if not (release.get("assets") or []):
+                continue
+            if not re.search(r"b\d+", release.get("tag_name", "")):
+                continue
+            return release
+        raise RuntimeError("No downloadable llama.cpp release found")
 
     def parse_build_number(self, value):
         # Сначала ищем формат bXXXX (стандартный для llama.cpp)
@@ -381,3 +406,36 @@ class LlamaCppUpdater(QThread):
             shutil.rmtree(old, ignore_errors=True)
 
         return backup_subdir
+
+
+class LlamaCppUpdateChecker(QThread):
+    """Passive "is a newer build available?" check for every CUDA major
+    version — does not download anything, unlike ``LlamaCppUpdater``."""
+
+    checked = Signal(dict)  # {"12": {"current": int|None, "latest": int}, ...}
+    error = Signal(str)
+
+    def __init__(self, base_path, versions=("12", "13")):
+        super().__init__()
+        self.base_path = base_path
+        self.versions = list(versions)
+
+    def run(self):
+        probe = LlamaCppUpdater(self.base_path)
+        try:
+            release = probe.fetch_latest_release()
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        latest_build = probe.parse_build_number(release.get("tag_name", ""))
+        if latest_build is None:
+            self.error.emit(f"Cannot parse release tag: {release.get('tag_name')}")
+            return
+
+        result = {}
+        for version in self.versions:
+            updater = LlamaCppUpdater(self.base_path, cuda_version=version)
+            target_dir = updater.resolve_target_dir(updater.select_assets(release))
+            current_build = updater.get_current_build(target_dir / "llama-server.exe")
+            result[version] = {"current": current_build, "latest": latest_build}
+        self.checked.emit(result)

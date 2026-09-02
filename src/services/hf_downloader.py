@@ -11,7 +11,12 @@ from typing import Dict, Iterable, List
 
 from PySide6.QtCore import QThread, Signal
 
-from src.core.gguf_parser import is_mtp_draft_file, is_projector_file
+from src.core.gguf_parser import (
+    is_mtp_draft_file,
+    is_non_primary_split_shard,
+    is_projector_file,
+    split_shard_total_size,
+)
 
 
 HF_API_MODEL_URL = "https://huggingface.co/api/models/{repo_id}?blobs=true"
@@ -526,23 +531,46 @@ def list_all_local_model_entries(base_model_dir: Path) -> Dict:
     except OSError:
         return result
 
-    grouped: Dict[Path, Dict] = {}
     root_resolved = root.resolve()
+
+    # First pass: collect main GGUFs (skip projectors/drafts/non-primary split
+    # shards) with their resolved parent, so a folder holding several distinct
+    # quantizations (e.g. Q4_K_M + Q8_0) can be told apart from a
+    # single-model folder (one main GGUF plus its projector/draft/shard
+    # siblings). Shard 2+ of a split model (NAME-00002-of-00003.gguf) is not
+    # its own model — it is folded into shard 1's size below.
+    main_ggufs: List[tuple] = []
     for gguf in ggufs:
         try:
-            if not gguf.is_file() or is_projector_file(gguf) or is_mtp_draft_file(gguf):
+            if (
+                not gguf.is_file()
+                or is_projector_file(gguf)
+                or is_mtp_draft_file(gguf)
+                or is_non_primary_split_shard(gguf)
+            ):
                 continue
             gguf_resolved = gguf.resolve()
             gguf_resolved.relative_to(root_resolved)
         except (OSError, ValueError):
             continue
+        main_ggufs.append((gguf, gguf_resolved))
 
-        if gguf_resolved.parent == root_resolved:
+    per_parent_count: Dict[Path, int] = {}
+    for _, gguf_resolved in main_ggufs:
+        parent = gguf_resolved.parent
+        per_parent_count[parent] = per_parent_count.get(parent, 0) + 1
+
+    grouped: Dict[Path, Dict] = {}
+    for gguf, gguf_resolved in main_ggufs:
+        parent = gguf_resolved.parent
+        if parent == root_resolved or per_parent_count[parent] > 1:
+            # Root-level file, or one of several distinct models sharing a
+            # folder: each main GGUF is its own entry.
             key = gguf_resolved
             entry_type = "file"
             target = gguf
         else:
-            key = gguf_resolved.parent
+            key = parent
             entry_type = "folder"
             target = gguf.parent
 
@@ -566,7 +594,9 @@ def list_all_local_model_entries(base_model_dir: Path) -> Dict:
     entries = []
     for entry in grouped.values():
         target = Path(entry["path"])
-        size = _folder_size(target)
+        # A "file" entry may be shard 1 of a split model: its own stat() only
+        # covers its slice of the weights, so pull in sibling shards by name.
+        size = split_shard_total_size(target) if entry["type"] == "file" else _folder_size(target)
         entry["size"] = size
         entry["size_text"] = format_bytes(size)
         result["total_size"] += size
