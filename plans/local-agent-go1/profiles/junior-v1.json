@@ -1,0 +1,26 @@
+{
+  "id": "junior-v1",
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "model": "qwen-27b",
+
+  "reasoning": {
+    "enabled": true,
+    "effort": "medium",
+    "budget": 6144,
+    "preserve": false
+  },
+
+  "client": {
+    "normal_max_tokens": 8192,
+    "finalize_max_tokens": 4096,
+    "finalize_disable_thinking": true
+  },
+
+  "role": "bounded-junior",
+
+  "notes": [
+    "reasoning.budget/effort/preserve mirror llama-server CLI flags (--reasoning-budget, --reasoning-effort, --no-reasoning-preserve).",
+    "The server CLI reasoning-budget takes priority over any client-side thinking_budget_tokens, so the client does not attempt to control it during normal turns.",
+    "n_ctx, model_alias, model_path, model_ftype and default_generation_settings are NOT stored here — they are fetched live from GET /props so this file doesn't drift from the running server."
+  ]
+}

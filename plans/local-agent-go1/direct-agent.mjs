@@ -3,10 +3,44 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
 const DEFAULT_MODEL = "qwen-27b";
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PROFILE_PATH = path.join(SCRIPT_DIR, "profiles", "junior-v1.json");
+const FALLBACK_PROFILE = {
+  id: "builtin-fallback",
+  client: { normal_max_tokens: 2048, finalize_max_tokens: 4096, finalize_disable_thinking: true },
+};
 let lastFailureTrace = null;
+
+async function loadProfile(profilePath) {
+  try {
+    const raw = await fs.readFile(profilePath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return FALLBACK_PROFILE;
+  }
+}
+
+async function fetchProps(baseUrl) {
+  const origin = baseUrl.replace(/\/v1\/?$/, "");
+  try {
+    const response = await fetch(`${origin}/props`, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) return null;
+    const props = await response.json();
+    return {
+      model_alias: props.model_alias,
+      model_path: props.model_path,
+      model_ftype: props.model_ftype,
+      n_ctx: props.default_generation_settings?.n_ctx,
+      default_generation_settings: props.default_generation_settings?.params,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function parseArgs(argv) {
   const parsed = {
@@ -18,8 +52,9 @@ function parseArgs(argv) {
     maxToolOutputBytes: 1024 * 1024,
     maxFileBytes: 256 * 1024,
     maxGrepMatches: 100,
-    maxTokens: 2048,
-    finalizeMaxTokens: 8192,
+    maxTokens: undefined,
+    finalizeMaxTokens: undefined,
+    profile: DEFAULT_PROFILE_PATH,
     traceOut: "",
     repoWorkdir: "",
   };
@@ -42,6 +77,7 @@ function parseArgs(argv) {
     else if (arg === "--max-files-read") parsed.maxFilesRead = Number(next());
     else if (arg === "--max-tokens") parsed.maxTokens = Number(next());
     else if (arg === "--finalize-max-tokens") parsed.finalizeMaxTokens = Number(next());
+    else if (arg === "--profile") parsed.profile = next();
     else if (arg === "--trace-out") parsed.traceOut = next();
     else if (arg === "--help" || arg === "-h") parsed.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
@@ -63,10 +99,14 @@ function usage() {
     "  --max-steps <n>         Maximum model turns (default: 20)",
     "  --max-tool-calls <n>    Maximum total tool calls (default: 30)",
     "  --max-files-read <n>    Maximum distinct files read (default: 15)",
-    "  --max-tokens <n>        Maximum tokens per model response (default: 2048)",
-    "  --finalize-max-tokens <n>  Token budget for the forced finalize turn (default: 8192);",
-    "                          should exceed the server's --reasoning-budget so thinking",
-    "                          doesn't crowd out the final answer content.",
+    "  --max-tokens <n>        Maximum tokens per model response (default: from profile, else 2048)",
+    "  --finalize-max-tokens <n>  Token budget for the forced finalize turn (default: from",
+    "                          profile, else 4096). Thinking is disabled on that turn, so",
+    "                          it does not need to cover the server's --reasoning-budget.",
+    "  --profile <file>        Runtime profile JSON (default: profiles/junior-v1.json next",
+    "                          to this script). Supplies client.normal_max_tokens /",
+    "                          finalize_max_tokens / finalize_disable_thinking. n_ctx and",
+    "                          model info are fetched live from GET /props, not the profile.",
     "  --trace-out <file>      Write full trace JSON to this file",
   ].join("\n");
 }
@@ -366,7 +406,7 @@ function parseToolArguments(raw) {
   return JSON.parse(raw);
 }
 
-async function callModel(options, messages, { toolChoice = "auto", maxTokens } = {}) {
+async function callModel(options, messages, { toolChoice = "auto", maxTokens, disableThinking = false } = {}) {
   const body = {
     model: options.model,
     messages,
@@ -379,6 +419,9 @@ async function callModel(options, messages, { toolChoice = "auto", maxTokens } =
   } else {
     body.tools = tools;
     body.tool_choice = "auto";
+  }
+  if (disableThinking) {
+    body.chat_template_kwargs = { enable_thinking: false };
   }
 
   const response = await fetch(`${options.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -413,6 +456,12 @@ async function main() {
     return;
   }
   if ((!options.cwd && !options.repo) || !options.task) throw new Error("--cwd or --repo, and --task are required");
+
+  const profile = await loadProfile(path.resolve(options.profile));
+  const props = await fetchProps(options.baseUrl);
+  options.maxTokens = options.maxTokens ?? profile.client?.normal_max_tokens ?? 2048;
+  options.finalizeMaxTokens = options.finalizeMaxTokens ?? profile.client?.finalize_max_tokens ?? 4096;
+  const finalizeDisableThinking = profile.client?.finalize_disable_thinking !== false;
 
   const prepared = await prepareRepo(options);
   options.cwd = prepared.cwd;
@@ -458,7 +507,8 @@ async function main() {
 
     const response = await callModel(options, messages, {
       toolChoice: mustFinalizeNow ? "none" : "auto",
-      maxTokens: mustFinalizeNow ? Math.max(options.maxTokens, options.finalizeMaxTokens) : undefined,
+      maxTokens: mustFinalizeNow ? options.finalizeMaxTokens : undefined,
+      disableThinking: mustFinalizeNow && finalizeDisableThinking,
     });
     const choice = response.choices?.[0];
     const assistant = choice?.message;
@@ -524,17 +574,13 @@ async function main() {
     budgetLimited = true;
   }
 
-  const content = typeof finalMessage.content === "string"
+  const text = typeof finalMessage.content === "string"
     ? finalMessage.content
     : JSON.stringify(finalMessage.content ?? "");
-  const reasoning = typeof finalMessage.reasoning_content === "string" ? finalMessage.reasoning_content : "";
-  const usedReasoningFallback = !content.trim() && Boolean(reasoning.trim());
-  const text = usedReasoningFallback ? reasoning : content;
   const output = {
     status: finalFinishReason === "length" || (budgetLimited && !text.trim()) ? "incomplete" : "completed",
     finish_reason: finalFinishReason,
     answer: text.trim(),
-    answer_source: usedReasoningFallback ? "reasoning_fallback" : "content",
     stats: {
       steps: trace.filter(entry => entry.assistant).length,
       tool_calls: toolCallCount,
@@ -545,6 +591,12 @@ async function main() {
       budget_limited: budgetLimited,
     },
     repo: prepared.repo ? { url: prepared.repo.url, path: prepared.repo.path } : undefined,
+    runtime: {
+      profile: profile.id,
+      model_alias: props?.model_alias ?? options.model,
+      n_ctx: props?.n_ctx ?? null,
+      props_available: props !== null,
+    },
   };
 
   if (options.traceOut) {
