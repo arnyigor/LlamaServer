@@ -254,17 +254,17 @@ def _extra_flag_tokens(name: str, value: Any, settings: Any) -> List[str]:
         v = value if isinstance(value, int) else -1
         return ["--main-gpu", str(v)] if v >= 0 else []
     if name == "split_mode":
-        v = str(value or "").strip()
-        return ["--split-mode", v] if v else []
+        sv = str(value or "").strip()
+        return ["--split-mode", sv] if sv else []
     if name == "cuda_device":
-        v = str(value or "").strip()
-        return ["--device", v] if v else []
+        sv = str(value or "").strip()
+        return ["--device", sv] if sv else []
     if name == "cuda_visible_devices":
-        v = str(value or "").strip()
-        return ["--cuda-visible-devices", v] if v else []
+        sv = str(value or "").strip()
+        return ["--cuda-visible-devices", sv] if sv else []
     if name == "cuda_module_loading":
-        v = str(value or "").strip()
-        return ["--cuda-module-loading", v] if v and v != "LAZY" else []
+        sv = str(value or "").strip()
+        return ["--cuda-module-loading", sv] if sv and sv != "LAZY" else []
     if name in (
         "use_mlock",
         "verbose",
