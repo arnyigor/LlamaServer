@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
     QGridLayout,
+    QProgressBar,
     QPushButton,
 )
 from PySide6.QtCore import Qt
@@ -58,6 +59,13 @@ class DashboardPage(QScrollArea):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         overview.addWidget(mw.overview_model)
+
+        mw.overview_load_progress = QProgressBar()
+        mw.overview_load_progress.setRange(0, 100)
+        mw.overview_load_progress.setTextVisible(True)
+        mw.overview_load_progress.setFormat("starting...")
+        mw.overview_load_progress.setVisible(False)
+        overview.addWidget(mw.overview_load_progress)
 
         def make_metric_card(title, value="-", detail=""):
             card = QGroupBox(title)

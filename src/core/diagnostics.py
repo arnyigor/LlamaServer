@@ -78,6 +78,10 @@ _WINDOWS_EXIT_CODES = {
     3221225725: "stack overflow (0xC00000FD)",
     -1073740940: "heap corruption (0xC0000374)",
     3221226356: "heap corruption (0xC0000374)",
+    # Very common on CPUs without AVX2/AVX512: the selected llama.cpp build
+    # was compiled assuming an instruction set the CPU doesn't have.
+    -1073741795: "illegal instruction (0xC000001D) — CPU likely lacks the AVX2/AVX512 instructions this build requires",
+    3221225501: "illegal instruction (0xC000001D) — CPU likely lacks the AVX2/AVX512 instructions this build requires",
 }
 
 

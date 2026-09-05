@@ -8,11 +8,53 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QLabel,
+    QLineEdit,
     QPushButton,
+    QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+
+def add_clear_button(row_layout, widget, on_clear=None, tooltip=None):
+    """Small "x" button next to an optional input.
+
+    Resets the widget to its empty/auto/minimum state — the same state the
+    CLI builder already treats as "flag not set" — so the parameter is
+    excluded from the launch command instead of surviving as a stale value.
+    ``on_clear`` runs after the reset for widgets needing extra bookkeeping
+    (e.g. persisting that auto-fill should stay off for this field).
+
+    ``tooltip`` overrides the default "excluded from the command" wording —
+    use it for a field whose flag is always emitted regardless (e.g. a
+    numeric tuning knob required whenever its parent feature is on), where
+    the button can only reset the value, not remove the flag.
+    """
+    btn = QToolButton()
+    btn.setText("✕")
+    btn.setToolTip(tooltip or "Clear (exclude from launch command)")
+    btn.setFixedSize(20, 20)
+    btn.setStyleSheet(
+        "QToolButton { color: #888; border: none; }"
+        "QToolButton:hover { color: #e66; }"
+    )
+
+    def _clear():
+        if isinstance(widget, QLineEdit):
+            widget.setText("")
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            widget.setValue(widget.minimum())
+        elif isinstance(widget, QComboBox):
+            widget.setCurrentIndex(0)
+        if on_clear:
+            on_clear()
+
+    btn.clicked.connect(_clear)
+    row_layout.addWidget(btn)
+    return btn
 
 
 class NoWheelValueChangeFilter(QObject):

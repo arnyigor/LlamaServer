@@ -44,7 +44,7 @@ from src.core.constants import (
     SAMPLING_SEED_AUTO,
     SERVER_DEFAULT_SENTINEL,
 )
-from src.ui.widgets import CollapsiblePanel
+from src.ui.widgets import CollapsiblePanel, add_clear_button
 
 
 class GenerationBuilder:
@@ -229,6 +229,7 @@ class GenerationBuilder:
         r2a = QHBoxLayout()
         r2a.addWidget(QLabel(mw.tr("Context Size (-c):")))
         r2a.addWidget(mw.ctx_size)
+        add_clear_button(r2a, mw.ctx_size)
         mw.ctx_help_btn = QToolButton()
         mw.ctx_help_btn.setText("?")
         mw.ctx_help_btn.setToolTip("Open detailed context/VRAM guidance")
@@ -236,6 +237,7 @@ class GenerationBuilder:
         r2a.addSpacing(10)
         r2a.addWidget(QLabel(mw.tr("CPU MoE (-ncmoe):")))
         r2a.addWidget(mw.cpu_moe_layers)
+        add_clear_button(r2a, mw.cpu_moe_layers)
         mw.ncmoe_help_btn = QToolButton()
         mw.ncmoe_help_btn.setText("?")
         mw.ncmoe_help_btn.setToolTip("Open detailed CPU MoE/VRAM guidance")
@@ -314,7 +316,9 @@ class GenerationBuilder:
         r_batch = QHBoxLayout()
         r_batch.addWidget(QLabel(mw.tr("Batch / UBatch (-b / -ub):")))
         r_batch.addWidget(mw.batch_size)
+        add_clear_button(r_batch, mw.batch_size)
         r_batch.addWidget(mw.ubatch_size)
+        add_clear_button(r_batch, mw.ubatch_size)
         r_batch.addStretch(1)
         sampling.addLayout(r_batch)
 
@@ -368,9 +372,11 @@ class GenerationBuilder:
         r7.addSpacing(10)
         r7.addWidget(QLabel(mw.tr("Effort (--reasoning-effort):")))
         r7.addWidget(mw.reasoning_effort)
+        add_clear_button(r7, mw.reasoning_effort)
         r7.addSpacing(10)
         r7.addWidget(QLabel(mw.tr("Preserve (--reasoning-preserve):")))
         r7.addWidget(mw.reasoning_preserve)
+        add_clear_button(r7, mw.reasoning_preserve)
         sampling.addLayout(r7)
 
         # Budget и Budget msg — вертикально ("друг под другом"): текстовое
@@ -380,6 +386,7 @@ class GenerationBuilder:
         row_budget = QHBoxLayout()
         row_budget.addWidget(QLabel(mw.tr("Budget (--reasoning-budget):")))
         row_budget.addWidget(mw.reasoning_budget)
+        add_clear_button(row_budget, mw.reasoning_budget)
         row_budget.addStretch(1)
         r7b.addLayout(row_budget)
         row_budget_msg = QHBoxLayout()
@@ -387,6 +394,7 @@ class GenerationBuilder:
             QLabel(mw.tr("Budget msg (--reasoning-budget-message):"))
         )
         row_budget_msg.addWidget(mw.reasoning_budget_message, 1)
+        add_clear_button(row_budget_msg, mw.reasoning_budget_message)
         r7b.addLayout(row_budget_msg)
         sampling.addLayout(r7b)
 
@@ -408,9 +416,20 @@ class GenerationBuilder:
         r8.addSpacing(10)
         r8.addWidget(QLabel(mw.tr("Slots (-np):")))
         r8.addWidget(mw.parallel_slots)
+        add_clear_button(r8, mw.parallel_slots)
         server_opts.addLayout(r8)
 
         mw.kv_unified = QCheckBox(mw.tr("KV unified (-kvu)"))
+        sampling.addWidget(mw.kv_unified)
+
+        # Speculative decoding (MTP) — grouped in its own box so the whole
+        # feature (toggle + draft path + tuning) reads as one unit, matching
+        # how llama.cpp launchers typically separate it from generic sampling.
+        mtp_box = QGroupBox(mw.tr("Speculative decoding (MTP)"))
+        mtp_layout = QVBoxLayout(mtp_box)
+        mtp_layout.setContentsMargins(8, 6, 8, 6)
+        mtp_layout.setSpacing(6)
+
         mw.speculative_mtp = QCheckBox(mw.tr("MTP speculative"))
         mw.spec_draft_n_max = QSpinBox()
         mw.spec_draft_n_max.setRange(1, 32)
@@ -430,17 +449,28 @@ class GenerationBuilder:
         mw.spec_draft_gpu_layers.setText("all")
         mw.spec_draft_gpu_layers.setMaximumWidth(60)
         r8b = QHBoxLayout()
-        r8b.addWidget(mw.kv_unified)
         r8b.addWidget(mw.speculative_mtp)
         r8b.addSpacing(10)
-        r8b.addWidget(QLabel(mw.tr("MTP n-max / p-min / draft ngl:")))
+        r8b.addWidget(QLabel(mw.tr("n-max / p-min / draft ngl:")))
         r8b.addWidget(mw.spec_draft_n_max)
+        add_clear_button(
+            r8b,
+            mw.spec_draft_n_max,
+            tooltip="Reset to minimum (1) — always sent while MTP is on, cannot be omitted",
+        )
         r8b.addWidget(mw.spec_draft_p_min)
+        add_clear_button(
+            r8b,
+            mw.spec_draft_p_min,
+            tooltip="Reset to minimum (0.00) — always sent while MTP is on, cannot be omitted",
+        )
         r8b.addWidget(mw.spec_draft_gpu_layers)
-        sampling.addLayout(r8b)
+        add_clear_button(r8b, mw.spec_draft_gpu_layers)
+        r8b.addStretch(1)
+        mtp_layout.addLayout(r8b)
 
         r8b2 = QHBoxLayout()
-        r8b2.addWidget(QLabel(mw.tr("MTP draft GGUF:")))
+        r8b2.addWidget(QLabel(mw.tr("Draft GGUF:")))
         mw.spec_draft_model_path = QLineEdit(
             placeholderText="Auto-detected, or browse for separate MTP GGUF"
         )
@@ -453,29 +483,44 @@ class GenerationBuilder:
             lambda _checked=False: mw._browse_mtp_draft_clicked()
         )
         r8b2.addWidget(mw.spec_draft_model_path, 1)
+        add_clear_button(
+            r8b2,
+            mw.spec_draft_model_path,
+            on_clear=lambda: mw._on_mtp_draft_path_edited(""),
+        )
         r8b2.addWidget(mw.spec_draft_model_btn)
-        sampling.addLayout(r8b2)
+        mtp_layout.addLayout(r8b2)
+
+        mw.spec_draft_device = QLineEdit(placeholderText="CUDA0")
+        mw.spec_draft_device.setMaximumWidth(80)
+        r8c = QHBoxLayout()
+        r8c.addWidget(QLabel(mw.tr("Draft device:")))
+        r8c.addWidget(mw.spec_draft_device)
+        add_clear_button(r8c, mw.spec_draft_device)
+        r8c.addStretch(1)
+        mtp_layout.addLayout(r8c)
+        sampling.addWidget(mtp_box)
 
         mw.cuda_device = QLineEdit(placeholderText="CUDA0")
         mw.cuda_device.setMaximumWidth(80)
-        mw.spec_draft_device = QLineEdit(placeholderText="CUDA0")
-        mw.spec_draft_device.setMaximumWidth(80)
         mw.split_mode = QComboBox()
         mw.split_mode.addItems(["", "none", "layer", "row"])
         mw.main_gpu = QSpinBox()
         mw.main_gpu.setRange(AUTO_SENTINEL, 16)
         mw.main_gpu.setSpecialValueText("auto")
         mw.main_gpu.setValue(AUTO_SENTINEL)
-        r8c = QHBoxLayout()
-        r8c.addWidget(QLabel(mw.tr("Device:")))
-        r8c.addWidget(mw.cuda_device)
-        r8c.addWidget(QLabel(mw.tr("Draft device:")))
-        r8c.addWidget(mw.spec_draft_device)
-        r8c.addWidget(QLabel(mw.tr("Split:")))
-        r8c.addWidget(mw.split_mode)
-        r8c.addWidget(QLabel(mw.tr("Main GPU:")))
-        r8c.addWidget(mw.main_gpu)
-        sampling.addLayout(r8c)
+        r8d = QHBoxLayout()
+        r8d.addWidget(QLabel(mw.tr("Device:")))
+        r8d.addWidget(mw.cuda_device)
+        add_clear_button(r8d, mw.cuda_device)
+        r8d.addWidget(QLabel(mw.tr("Split:")))
+        r8d.addWidget(mw.split_mode)
+        add_clear_button(r8d, mw.split_mode)
+        r8d.addWidget(QLabel(mw.tr("Main GPU:")))
+        r8d.addWidget(mw.main_gpu)
+        add_clear_button(r8d, mw.main_gpu)
+        r8d.addStretch(1)
+        sampling.addLayout(r8d)
 
         mw.ctx_checkpoints = QSpinBox()
         mw.ctx_checkpoints.setRange(AUTO_SENTINEL, 128)
@@ -488,9 +533,11 @@ class GenerationBuilder:
         r9 = QHBoxLayout()
         r9.addWidget(QLabel(mw.tr("Ctx Checkpoints:")))
         r9.addWidget(mw.ctx_checkpoints)
+        add_clear_button(r9, mw.ctx_checkpoints)
         r9.addSpacing(10)
         r9.addWidget(QLabel(mw.tr("Cache RAM (MiB):")))
         r9.addWidget(mw.cache_ram)
+        add_clear_button(r9, mw.cache_ram)
         lperf.addLayout(r9)
 
     def _build_sampling_section(self):
@@ -574,7 +621,11 @@ class GenerationBuilder:
         for index, (label, widget) in enumerate(sampling_fields):
             row, column = divmod(index, 2)
             sampling_grid.addWidget(QLabel(label), row, column * 2)
-            sampling_grid.addWidget(widget, row, column * 2 + 1)
+            cell = QHBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.addWidget(widget)
+            add_clear_button(cell, widget)
+            sampling_grid.addLayout(cell, row, column * 2 + 1)
         sampling_help = {
             mw.temperature: "Randomness (0.0–2.0).\nCLI: --temp\nauto = server default",
             mw.top_k: "Keep K most likely tokens; 0 disables.\nCLI: --top-k",
@@ -612,7 +663,9 @@ class GenerationBuilder:
         s_cuda = QHBoxLayout()
         s_cuda.addWidget(QLabel(mw.tr("CUDA env:")))
         s_cuda.addWidget(mw.cuda_visible_devices)
+        add_clear_button(s_cuda, mw.cuda_visible_devices)
         s_cuda.addWidget(mw.cuda_module_loading)
+        add_clear_button(s_cuda, mw.cuda_module_loading)
         s_cuda.addStretch(1)
         lperf.addLayout(s_cuda)
 
@@ -644,6 +697,7 @@ class GenerationBuilder:
         )
         s_tpl.addWidget(mw.use_chat_template)
         s_tpl.addWidget(mw.chat_template_file, 1)
+        add_clear_button(s_tpl, mw.chat_template_file)
         s_tpl.addWidget(mw.chat_template_btn)
         server_opts.addLayout(s_tpl)
 

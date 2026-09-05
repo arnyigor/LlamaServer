@@ -73,13 +73,16 @@ from src.core.constants import (
     stat_sep,
 )
 from src.core.gguf_parser import extract_model_info, is_mtp_draft_file
+from src.core.help_detector import is_spec_supported, probe_supported_flags
 from src.core.mem_viz_parser import COMPONENT_META, MemoryData, fmt_mem, parse_line
+from src.core.model_load_progress import progress_from_load_line
 from src.core.mtp_fallback import (
     MtpFallbackController,
     MtpModelRules,
     strip_mtp_args,
 )
 from src.core.metrics_poller import MetricsPoller
+from src.core.param_registry import PARAM_REGISTRY
 from src.core.runtime_stats import RuntimeStatsController, format_runtime_stats_markdown
 from src.core.server_launch import ServerLaunchController
 from src.core.server_manager import ServerManager
@@ -245,6 +248,7 @@ class LlamaGUI:
         u.parallel_slots.valueChanged.connect(self._on_param_changed)
         u.kv_unified.stateChanged.connect(self._on_param_changed)
         u.speculative_mtp.stateChanged.connect(self._on_param_changed)
+        u.speculative_mtp.toggled.connect(self._on_mtp_checkbox_toggled)
         u.spec_draft_n_max.valueChanged.connect(self._on_param_changed)
         u.spec_draft_p_min.valueChanged.connect(self._on_param_changed)
         u.spec_draft_gpu_layers.textChanged.connect(self._on_param_changed)
@@ -262,6 +266,10 @@ class LlamaGUI:
         u.threads_batch.valueChanged.connect(self._on_param_changed)
         u.fit_off.stateChanged.connect(self._on_param_changed)
         u.reasoning_mode.currentIndexChanged.connect(self._on_param_changed)
+        u.reasoning_effort.currentIndexChanged.connect(self._on_param_changed)
+        u.reasoning_preserve.currentIndexChanged.connect(self._on_param_changed)
+        u.reasoning_budget.valueChanged.connect(self._on_param_changed)
+        u.reasoning_budget_message.textChanged.connect(self._on_param_changed)
         u.host.textChanged.connect(self._on_param_changed)
         u.port.valueChanged.connect(self._on_param_changed)
         u.ctx_checkpoints.valueChanged.connect(self._on_param_changed)
@@ -502,7 +510,32 @@ class LlamaGUI:
             "mtp_text": mtp_text,
             "endpoint": f"{self._server_metrics_url()}/v1",
             "estimate": estimate,
+            "missing_paths": self._missing_launch_paths(model_path),
         }
+
+    def _missing_launch_paths(self, model_path: str | None) -> list[str]:
+        """Referenced files that are configured but no longer on disk.
+
+        Checked at every preview refresh (not just at launch) so a moved or
+        deleted model/draft/template surfaces before the user clicks Start,
+        instead of as an opaque llama-server startup failure.
+        """
+        missing: list[str] = []
+        if not self._resolve_llamacpp_executable("server"):
+            exe_text = self.ui.exe_path.text().strip()
+            if exe_text:
+                missing.append(f"llama-server executable: {exe_text}")
+        if model_path and not os.path.isfile(model_path):
+            missing.append(f"model file: {model_path}")
+        if self.ui.speculative_mtp.isChecked():
+            draft = self.ui.spec_draft_model_path.text().strip()
+            if draft and not os.path.isfile(draft):
+                missing.append(f"MTP draft GGUF: {draft}")
+        if self.ui.use_chat_template.isChecked():
+            tmpl = self.ui.chat_template_file.text().strip()
+            if tmpl and not os.path.isfile(tmpl):
+                missing.append(f"chat template: {tmpl}")
+        return missing
 
     def _refresh_overview(self):
         overview_status = getattr(self.ui, "overview_status", None)
@@ -627,6 +660,15 @@ class LlamaGUI:
                 "font-weight: bold; color: " + STATUS_COLOR_MUTED_DARK + ";"
             )
             self.ui.preflight_warning.setText("")
+            return
+        if preview["missing_paths"]:
+            self.ui.preflight_status.setText("Missing files — launch will likely fail")
+            self.ui.preflight_status.setStyleSheet(
+                "font-weight: bold; color: " + STATUS_COLOR_ERROR + ";"
+            )
+            self.ui.preflight_warning.setText(
+                "Missing: " + "; ".join(preview["missing_paths"])
+            )
             return
         # VRAM capacity bar removed: llama.cpp reports VRAM only after the
         # model loads, so the pre-launch estimate was unreliable
@@ -1098,6 +1140,45 @@ class LlamaGUI:
         label.setText(" | ".join(parts))
         label.setToolTip(note)
         label.setStyleSheet(f"color: {color};")
+        self._refresh_feature_detection(exe)
+
+    _FEATURE_DETECT_SEP = "\n\n[!] "
+
+    def _refresh_feature_detection(self, exe: str) -> None:
+        """Re-probe --help only when the resolved binary actually changed.
+
+        update_cli_preview -> _update_cuda_status runs on nearly every param
+        edit; caching by resolved exe path keeps this to one subprocess call
+        per binary switch instead of one per keystroke.
+        """
+        if exe == getattr(self, "_last_probed_exe", None):
+            return
+        self._last_probed_exe = exe
+        self._supported_flags = probe_supported_flags(exe) if exe else None
+        self._apply_feature_detection()
+
+    def _apply_feature_detection(self) -> None:
+        supported = getattr(self, "_supported_flags", None)
+        exe_name = Path(self._last_probed_exe).name if self._last_probed_exe else "this build"
+        sep = self._FEATURE_DETECT_SEP
+        for spec in PARAM_REGISTRY:
+            if not spec.widget_attr or not spec.cli_flags:
+                continue
+            widget = getattr(self.ui, spec.widget_attr, None)
+            if widget is None:
+                continue
+            base_tip = widget.toolTip().split(sep, 1)[0]
+            if is_spec_supported(spec, supported):
+                if widget.toolTip() != base_tip:
+                    widget.setToolTip(base_tip)
+                widget.setStyleSheet("")
+            else:
+                flags = "/".join(spec.cli_flags)
+                widget.setToolTip(
+                    f"{base_tip}{sep}Not found in `{exe_name} --help` — "
+                    f"this llama-server build may not support {flags}."
+                )
+                widget.setStyleSheet("background-color: #4a3a1a;")
 
     def _llamacpp_cuda_major(self, path: Path) -> str:
         match = re.search(r"cuda-(\d+)(?:[.-]|$)", path.name.lower())
@@ -2390,7 +2471,8 @@ class LlamaGUI:
 
         if manual_draft and os.path.isfile(manual_draft):
             self.ui.spec_draft_model_path.setText(manual_draft)
-            self.ui.speculative_mtp.setChecked(True)
+            if not self._is_mtp_draft_auto_disabled(info):
+                self.ui.speculative_mtp.setChecked(True)
             self.ui.spec_draft_model_path.setPlaceholderText(
                 "Manually selected draft GGUF"
             )
@@ -2510,6 +2592,15 @@ class LlamaGUI:
             self.ui.speculative_mtp.setChecked(True)
         self.config.read_from_ui(self.ui)
         self.config.save()
+
+    def _on_mtp_checkbox_toggled(self, checked):
+        # Persists per-model whether MTP should stay off: without this,
+        # _sync_mtp_controls_for_model would force the checkbox back on the
+        # next time this model is (re)selected, because a manual/auto draft
+        # path is still on file. Idempotent: sync only ever checks the box
+        # when this flag is already False, so recording False again there is
+        # a no-op.
+        self._set_mtp_draft_auto_disabled(not checked)
 
     def _uses_embedded_mtp_mode(self, info):
         """True when llama.cpp should use --spec-type draft-mtp without --model-draft."""
@@ -3277,10 +3368,29 @@ class LlamaGUI:
             )
         for line in text.splitlines():
             parse_line(line, self._mem_data)
+            self._update_load_progress(line)
         if self._mem_data.server_ready:
             self._update_process_memory_fallbacks()
         self._maybe_log_memory_summary()
         self._schedule_mem_viz_flush()
+
+    def _update_load_progress(self, line: str) -> None:
+        bar = getattr(self.ui, "overview_load_progress", None)
+        if bar is None:
+            return
+        progress = progress_from_load_line(line)
+        if progress is None:
+            return
+        pct, phase = progress
+        # Monotonic: log lines are mostly ordered, but a stray match for an
+        # earlier phase (e.g. from a retry) must not walk the bar backwards.
+        if pct < getattr(self, "_load_progress_pct", -1):
+            return
+        self._load_progress_pct = pct
+        bar.setValue(pct)
+        bar.setFormat(f"{phase} — %p%")
+        if pct >= 100:
+            bar.setVisible(False)
 
     def _reset_mem_viz(self, status: str | None = None):
         """Сброс данных памяти (визуализация удалена)."""
@@ -3290,6 +3400,10 @@ class LlamaGUI:
             timer.stop()
         self._mem_data = MemoryData()
         self._memory_summary_logged = False
+        self._load_progress_pct = -1
+        bar = getattr(self.ui, "overview_load_progress", None)
+        if bar is not None:
+            bar.setVisible(False)
         self._refresh_overview()
 
     def _finalize_mem_viz_after_stop(self, exit_code: int | None, status: str):
@@ -3315,6 +3429,7 @@ class LlamaGUI:
 
         exe, fallback_args, env = launch
         self.ui.speculative_mtp.setChecked(False)
+        self._set_mtp_draft_auto_disabled(True)
         self.log_mgr.append(
             f"⚠️ MTP disabled: {reason}. Retrying once without MTP so the main model can start. "
             "For automatic MTP use a main GGUF/package that actually contains MTP layers, "
@@ -3625,6 +3740,11 @@ class LlamaGUI:
         )
         self.mtp.remember_launch(exe, args, env, is_retry=is_retry)
         self._reset_mem_viz()
+        bar = getattr(self.ui, "overview_load_progress", None)
+        if bar is not None:
+            bar.setValue(0)
+            bar.setFormat("starting...")
+            bar.setVisible(True)
         self.server.start_server(exe, args, env=env)
         self._start_metrics_polling()
         self._reset_restart_indicator()
