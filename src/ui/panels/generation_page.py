@@ -312,7 +312,14 @@ class GenerationBuilder:
         kv_cache_box.setLayout(r3)
         sampling.addWidget(kv_cache_box)
 
-        # Batch / UBatch — генеративные параметры, на страницу Сэмплинг.
+        # Batch/UBatch + Threads — grouped as "Compute" so they read as one
+        # unit alongside the GPU offload / KV cache type boxes next to them,
+        # instead of sitting as bare rows between two titled boxes.
+        compute_box = QGroupBox(mw.tr("Compute"))
+        compute_layout = QVBoxLayout(compute_box)
+        compute_layout.setContentsMargins(8, 6, 8, 6)
+        compute_layout.setSpacing(6)
+
         r_batch = QHBoxLayout()
         r_batch.addWidget(QLabel(mw.tr("Batch / UBatch (-b / -ub):")))
         r_batch.addWidget(mw.batch_size)
@@ -320,7 +327,7 @@ class GenerationBuilder:
         r_batch.addWidget(mw.ubatch_size)
         add_clear_button(r_batch, mw.ubatch_size)
         r_batch.addStretch(1)
-        sampling.addLayout(r_batch)
+        compute_layout.addLayout(r_batch)
 
         mw.threads = QSpinBox()
         mw.threads.setRange(1, 64)
@@ -333,7 +340,9 @@ class GenerationBuilder:
         r4.addWidget(QLabel(mw.tr("Threads gen / batch (-t / -tb):")))
         r4.addWidget(mw.threads)
         r4.addWidget(mw.threads_batch)
-        sampling.addLayout(r4)
+        r4.addStretch(1)
+        compute_layout.addLayout(r4)
+        sampling.addWidget(compute_box)
 
         mw.flash_attn = QCheckBox(mw.tr("Flash Attention (-fa)"))
         mw.flash_attn.setChecked(True)
@@ -363,6 +372,15 @@ class GenerationBuilder:
         mw.reasoning_budget.setRange(0, 32767)
         mw.reasoning_budget.setValue(0)
         mw.reasoning_budget_message = QLineEdit(placeholderText="optional")
+
+        # Grouped in its own box (matches the MTP box below) so the five
+        # reasoning-related rows read as one feature instead of loose rows
+        # sitting directly on the page background.
+        reasoning_box = QGroupBox(mw.tr("Reasoning"))
+        reasoning_layout = QVBoxLayout(reasoning_box)
+        reasoning_layout.setContentsMargins(8, 6, 8, 6)
+        reasoning_layout.setSpacing(6)
+
         r7 = QHBoxLayout()
         r7.addWidget(QLabel(mw.tr("Reasoning (--reasoning):")))
         r7.addWidget(mw.reasoning_mode)
@@ -377,7 +395,7 @@ class GenerationBuilder:
         r7.addWidget(QLabel(mw.tr("Preserve (--reasoning-preserve):")))
         r7.addWidget(mw.reasoning_preserve)
         add_clear_button(r7, mw.reasoning_preserve)
-        sampling.addLayout(r7)
+        reasoning_layout.addLayout(r7)
 
         # Budget и Budget msg — вертикально ("друг под другом"): текстовое
         # поле рядом со спинбоксом неудобно, а сообщение удобнее на всю ширину.
@@ -396,7 +414,8 @@ class GenerationBuilder:
         row_budget_msg.addWidget(mw.reasoning_budget_message, 1)
         add_clear_button(row_budget_msg, mw.reasoning_budget_message)
         r7b.addLayout(row_budget_msg)
-        sampling.addLayout(r7b)
+        reasoning_layout.addLayout(r7b)
+        sampling.addWidget(reasoning_box)
 
         mw.host = QLineEdit(placeholderText="127.0.0.1")
         mw.host.setText("127.0.0.1")
@@ -417,7 +436,10 @@ class GenerationBuilder:
         r8.addWidget(QLabel(mw.tr("Slots (-np):")))
         r8.addWidget(mw.parallel_slots)
         add_clear_button(r8, mw.parallel_slots)
-        server_opts.addLayout(r8)
+        r8.addStretch(1)
+        network_box = QGroupBox(mw.tr("Network"))
+        network_box.setLayout(r8)
+        server_opts.addWidget(network_box)
 
         mw.kv_unified = QCheckBox(mw.tr("KV unified (-kvu)"))
         sampling.addWidget(mw.kv_unified)
@@ -509,16 +531,18 @@ class GenerationBuilder:
         mw.main_gpu.setRange(AUTO_SENTINEL, 16)
         mw.main_gpu.setSpecialValueText("auto")
         mw.main_gpu.setValue(AUTO_SENTINEL)
+        # No clear buttons here: cuda_device/split_mode/main_gpu are
+        # managed=False "extra" params that _hide_extra_widgets()
+        # (main_window.py) removes from the UI at runtime in favor of the
+        # free-form Extra params field — a button here would survive that
+        # removal and float with nothing left beside it.
         r8d = QHBoxLayout()
         r8d.addWidget(QLabel(mw.tr("Device:")))
         r8d.addWidget(mw.cuda_device)
-        add_clear_button(r8d, mw.cuda_device)
         r8d.addWidget(QLabel(mw.tr("Split:")))
         r8d.addWidget(mw.split_mode)
-        add_clear_button(r8d, mw.split_mode)
         r8d.addWidget(QLabel(mw.tr("Main GPU:")))
         r8d.addWidget(mw.main_gpu)
-        add_clear_button(r8d, mw.main_gpu)
         r8d.addStretch(1)
         sampling.addLayout(r8d)
 
@@ -530,14 +554,14 @@ class GenerationBuilder:
         mw.cache_ram.setRange(SERVER_DEFAULT_SENTINEL, 262144)
         mw.cache_ram.setSpecialValueText("default")
         mw.cache_ram.setValue(SERVER_DEFAULT_SENTINEL)
+        # No clear buttons: ctx_checkpoints/cache_ram are also hidden by
+        # _hide_extra_widgets() (see r8d above).
         r9 = QHBoxLayout()
         r9.addWidget(QLabel(mw.tr("Ctx Checkpoints:")))
         r9.addWidget(mw.ctx_checkpoints)
-        add_clear_button(r9, mw.ctx_checkpoints)
         r9.addSpacing(10)
         r9.addWidget(QLabel(mw.tr("Cache RAM (MiB):")))
         r9.addWidget(mw.cache_ram)
-        add_clear_button(r9, mw.cache_ram)
         lperf.addLayout(r9)
 
     def _build_sampling_section(self):
@@ -603,6 +627,9 @@ class GenerationBuilder:
         mw.seed.setValue(SAMPLING_SEED_AUTO)
         mw.seed.setSpecialValueText("auto")
 
+        sampling_box = QGroupBox(mw.tr("Sampling parameters"))
+        sampling_box_layout = QVBoxLayout(sampling_box)
+        sampling_box_layout.setContentsMargins(8, 6, 8, 6)
         sampling_grid = QGridLayout()
         sampling_grid.setHorizontalSpacing(10)
         sampling_grid.setVerticalSpacing(6)
@@ -640,7 +667,8 @@ class GenerationBuilder:
         }
         for widget, help_text in sampling_help.items():
             widget.setToolTip(help_text)
-        sampling.addLayout(sampling_grid)
+        sampling_box_layout.addLayout(sampling_grid)
+        sampling.addWidget(sampling_box)
 
         mw.use_mlock = QCheckBox(mw.tr("mlock"))
         mw.verbose = QCheckBox(mw.tr("verbose"))
@@ -660,12 +688,12 @@ class GenerationBuilder:
         mw.cuda_module_loading = QLineEdit(placeholderText="CUDA_MODULE_LOADING")
         mw.cuda_module_loading.setText("LAZY")
         mw.cuda_module_loading.setMaximumWidth(80)
+        # No clear buttons: both fields are hidden by _hide_extra_widgets()
+        # (see r8d above).
         s_cuda = QHBoxLayout()
         s_cuda.addWidget(QLabel(mw.tr("CUDA env:")))
         s_cuda.addWidget(mw.cuda_visible_devices)
-        add_clear_button(s_cuda, mw.cuda_visible_devices)
         s_cuda.addWidget(mw.cuda_module_loading)
-        add_clear_button(s_cuda, mw.cuda_module_loading)
         s_cuda.addStretch(1)
         lperf.addLayout(s_cuda)
 
@@ -695,9 +723,11 @@ class GenerationBuilder:
         mw.chat_template_btn.clicked.connect(
             lambda _checked=False: mw._browse_chat_template_clicked()
         )
+        # No clear button: use_chat_template/chat_template_file/
+        # chat_template_btn are all hidden by _hide_extra_widgets() (see
+        # r8d above).
         s_tpl.addWidget(mw.use_chat_template)
         s_tpl.addWidget(mw.chat_template_file, 1)
-        add_clear_button(s_tpl, mw.chat_template_file)
         s_tpl.addWidget(mw.chat_template_btn)
         server_opts.addLayout(s_tpl)
 
